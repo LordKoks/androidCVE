@@ -198,7 +198,7 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 10
-#define SPRAY_COUNT 5000
+#define SPRAY_COUNT 6000
 #define SPRAY_COUNT_STEP 500
 #define SPRAY_COUNT_MAX 10000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
