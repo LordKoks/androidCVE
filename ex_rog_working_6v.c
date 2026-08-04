@@ -1878,7 +1878,7 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
     uint64_t current_va = start_va;
 
-    while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found && pages_scanned < SCAN_MAX_PAGES * num_offsets)
+    while (current_va < end_va && *num_found < MAX_FOUND_PAGES && !marker_found)
     {
         uint32_t *cmd = (uint32_t *)ib_vma;
         memset(ib_vma, 0, ib_alloc.mmapsize);
