@@ -2907,7 +2907,7 @@ restart:;
         for (int i = 0; i < batch_size; i++) {
             if (spray_pids[i] > 0) {
                 kill(spray_pids[i], SIGKILL);
-                waitpid(spray_pids[i], NULL, WNOHANG);
+            waitpid(spray_pids[i], NULL, 0);
             }
         }
         total_sprayed += batch_size;
