@@ -235,14 +235,28 @@ static double get_ram_usage_percentage(void)
     char line[256];
     unsigned long total_kb = 0;
     unsigned long avail_kb = 0;
+    unsigned long zram_total = 0;
+    
     while (fgets(line, sizeof(line), fp))
     {
         if (strncmp(line, "MemTotal:", 9) == 0)
             sscanf(line + 9, "%lu", &total_kb);
         else if (strncmp(line, "MemAvailable:", 13) == 0)
             sscanf(line + 13, "%lu", &avail_kb);
+        else if (strncmp(line, "SwapTotal:", 10) == 0)
+            sscanf(line + 10, "%lu", &zram_total);
     }
     fclose(fp);
+
+    if (zram_total > 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "\n[!] WARNING: ZRAM/Virtual RAM detected (%lu KB). \n", zram_total);
+            fprintf(stderr, "    This may cause page instability and scan failures.\n");
+            fprintf(stderr, "    Recommended: Disable 'Memory Extension' in Developer Options.\n");
+            warned = 1;
+        }
+    }
 
     if (total_kb == 0) return 0.0;
     double usage = (double)(total_kb - avail_kb) / (double)total_kb * 100.0;
