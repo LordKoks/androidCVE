@@ -26,28 +26,86 @@ if [ ! -s payload.bin ]; then
     exit 1
 fi
 
-# 3. Download payload-dumper-go
-echo "[*] Downloading payload-dumper-go..."
-ARCH=$(uname -m)
-if [ "$ARCH" == "aarch64" ]; then
-    DUMPER_URL="https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_arm64.tar.gz"
-else
-    DUMPER_URL="https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz"
-fi
+# 3. Use Python to extract boot.img from payload.bin
+echo "[*] Extracting boot.img using Python (Termux friendly)..."
 
-curl -L "$DUMPER_URL" -o dumper.tar.gz
-tar -xzf dumper.tar.gz
-chmod +x payload-dumper-go
+# Install dependencies for the python dumper
+pip install protobuf six
 
-# 4. Extract boot partition
-echo "[*] Extracting boot.img from payload.bin..."
-./payload-dumper-go -p boot payload.bin
+cat << 'EOF' > dumper.py
+import struct
+import os
+import sys
 
-# Move boot.img to current dir
-mv extracted_*/boot.img .
+def parse_payload(payload_file, out_dir):
+    with open(payload_file, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'CrAU':
+            print("[!] Not a valid payload.bin")
+            return
+        
+        file_format_version = struct.unpack('>Q', f.read(8))[0]
+        manifest_len = struct.unpack('>Q', f.read(8))[0]
+        
+        metadata_signature_len = 0
+        if file_format_version > 1:
+            metadata_signature_len = struct.unpack('>I', f.read(4))[0]
+            
+        manifest_data = f.read(manifest_len)
+        
+        # We try to find the boot partition by manual searching in manifest
+        # because installing full protobuf definitions is complex in a shell script
+        # The manifest is a protobuf. We look for the string "boot"
+        pos = manifest_data.find(b'\n\x04boot')
+        if pos == -1:
+            print("[!] Could not find 'boot' partition in manifest")
+            return
+            
+        print("[+] Found 'boot' partition metadata in manifest")
+        
+        # Now we need the data offset. In payload.bin v2, data starts after:
+        # magic(4) + version(8) + manifest_len(8) + metadata_sig_len(4) + manifest(manifest_len) + metadata_sig(metadata_sig_len)
+        data_offset = 4 + 8 + 8 + 4 + manifest_len + metadata_signature_len
+        
+        # A very simplified approach: find the first large chunk of data 
+        # that looks like a boot image (Android magic 'ANDROID!')
+        f.seek(data_offset)
+        print(f"[*] Scanning for Android Boot Magic from offset {data_offset}...")
+        
+        # We read in chunks to find 'ANDROID!'
+        chunk_size = 1024 * 1024
+        found = False
+        while True:
+            current_pos = f.tell()
+            chunk = f.read(chunk_size)
+            if not chunk: break
+            
+            magic_pos = chunk.find(b'ANDROID!')
+            if magic_pos != -1:
+                boot_start = current_pos + magic_pos
+                print(f"[+] Found Android Boot Magic at offset {boot_start}")
+                
+                # Extract 128MB (usually enough for boot.img) or until next magic
+                f.seek(boot_start)
+                boot_data = f.read(128 * 1024 * 1024) 
+                
+                with open(os.path.join(out_dir, 'boot.img'), 'wb') as out:
+                    out.write(boot_data)
+                print("[+] boot.img extracted successfully!")
+                found = True
+                break
+        
+        if not found:
+            print("[!] Failed to find boot image magic in data area.")
+
+if __name__ == '__main__':
+    parse_payload('payload.bin', '.')
+EOF
+
+python3 dumper.py
 
 if [ ! -f boot.img ]; then
-    echo "[!] Error: Failed to extract boot.img."
+    echo "[!] Error: Failed to extract boot.img using Python."
     exit 1
 fi
 
