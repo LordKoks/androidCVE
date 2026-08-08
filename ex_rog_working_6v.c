@@ -2703,7 +2703,7 @@ restart:;
         uint8_t elf_check[4];
         for (uint64_t off = 0; off < 0x10000000ULL; off += 0x100000ULL) {
              if (gpu_read_task_struct(fd, kernel_base + off, elf_check, 4) == 0) {
-                 if (memcmp(elf_check, "\x7fELF", 4) == 0) {
+                 if (memcmp(elf_check, "\x7f" "ELF", 4) == 0) {
                      kernel_base += off;
                      fprintf(stderr, "[KERNEL_BASE] Precise base found at 0x%lx\n", (unsigned long)kernel_base);
                      break;
