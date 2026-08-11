@@ -115,9 +115,10 @@ class MemoryExplorerAI:
 
     def render_tui(self, status_msg=""):
         os.system('clear')
+        is_active = self.exploit_proc is not None and self.exploit_proc.poll() is None
         print("="*85)
         print(" KGSL AI MEMORY EXPLORER & CLASSIFIER (ROG 5S Optimized)")
-        print(f" STATUS: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | RAM: {self.get_ram_usage():.1f}%")
+        print(f" STATUS: {'EXPLOIT ACTIVE' if is_active else 'IDLE'} | RAM: {self.get_ram_usage():.1f}%")
         print(f" AI LEARNING: {self.knowledge_base['hit_count']} Patterns in Knowledge Base")
         if status_msg:
             print(f" LAST MSG: {status_msg}")
@@ -147,22 +148,48 @@ class MemoryExplorerAI:
         print(" [R] Verify Root       [B] Rebuild Engine     [Q] Exit Explorer   [ID] Open File")
         print("="*85)
 
+    def ensure_engine(self):
+        """Checks if engine is alive, restarts if not."""
+        if self.exploit_proc:
+            if self.exploit_proc.poll() is None:
+                return True
+            else:
+                ret = self.exploit_proc.returncode
+                err = self.exploit_proc.stderr.read().decode() if self.exploit_proc.stderr else "Unknown error"
+                print(f"[!] Engine died (code {ret}). Error: {err}")
+                self.exploit_proc = None
+
+        print("[*] Restarting engine...")
+        try:
+            self.exploit_proc = subprocess.Popen([self.engine_path], 
+                                               stdin=subprocess.PIPE, 
+                                               stdout=subprocess.PIPE, 
+                                               stderr=subprocess.PIPE, 
+                                               text=False, bufsize=0)
+            return True
+        except Exception as e:
+            print(f"[!] Failed to restart engine: {e}")
+            return False
+
     def _read_data_packet(self):
-        line = self.exploit_proc.stdout.readline().decode().strip()
-        if not line.startswith("DATA:"):
-            return None
-        
-        parts = line.split(":")
-        va = int(parts[1], 16)
-        size = int(parts[2])
-        data = self.exploit_proc.stdout.read(size)
-        end_marker = self.exploit_proc.stdout.readline().decode().strip()
-        if not end_marker:
-             end_marker = self.exploit_proc.stdout.readline().decode().strip()
-        return data
+        if not self.ensure_engine(): return None
+        try:
+            line = self.exploit_proc.stdout.readline().decode().strip()
+            if not line.startswith("DATA:"):
+                return None
+            
+            parts = line.split(":")
+            va = int(parts[1], 16)
+            size = int(parts[2])
+            data = self.exploit_proc.stdout.read(size)
+            end_marker = self.exploit_proc.stdout.readline().decode().strip()
+            if not end_marker:
+                 end_marker = self.exploit_proc.stdout.readline().decode().strip()
+            return data
+        except: return None
 
     def read_page(self, va):
-        if not self.exploit_proc: return None
+        if not self.ensure_engine(): return None
         try:
             self.exploit_proc.stdin.write(f"read {hex(va)}\n".encode())
             self.exploit_proc.stdin.flush()
@@ -170,7 +197,7 @@ class MemoryExplorerAI:
         except: return None
 
     def patch_mem(self, va, val):
-        if not self.exploit_proc: return "Engine not running"
+        if not self.ensure_engine(): return "Engine Error"
         try:
             self.exploit_proc.stdin.write(f"patch {hex(va)} {hex(val)}\n".encode())
             self.exploit_proc.stdin.flush()
@@ -232,7 +259,7 @@ class MemoryExplorerAI:
         return False
 
     def trigger_exploit(self):
-        if not self.exploit_proc: return "Engine not running"
+        if not self.ensure_engine(): return "Engine Error"
         try:
             self.exploit_proc.stdin.write(b"exploit\n")
             self.exploit_proc.stdin.flush()
@@ -273,22 +300,25 @@ class MemoryExplorerAI:
                 except OSError: break
             
             # 2. Scan and record
-            if self.exploit_proc:
-                self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
-                self.exploit_proc.stdin.flush()
-                
-                while True:
-                    line = self.exploit_proc.stdout.readline().decode().strip()
-                    if not line or "SCAN_DONE" in line: break
-                    if "MATCH:" in line:
-                        va = int(line.split(":")[1], 16)
-                        data = self._read_data_packet()
-                        if data:
-                            classification = self.classify_page(data, va)
-                            if classification['confidence'] > 0.5:
-                                if not any(int(item['va'], 16) == va for item in self.found_items):
-                                    self.found_items.append(classification)
-                                    print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
+            if self.ensure_engine():
+                try:
+                    self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
+                    self.exploit_proc.stdin.flush()
+                    
+                    while True:
+                        line = self.exploit_proc.stdout.readline().decode().strip()
+                        if not line or "SCAN_DONE" in line: break
+                        if "MATCH:" in line:
+                            va = int(line.split(":")[1], 16)
+                            data = self._read_data_packet()
+                            if data:
+                                classification = self.classify_page(data, va)
+                                if classification['confidence'] > 0.5:
+                                    if not any(int(item['va'], 16) == va for item in self.found_items):
+                                        self.found_items.append(classification)
+                                        print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
+                except Exception as e:
+                    print(f"[!] Learning scan failed: {e}")
             
             # 3. Kill and Cleanup
             for pid in batch_pids:
@@ -304,20 +334,9 @@ class MemoryExplorerAI:
         if not os.path.exists(self.engine_path): 
             self.try_compile_engine()
         
-        try:
-            self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
-        except (OSError, Exception) as e:
-            print(f"[*] Engine execution failed ({e}), attempting rebuild...")
-            if os.path.exists(self.engine_path):
-                try: os.remove(self.engine_path)
-                except: pass
-            if self.try_compile_engine():
-                try:
-                    self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
-                except Exception as e2:
-                    print(f"[!] Critical Error: Could not start engine even after rebuild: {e2}")
-            else:
-                print("[!] Critical Error: Rebuild failed. Check GCC/Clang in Termux.")
+        if not self.ensure_engine():
+            print("[!] Critical Error: Could not start engine. Check GCC/Clang in Termux.")
+            return
 
         status_msg = "Engine Ready."
         while True:
@@ -356,8 +375,8 @@ class MemoryExplorerAI:
                 else:
                     status_msg = "Rebuild Failed."
             elif cmd == 's':
-                if not self.exploit_proc: 
-                    status_msg = "Engine not running"
+                if not self.ensure_engine(): 
+                    status_msg = "Engine Error"
                     continue
                 
                 # Prioritize ranges from Knowledge Base

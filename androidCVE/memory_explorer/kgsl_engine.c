@@ -52,25 +52,45 @@ static uint32_t ib_id = 0, dst_id = 0;
 
 int init_kgsl() {
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) return -1;
+    if (kgsl_fd < 0) {
+        fprintf(stderr, "Error opening /dev/kgsl-3d0: %s\n", strerror(errno));
+        return -1;
+    }
 
     struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) return -2;
+    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) {
+        fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s\n", strerror(errno));
+        return -2;
+    }
     ctx_id = ctx.drawctxt_id;
 
     struct kgsl_gpuobj_alloc alloc = { .size = PAGE_SIZE * 2, .flags = KGSL_MEMFLAGS_USE_CPU_MAP };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) return -3;
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) {
+        fprintf(stderr, "IOCTL_KGSL_GPUOBJ_ALLOC (IB) failed: %s\n", strerror(errno));
+        return -3;
+    }
     ib_id = alloc.id;
     ib_vma = mmap(NULL, alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)ib_id << 12);
+    if (ib_vma == MAP_FAILED) {
+        fprintf(stderr, "mmap IB failed: %s\n", strerror(errno));
+        return -3;
+    }
     
     struct kgsl_gpuobj_info info = { .id = ib_id };
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
     ib_gpu = info.gpuaddr;
 
     alloc.size = PAGE_SIZE;
-    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) return -4;
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) {
+        fprintf(stderr, "IOCTL_KGSL_GPUOBJ_ALLOC (DST) failed: %s\n", strerror(errno));
+        return -4;
+    }
     dst_id = alloc.id;
     dst_vma = mmap(NULL, alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)dst_id << 12);
+    if (dst_vma == MAP_FAILED) {
+        fprintf(stderr, "mmap DST failed: %s\n", strerror(errno));
+        return -4;
+    }
     info.id = dst_id;
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
     dst_gpu = info.gpuaddr;
