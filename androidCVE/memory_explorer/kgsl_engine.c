@@ -16,10 +16,13 @@
 #include "../../msm_kgsl.h"
 
 #define PAGE_SIZE 4096
-#define KGSL_CONTEXT_PREAMBLE 0x00000008
-#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000010
+// IMPORTANT: These flags MUST match v6.c exactly
+// KGSL_CONTEXT_PREAMBLE = 0x10, KGSL_CONTEXT_NO_GMEM_ALLOC = 0x02
+#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
+#define KGSL_CONTEXT_PREAMBLE 0x00000010
 #define KGSL_CMDLIST_IB 0x00000001
-#define KGSL_TIMESTAMP_RETIRED 0x00000001
+#define KGSL_TIMESTAMP_RETIRED 0x00000002
+#define IOCTL_KGSL_DRAWCTXT_DESTROY _IOW(KGSL_IOC_TYPE, 0x14, struct kgsl_drawctxt_destroy)
 
 static inline uint32_t pm4_calc_odd_parity_bit(uint32_t val)
 {
@@ -78,23 +81,25 @@ int init_kgsl() {
         return -1;
     }
 
-    struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    int retries = 30; // Increased to match v6.c
-    while (retries--) {
-        if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) break;
-        
-        if (errno == EINVAL && (ctx.flags & KGSL_CONTEXT_PREAMBLE)) {
-            ctx.flags &= ~KGSL_CONTEXT_PREAMBLE;
-            continue;
+    // Use the exact same flags and retry strategy as v6.c
+    struct kgsl_drawctxt_create ctx = {
+        .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC
+    };
+    int retry = 30;
+    while (retry--) {
+        if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) {
+            ctx_id = ctx.drawctxt_id;
+            break;
         }
-        
-        if (retries == 0) {
-            fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s (flags: 0x%x)\n", strerror(errno), ctx.flags);
-            return -2;
-        }
-        usleep(100000); 
+        // Small delay between retries (like v6.c, but faster)
+        usleep(50000); // 50ms
     }
-    ctx_id = ctx.drawctxt_id;
+    
+    if (ctx_id == 0) {
+        fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s (flags: 0x%x)\n", 
+                strerror(errno), ctx.flags);
+        return -2;
+    }
 
     struct kgsl_gpuobj_alloc alloc = { .size = PAGE_SIZE * 2, .flags = KGSL_MEMFLAGS_USE_CPU_MAP };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) {
