@@ -77,6 +77,9 @@ class MemoryExplorerAI:
         self.cmd_hist_idx = 0
         self.last_cmd_text = ""
 
+        # Render lock — auto-render thread and input thread share the TUI
+        self.render_lock = threading.Lock()
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
 
@@ -112,6 +115,8 @@ class MemoryExplorerAI:
         # Start live updater
         self._stop_live = threading.Event()
         threading.Thread(target=self._live_updater, daemon=True).start()
+        # Start auto renderer (updates TUI every 0.3s without user input)
+        threading.Thread(target=self._auto_renderer, daemon=True).start()
 
     # ============== KNOWLEDGE BASE ==============
     def load_kb(self):
@@ -213,118 +218,142 @@ class MemoryExplorerAI:
                 self.live["sprays_per_sec"] = (self.live["spray_count"] - last_spray_count) / dt
                 last_spray_count = self.live["spray_count"]
                 self.live["last_spray_ts"] = now
-                self.live["spray_pulse"] = (self.live["spray_pulse"] + 1) % 8
+                self.live["spray_pulse"] = (self.live["spray_pulse"] + 1) % len(SPRAY_PARTICLES)
                 last_t = now
 
             time.sleep(0.2)
 
+    # ============== AUTO RENDERER (redraws TUI without waiting for input) ==============
+    def _auto_renderer(self):
+        """Continuously redraws the TUI every 0.3s, independent of user input.
+        This makes all live values (RAM, AI, spray, scan, particles) update
+        online without the user having to press anything."""
+        while not self._stop_live.is_set():
+            time.sleep(0.3)
+            try:
+                # Skip if user is currently typing at the prompt
+                if getattr(self, "is_reading_input", False):
+                    continue
+                # Only redraw if we can grab the lock (don't block input).
+                if self.render_lock.acquire(blocking=False):
+                    self.render_tui()
+                    self.render_lock.release()
+            except Exception:
+                pass
+
     # ============== TUI ==============
     def render_tui(self, hint=""):
-        out = []
-        L = self.live
-        up = int(time.time() - L["uptime_start"])
-        m, s = divmod(up, 60)
-        h, m = divmod(m, 60)
+        with self.render_lock:
+            out = []
+            L = self.live
+            up = int(time.time() - L["uptime_start"])
+            m, s = divmod(up, 60)
+            h, m = divmod(m, 60)
 
-        # Header with particle animation
-        particle = PARTICLES[L["particle_idx"]]
-        spray_p  = SPRAY_PARTICLES[L["spray_pulse"]]
-        out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.1  {C.RST}"
-                   f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
-                   f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
-                   f"{C.MAG}{spray_p}{C.RST}")
+            # Header with particle animation
+            pi = L["particle_idx"] % len(PARTICLES)
+            sp = L["spray_pulse"] % len(SPRAY_PARTICLES)
+            particle = PARTICLES[pi]
+            spray_p  = SPRAY_PARTICLES[sp]
+            out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.1  {C.RST}"
+                       f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
+                       f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
+                       f"{C.MAG}{spray_p}{C.RST}")
 
-        # Live status — split into two visual lines for clarity
-        ram_color = C.GRN if L["ram"] < 50 else (C.YEL if L["ram"] < 75 else C.RED)
-        st_color  = C.GRN if "ACTIVE" in L["status"] else C.GRY
-        out.append(f" {C.BOLD}STATUS{C.RST}: {st_color}{L['status']:<14}{C.RST}"
-                   f" {C.GRY}│{C.RST} {C.BOLD}RAM{C.RST}: {ram_color}{L['ram']:5.1f}%{C.RST}"
-                   f" {C.GRY}│{C.RST} {C.BOLD}AI LEARNING{C.RST}: {C.MAG}{L['ai_patterns']:>4}{C.RST} patterns"
-                   f" {C.GRY}│{C.RST} {C.BOLD}ENGINE{C.RST}: {C.CYN}{L['engine_pid']:>6}{C.RST}"
-                   f" {C.GRY}│{C.RST} {C.BOLD}SPRAY/s{C.RST}: {C.YEL}{L['sprays_per_sec']:5.1f}{C.RST}")
+            # Live status — split into two visual lines for clarity
+            ram_color = C.GRN if L["ram"] < 50 else (C.YEL if L["ram"] < 75 else C.RED)
+            st_color  = C.GRN if "ACTIVE" in L["status"] else C.GRY
+            out.append(f" {C.BOLD}STATUS{C.RST}: {st_color}{L['status']:<14}{C.RST}"
+                       f" {C.GRY}│{C.RST} {C.BOLD}RAM{C.RST}: {ram_color}{L['ram']:5.1f}%{C.RST}"
+                       f" {C.GRY}│{C.RST} {C.BOLD}AI LEARNING{C.RST}: {C.MAG}{L['ai_patterns']:>4}{C.RST} patterns"
+                       f" {C.GRY}│{C.RST} {C.BOLD}ENGINE{C.RST}: {C.CYN}{L['engine_pid']:>6}{C.RST}"
+                       f" {C.GRY}│{C.RST} {C.BOLD}SPRAY/s{C.RST}: {C.YEL}{L['sprays_per_sec']:5.1f}{C.RST}")
 
-        # Last message (continuously updated online)
-        out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
+            # Last message (continuously updated online)
+            out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
 
-        # Live scan/spray progress bars
-        if L["scan_total"] > 0 or L["spray_target"] > 0:
-            if L["spray_target"] > 0:
-                pct = min(100, 100 * L["spray_count"] // max(1, L["spray_target"]))
-                bar = self._bar(pct, 32, C.CYN)
-                out.append(f" {C.BOLD}SPRAY {C.RST}{spray_p} {bar} {pct:3d}%  "
-                           f"({L['spray_count']}/{L['spray_target']})  "
-                           f"{C.GRY}kills:{L['kill_count']}{C.RST}")
-            if L["scan_total"] > 0:
-                pct = min(100, 100 * L["scan_offset"] // max(1, L["scan_total"]))
-                bar = self._bar(pct, 32, C.YEL)
-                out.append(f" {C.BOLD}SCAN  {C.RST}  {bar} {pct:3d}%  "
-                           f"({L['scan_offset']:#x}/{L['scan_total']:#x})")
+            # Live scan/spray progress bars
+            if L["scan_total"] > 0 or L["spray_target"] > 0:
+                if L["spray_target"] > 0:
+                    pct = min(100, 100 * L["spray_count"] // max(1, L["spray_target"]))
+                    bar = self._bar(pct, 32, C.CYN)
+                    out.append(f" {C.BOLD}SPRAY {C.RST}{spray_p} {bar} {pct:3d}%  "
+                               f"({L['spray_count']}/{L['spray_target']})  "
+                               f"{C.GRY}kills:{L['kill_count']}{C.RST}")
+                if L["scan_total"] > 0:
+                    pct = min(100, 100 * L["scan_offset"] // max(1, L["scan_total"]))
+                    bar = self._bar(pct, 32, C.YEL)
+                    out.append(f" {C.BOLD}SCAN  {C.RST}  {bar} {pct:3d}%  "
+                               f"({L['scan_offset']:#x}/{L['scan_total']:#x})")
 
-        out.append(f"{C.GRY}{'─'*92}{C.RST}")
-
-        # Found items (file manager)
-        out.append(f" {C.BOLD}{C.WHT}[FILE MANAGER VIEW] — Found Memory Offsets  "
-                   f"{C.GRY}({len(self.found_items)} total){C.RST}")
-        out.append(f"{C.GRY}{'─'*92}{C.RST}")
-        if not self.found_items:
-            out.append(f" {C.GRY}(No items yet — press {C.WHT}[E]{C.GRY} to exploit, "
-                       f"{C.WHT}[L]{C.GRY} to learn, {C.WHT}[S]{C.GRY} to scan){C.RST}")
-        else:
-            display = self.found_items[-12:]
-            for i, item in enumerate(display):
-                idx = len(self.found_items) - len(display) + i
-                color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
-                         "System App": C.BLU, "Kernel Code": C.MAG}.get(item['type'], C.GRY)
-                out.append(f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
-                           f"{color}{item['type']:<18}{C.RST} │ "
-                           f"{C.WHT}{item['description'][:40]:<40}{C.RST} │ "
-                           f"{C.CYN}{item['va']}{C.RST}")
-
-        out.append(f"{C.GRY}{'─'*92}{C.RST}")
-
-        # Color-coded menu (E, L, S = GREEN 1st/2nd/3rd; C, R, B, Q, ID = BLUE neutral)
-        out.append(
-            f" {C.GRN}[E]{C.RST} Exploit Trigger   "
-            f"{C.GRN}[L]{C.RST} AI Learning Loop  "
-            f"{C.GRN}[S]{C.RST} Start AI Scan     "
-            f"{C.BLU}[C]{C.RST} Clear Memory"
-        )
-        out.append(
-            f" {C.BLU}[R]{C.RST} Verify Root       "
-            f"{C.BLU}[B]{C.RST} Rebuild Engine    "
-            f"{C.BLU}[Q]{C.RST} Exit Explorer     "
-            f"{C.BLU}[ID]{C.RST} Open File"
-        )
-        out.append(f"{C.GRY}{'─'*92}{C.RST}")
-
-        # Spray log activity (recent 3 lines)
-        if self.spray_log:
-            out.append(f" {C.BOLD}{C.MAG}LIVE LOG STREAM{C.RST} {C.GRY}(last 3){C.RST}")
-            for e in self.spray_log[-3:]:
-                et = e.get("type", "?")
-                if et == "spray":
-                    out.append(f"  {C.CYN}▸{C.RST} SPRAY  pid={C.WHT}{e.get('pid',0):<6}{C.RST} "
-                               f"name={C.YEL}{e.get('name','?'):<14}{C.RST} "
-                               f"batch={C.GRY}{e.get('batch',0)}{C.RST}")
-                elif et == "kill":
-                    out.append(f"  {C.RED}✗{C.RST} KILL   pid={C.WHT}{e.get('pid',0)}{C.RST}")
-                elif et == "scan_match":
-                    out.append(f"  {C.GRN}✓{C.RST} MATCH  va={C.CYN}{hex(e.get('va',0)):<14}{C.RST} "
-                               f"type={C.MAG}{e.get('type','?')}{C.RST}")
-                elif et == "patch":
-                    out.append(f"  {C.YEL}⚡{C.RST} PATCH  va={C.CYN}{e.get('va','?')}{C.RST} "
-                               f"val={e.get('val','?')} → {e.get('result','?')}")
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
-        # Hint + last command (rewind hint)
-        if hint:
-            out.append(f" {C.MAG}HINT{C.RST}: {C.WHT}{hint}{C.RST}")
-        out.append(f" {C.GRY}LAST CMD{C.RST}: {C.CYN}{L['last_command']}{C.RST}    "
-                   f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump){C.RST}")
+            # Found items (file manager)
+            out.append(f" {C.BOLD}{C.WHT}[FILE MANAGER VIEW] — Found Memory Offsets  "
+                       f"{C.GRY}({len(self.found_items)} total){C.RST}")
+            out.append(f"{C.GRY}{'─'*92}{C.RST}")
+            if not self.found_items:
+                out.append(f" {C.GRY}(No items yet — press {C.WHT}[E]{C.GRY} to exploit, "
+                           f"{C.WHT}[L]{C.GRY} to learn, {C.WHT}[S]{C.GRY} to scan){C.RST}")
+            else:
+                display = self.found_items[-12:]
+                for i, item in enumerate(display):
+                    idx = len(self.found_items) - len(display) + i
+                    color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
+                             "System App": C.BLU, "Kernel Code": C.MAG}.get(item['type'], C.GRY)
+                    out.append(f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
+                               f"{color}{item['type']:<18}{C.RST} │ "
+                               f"{C.WHT}{item['description'][:40]:<40}{C.RST} │ "
+                               f"{C.CYN}{item['va']}{C.RST}")
 
-        # Render atomically
-        sys.stdout.write(C.CLR + "\n".join(out) + "\n")
-        sys.stdout.flush()
+            out.append(f"{C.GRY}{'─'*92}{C.RST}")
+
+            # Color-coded menu (E, L, S = GREEN 1st/2nd/3rd; C, R, B, Q, ID = BLUE neutral)
+            out.append(
+                f" {C.GRN}[E]{C.RST} Exploit Trigger   "
+                f"{C.GRN}[L]{C.RST} AI Learning Loop  "
+                f"{C.GRN}[S]{C.RST} Start AI Scan     "
+                f"{C.BLU}[C]{C.RST} Clear Memory"
+            )
+            out.append(
+                f" {C.BLU}[R]{C.RST} Verify Root       "
+                f"{C.BLU}[B]{C.RST} Rebuild Engine    "
+                f"{C.BLU}[Q]{C.RST} Exit Explorer     "
+                f"{C.BLU}[ID]{C.RST} Open File"
+            )
+            out.append(f"{C.GRY}{'─'*92}{C.RST}")
+
+            # Spray log activity (recent 3 lines)
+            if self.spray_log:
+                out.append(f" {C.BOLD}{C.MAG}LIVE LOG STREAM{C.RST} {C.GRY}(last 3){C.RST}")
+                for e in self.spray_log[-3:]:
+                    et = e.get("type", "?")
+                    if et == "spray":
+                        out.append(f"  {C.CYN}▸{C.RST} SPRAY  pid={C.WHT}{e.get('pid',0):<6}{C.RST} "
+                                   f"name={C.YEL}{e.get('name','?'):<14}{C.RST} "
+                                   f"batch={C.GRY}{e.get('batch',0)}{C.RST}")
+                    elif et == "kill":
+                        out.append(f"  {C.RED}✗{C.RST} KILL   pid={C.WHT}{e.get('pid',0)}{C.RST}")
+                    elif et == "scan_match":
+                        out.append(f"  {C.GRN}✓{C.RST} MATCH  va={C.CYN}{hex(e.get('va',0)):<14}{C.RST} "
+                                   f"type={C.MAG}{e.get('type','?')}{C.RST}")
+                    elif et == "patch":
+                        out.append(f"  {C.YEL}⚡{C.RST} PATCH  va={C.CYN}{e.get('va','?')}{C.RST} "
+                                   f"val={e.get('val','?')} → {e.get('result','?')}")
+                out.append(f"{C.GRY}{'─'*92}{C.RST}")
+
+            # Hint + last command (rewind hint)
+            if hint:
+                out.append(f" {C.MAG}HINT{C.RST}: {C.WHT}{hint}{C.RST}")
+            out.append(f" {C.GRY}LAST CMD{C.RST}: {C.CYN}{L['last_command']}{C.RST}    "
+                       f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump){C.RST}")
+
+            # Render atomically
+            try:
+                sys.stdout.write(C.CLR + "\n".join(out) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     def _bar(self, pct, width, color):
         filled = int(width * pct / 100)
@@ -448,6 +477,16 @@ class MemoryExplorerAI:
         except Exception:
             return 0.0
 
+    def _set_comm(self, name):
+        """Set this process comm (visible in /proc/[pid]/comm) to `name`."""
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None)
+            PR_SET_NAME = 15
+            libc.prctl(PR_SET_NAME, name.encode(), 0, 0, 0)
+        except Exception:
+            pass
+
     # ============== ACTIONS ==============
     def trigger_exploit(self):
         self.live["last_command"] = "E (Exploit)"
@@ -554,6 +593,7 @@ class MemoryExplorerAI:
         return "BG started"
 
     def _learning_worker(self):
+        import subprocess as _sp
         libc = ctypes.CDLL(None)
         PR_SET_NAME = 15
         target_total = 1000
@@ -574,24 +614,22 @@ class MemoryExplorerAI:
                 if self.cancel_flag.is_set():
                     break
                 try:
-                    pid = os.fork()
-                    if pid == 0:
-                        try:
-                            libc.prctl(PR_SET_NAME,
-                                       f"KETO{(spray_batch_start + i) % 10000:04d}".encode(),
-                                       0, 0, 0)
-                        except Exception:
-                            pass
-                        while True:
-                            time.sleep(60)
-                    else:
-                        batch_pids.append(pid)
-                        self.spray_procs.append(pid)
-                        # log spray
-                        self.log_event("spray", {"pid": pid,
-                                                  "name": f"KETO{(spray_batch_start+i) % 10000:04d}",
-                                                  "batch": spray_batch_start // batch})
-                        time.sleep(0.0005)
+                    # Use subprocess.Popen instead of os.fork() to avoid
+                    # "fork in multi-threaded process" deadlock warning.
+                    name = f"KETO{(spray_batch_start + i) % 10000:04d}"
+                    p = _sp.Popen(
+                        ["sh", "-c",
+                         f"exec -a {name} sleep 3600"],
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                        preexec_fn=lambda n=name: self._set_comm(n),
+                    )
+                    batch_pids.append(p.pid)
+                    self.spray_procs.append(p.pid)
+                    # log spray
+                    self.log_event("spray", {"pid": p.pid,
+                                              "name": name,
+                                              "batch": spray_batch_start // batch})
+                    time.sleep(0.001)
                 except OSError as e:
                     self.log_event("spray_error", {"err": str(e)})
                     break
@@ -665,79 +703,84 @@ class MemoryExplorerAI:
     # ============== INPUT (with Ctrl+P detection) ==============
     def input_cmd(self):
         """Read one line, with history (Up/Down), Ctrl+P cancel, Ctrl+E rewind, Ctrl+C quit."""
-        sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
-        sys.stdout.flush()
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        self.is_reading_input = True
         try:
-            tty.setraw(fd)
-            buf = []
-            hist_idx = len(self.cmd_history)
-            while True:
-                ch = os.read(fd, 1)
-                if not ch:
-                    break
-                c = ch.decode("utf-8", errors="ignore")
-                if c == "\x03":  # Ctrl+C
-                    buf = ["q"]
-                    break
-                if c == "\x10":  # Ctrl+P  -> cancel learning
-                    self.cmd_learning_cancel()
-                    self.live["last_msg"] = "Press 'L' to start a new learning cycle."
-                    sys.stdout.write(f"\n{C.YEL}  [Ctrl+P] Learning cancelled. Press 'L' to restart.{C.RST}\n")
-                    sys.stdout.flush()
-                    continue
-                if c in ("\r", "\n"):
-                    sys.stdout.write("\n")
-                    break
-                if c == "\x7f" or c == "\b":
-                    if buf:
-                        buf.pop()
-                        sys.stdout.write("\b \b")
-                        sys.stdout.flush()
-                    continue
-                if c == "\x05":  # Ctrl+E -> rewind to last command
-                    if self.last_cmd_text:
-                        sys.stdout.write("\033[2K\r")
-                        sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.last_cmd_text}")
-                        sys.stdout.flush()
-                        buf = list(self.last_cmd_text)
-                    continue
-                if c == "\x1b":  # ESC sequence (arrow keys)
-                    nxt = os.read(fd, 2)
-                    if nxt == b"[A":  # Up arrow -> previous in history
-                        if self.cmd_history and hist_idx > 0:
-                            hist_idx -= 1
-                            sys.stdout.write("\033[2K\r")
-                            sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
-                            sys.stdout.flush()
-                            buf = list(self.cmd_history[hist_idx])
-                    elif nxt == b"[B":  # Down arrow -> next in history
-                        if self.cmd_history and hist_idx < len(self.cmd_history) - 1:
-                            hist_idx += 1
-                            sys.stdout.write("\033[2K\r")
-                            sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
-                            sys.stdout.flush()
-                            buf = list(self.cmd_history[hist_idx])
-                        elif self.cmd_history and hist_idx == len(self.cmd_history) - 1:
-                            hist_idx += 1
-                            sys.stdout.write("\033[2K\r")
-                            sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
-                            sys.stdout.flush()
-                            buf = []
-                    continue
-                buf.append(c)
-                sys.stdout.write(c)
+            with self.render_lock:
+                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
                 sys.stdout.flush()
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                buf = []
+                hist_idx = len(self.cmd_history)
+                while True:
+                    ch = os.read(fd, 1)
+                    if not ch:
+                        break
+                    c = ch.decode("utf-8", errors="ignore")
+                    if c == "\x03":  # Ctrl+C
+                        buf = ["q"]
+                        break
+                    if c == "\x10":  # Ctrl+P  -> cancel learning
+                        self.cmd_learning_cancel()
+                        self.live["last_msg"] = "Press 'L' to start a new learning cycle."
+                        sys.stdout.write(f"\n{C.YEL}  [Ctrl+P] Learning cancelled. Press 'L' to restart.{C.RST}\n")
+                        sys.stdout.flush()
+                        continue
+                    if c in ("\r", "\n"):
+                        sys.stdout.write("\n")
+                        break
+                    if c == "\x7f" or c == "\b":
+                        if buf:
+                            buf.pop()
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                        continue
+                    if c == "\x05":  # Ctrl+E -> rewind to last command
+                        if self.last_cmd_text:
+                            sys.stdout.write("\033[2K\r")
+                            sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.last_cmd_text}")
+                            sys.stdout.flush()
+                            buf = list(self.last_cmd_text)
+                        continue
+                    if c == "\x1b":  # ESC sequence (arrow keys)
+                        nxt = os.read(fd, 2)
+                        if nxt == b"[A":  # Up arrow -> previous in history
+                            if self.cmd_history and hist_idx > 0:
+                                hist_idx -= 1
+                                sys.stdout.write("\033[2K\r")
+                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
+                                sys.stdout.flush()
+                                buf = list(self.cmd_history[hist_idx])
+                        elif nxt == b"[B":  # Down arrow -> next in history
+                            if self.cmd_history and hist_idx < len(self.cmd_history) - 1:
+                                hist_idx += 1
+                                sys.stdout.write("\033[2K\r")
+                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
+                                sys.stdout.flush()
+                                buf = list(self.cmd_history[hist_idx])
+                            elif self.cmd_history and hist_idx == len(self.cmd_history) - 1:
+                                hist_idx += 1
+                                sys.stdout.write("\033[2K\r")
+                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
+                                sys.stdout.flush()
+                                buf = []
+                        continue
+                    buf.append(c)
+                    sys.stdout.write(c)
+                    sys.stdout.flush()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            cmd = "".join(buf).strip()
+            if cmd:
+                self.cmd_history.append(cmd)
+                if len(self.cmd_history) > 100:
+                    self.cmd_history = self.cmd_history[-100:]
+                self.last_cmd_text = cmd
+            return cmd
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        cmd = "".join(buf).strip()
-        if cmd:
-            self.cmd_history.append(cmd)
-            if len(self.cmd_history) > 100:
-                self.cmd_history = self.cmd_history[-100:]
-            self.last_cmd_text = cmd
-        return cmd
+            self.is_reading_input = False
 
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
