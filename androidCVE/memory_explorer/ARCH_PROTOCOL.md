@@ -1,37 +1,41 @@
-# KGSL Memory Explorer: AI-Driven Forensic Protocol
+# KGSL Memory Explorer & AI Classifier: Architecture Protocol
 
-## 1. Architecture Overview
-The system is divided into three functional layers to ensure stability on high-performance devices like the ASUS ROG 5S while maintaining deep analytical capabilities.
+## 1. Overview
+This project implements an intelligent memory forensic tool designed for the ASUS ROG 5S. It transforms a low-level KGSL UAF vulnerability into a user-friendly "Memory File Manager" with AI-driven content classification.
+
+## 2. Layered Architecture
 
 ### Layer 1: Hardware Interaction (GPU)
-- **Role**: Memory Mapping and Spraying.
-- **Implementation**: `kgsl_engine.c`.
-- **Strategy**: "Slow Spray" - mapping physical pages into user-space via CVE-2023-33107 in iterative batches.
-- **Constraints**: GPU operations are throttled to prevent thermal spikes and kernel panics.
+- **Primary Task**: "Slow Spray" & Page Mapping.
+- **Mechanism**: Iteratively maps physical pages into the user-space process using the KGSL UAF vulnerability.
+- **Throttling**: The GPU spray is deliberately slowed to prevent system freezes and keep RAM usage under control.
+- **Output**: Raw binary pages available for reading.
 
-### Layer 2: Heuristic Analysis (CPU - AI Core)
-- **Role**: Content Classification and Pattern Recognition.
-- **Algorithm**: Multi-weighted Heuristic Scanner.
-- **Detection Vectors**:
-    - **Strings**: Searching for package names (`com.android.*`) and kernel symbols.
-    - **Binary Signatures**: Identifying AArch64 function prologues and `ADRP` instructions.
-    - **UID Patterns**: Detecting consecutive UID/GID fields in `cred` structures.
-    - **Pointers**: Identifying pointers within the `KERNEL_BASE` range.
+### Layer 2: Intelligence & Classification (CPU)
+- **Primary Task**: AI Content Recognition.
+- **Classification Engine**:
+    - **Kernel Core**: Detection of `cred`, `selinux_enforcing`, `task_struct`, and Kernel Base pointers.
+    - **System Context**: Identification of system-critical apps (Settings, UI, Camera, Gallery, etc.) using UID patterns and package string signatures.
+    - **User Context**: Identification of third-party apps (Google Play, RuStore) based on heap patterns.
+- **Logic Translation**: Converts binary blobs into human-readable descriptions of the data's purpose.
 
-### Layer 3: Interactive Explorer (TUI)
-- **Role**: User Interface and Logic Translation.
+### Layer 3: Interactive Interface (TUI)
 - **Style**: "Terminal-in-Terminal" File Manager.
-- **Logic Translation**: Converts raw bytes into human-readable descriptions of kernel intent.
+- **Navigation**: Allows browsing memory offsets as if they were files in a directory.
+- **Detail View**: 
+    - **Binary View**: Bit-level representation.
+    - **HEX View**: BIOS-style low-level hexadecimal dump.
+    - **AI Summary**: Plain English explanation of what the code/data does.
 
-## 2. AI Classification Weights
-The classifier assigns confidence scores based on the following:
-- **Weight 1.0**: Exact match of known Android package names in process memory.
-- **Weight 0.9**: Match of unique kernel markers (e.g., `KETO0422` or `init_cred`).
-- **Weight 0.8**: Found pointer to `KERNEL_BASE` + `SELINUX_OFFSET`.
-- **Weight 0.6**: Consecutive AArch64 stack frame setups.
+## 3. AI Classification Weights
+The "Machine Learning" aspect uses a weighted heuristic model:
+1. **Signature Match (1.0)**: Exact match for kernel magic numbers or app package names.
+2. **UID Proximity (0.8)**: Grouping of data around known system UIDs (e.g., 1000).
+3. **Instruction Analysis (0.6)**: Detecting AArch64 function prologues or `ADRP/ADD` pairs.
+4. **Data Entropy (0.4)**: Distinguishing between code segments, heap data, and empty buffers.
 
-## 3. Data Flow Protocol
-1. **Trigger**: GPU creates a "Memory Window" into the kernel.
-2. **Scan**: Engine reports "Interesting" VAs (non-zero or signature matches).
-3. **Analyze**: Python AI Core reads the page, runs heuristics, and populates the Explorer.
-4. **Interact**: User selects a "Memory File" to view BIOS-style HEX/Binary and AI Logic.
+## 4. Operational Protocol
+1. **Initialization**: Load the GPU engine and establish the UAF window.
+2. **Exploration**: User triggers a "Slow Spray".
+3. **Discovery**: AI-scanner identifies interesting offsets and populates the "File Manager".
+4. **Analysis**: User selects an ID to perform deep BIOS-style inspection and logic translation.
