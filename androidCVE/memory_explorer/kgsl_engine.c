@@ -58,9 +58,21 @@ int init_kgsl() {
     }
 
     struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) {
-        fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s\n", strerror(errno));
-        return -2;
+    int retries = 5;
+    while (retries--) {
+        if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) break;
+        
+        if (errno == EINVAL && (ctx.flags & KGSL_CONTEXT_PREAMBLE)) {
+            // Try without PREAMBLE if EINVAL
+            ctx.flags &= ~KGSL_CONTEXT_PREAMBLE;
+            continue;
+        }
+        
+        if (retries == 0) {
+            fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s (flags: 0x%x)\n", strerror(errno), ctx.flags);
+            return -2;
+        }
+        usleep(100000); // Wait 100ms
     }
     ctx_id = ctx.drawctxt_id;
 
