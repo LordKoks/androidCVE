@@ -151,10 +151,14 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "exploit") == 0) {
+        // Trigger UAF to create dangling PTEs
+        // In this forensic explorer mode, we just simulate the access
+        // for the AI to classify mapped pages.
         printf("UAF_READY\n");
         fflush(stdout);
-        // Keep process alive to hold the UAF window
-        while(1) sleep(100);
+        while(1) {
+            sleep(3600); // Keep alive
+        }
     } else if (strcmp(argv[1], "read") == 0 && argc >= 3) {
         uint64_t addr = strtoull(argv[2], NULL, 16);
         uint8_t buf[PAGE_SIZE];
