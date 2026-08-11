@@ -7,7 +7,22 @@ import subprocess
 class MemoryExplorerAI:
     def __init__(self):
         self.found_items = []
-        self.engine_path = "/workspace/androidCVE/memory_explorer/kgsl_engine"
+        # Dynamic path detection for Termux/Linux portability
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.engine_path = os.path.join(base_dir, "kgsl_engine")
+        
+        # Fallback for common Termux paths if not found in script dir
+        if not os.path.exists(self.engine_path):
+            termux_path = "/data/data/com.termux/files/home/androidCVE/androidCVE/memory_explorer/kgsl_engine"
+            if os.path.exists(termux_path):
+                self.engine_path = termux_path
+            else:
+                # Try to find it in parent or current dir
+                for p in ["./kgsl_engine", "../kgsl_engine", "/workspace/androidCVE/memory_explorer/kgsl_engine"]:
+                    if os.path.exists(p):
+                        self.engine_path = os.path.abspath(p)
+                        break
+
         self.uaf_start = 0x7001ff000
         self.uaf_size = 0x10000000
         
@@ -102,7 +117,32 @@ class MemoryExplorerAI:
             print(f"{i:<3} | {item['type']:<15} | {item['description']:<35} | {item['va']:<12}")
         
         print("\n" + "="*75)
-        print("[S] Start Scanning   [Q] Quit   [ID] View Details")
+        print("[S] Start Scanning   [R] Check Root   [Q] Quit   [ID] View Details")
+        
+    def check_root(self):
+        print("\n[*] Checking for Root status...")
+        try:
+            # Method 1: id command
+            res = subprocess.check_output(["id"], text=True).strip()
+            print(f">> [id]: {res}")
+            
+            # Method 2: Check for protected file access
+            try:
+                with open("/data/system/packages.list", "r") as f:
+                    f.read(1)
+                print(">> [Access]: SUCCESS! Can read protected system files.")
+            except:
+                print(">> [Access]: FAILED. Cannot read protected files (SELinux or UID mismatch).")
+                
+            # Method 3: getenforce
+            try:
+                res = subprocess.check_output(["getenforce"], text=True).strip()
+                print(f">> [SELinux]: {res}")
+            except:
+                pass
+        except Exception as e:
+            print(f"[-] Error checking root: {e}")
+        input("\nPress Enter...")
 
     def show_detail(self, item_idx):
         if item_idx >= len(self.found_items):
@@ -162,6 +202,11 @@ class MemoryExplorerAI:
                 input("Press Enter...")
 
     def run(self):
+        if not os.path.exists(self.engine_path):
+            print(f"[!] ERROR: Engine not found at {self.engine_path}")
+            print("[*] Please run: gcc -O2 kgsl_engine.c -o kgsl_engine -lpthread")
+            return
+        
         self.render_tui()
         while True:
             cmd = input("> ").lower()
@@ -186,6 +231,9 @@ class MemoryExplorerAI:
                     proc.terminate()
                 
                 print("[+] Scan complete.")
+            elif cmd == 'r':
+                self.check_root()
+                self.render_tui()
             elif cmd.isdigit():
                 self.show_detail(int(cmd))
                 self.render_tui()

