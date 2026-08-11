@@ -190,6 +190,9 @@ int trigger_uaf() {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--test-exists") == 0) {
+        return 0;
+    }
     if (init_kgsl() != 0) {
         fprintf(stderr, "GPU Init failed\n");
         return 1;

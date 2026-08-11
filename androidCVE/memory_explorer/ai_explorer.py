@@ -159,7 +159,23 @@ class MemoryExplorerAI:
                 print(f"[!] Engine died (code {ret}). Error: {err}")
                 self.exploit_proc = None
 
-        print("[*] Restarting engine...")
+        # Fix: Check for Exec format error and try to recompile
+        if os.path.exists(self.engine_path):
+            try:
+                # Test run to check for Exec format error
+                subprocess.check_call([self.engine_path, "--test-exists"], 
+                                    stdout=subprocess.DEVNULL, 
+                                    stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.CalledProcessError) as e:
+                if isinstance(e, OSError) and e.errno == 8: # Exec format error
+                    print("[*] Exec format error detected. Rebuilding engine...")
+                    self.try_compile_engine()
+
+        if not os.path.exists(self.engine_path):
+            print("[*] Engine missing. Compiling...")
+            self.try_compile_engine()
+
+        print("[*] Starting engine...")
         try:
             self.exploit_proc = subprocess.Popen([self.engine_path], 
                                                stdin=subprocess.PIPE, 
@@ -168,7 +184,17 @@ class MemoryExplorerAI:
                                                text=False, bufsize=0)
             return True
         except Exception as e:
-            print(f"[!] Failed to restart engine: {e}")
+            print(f"[!] Failed to start engine: {e}")
+            # Final attempt: recompile and try again
+            if self.try_compile_engine():
+                try:
+                    self.exploit_proc = subprocess.Popen([self.engine_path], 
+                                                       stdin=subprocess.PIPE, 
+                                                       stdout=subprocess.PIPE, 
+                                                       stderr=subprocess.PIPE, 
+                                                       text=False, bufsize=0)
+                    return True
+                except: pass
             return False
 
     def _read_data_packet(self):
