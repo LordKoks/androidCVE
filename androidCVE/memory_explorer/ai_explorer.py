@@ -353,6 +353,17 @@ class MemoryExplorerAI:
         except Exception as e: print(f" [-] Verification Error: {e}")
         input("\nPress Enter...")
 
+    def clear_sprays(self):
+        print(f"[*] AI: Terminating {len(self.spray_procs)} spray processes...")
+        for pid in self.spray_procs:
+            try:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0) # Reap zombie
+            except: pass
+        self.spray_procs = []
+        print("[+] AI: Memory Cache cleared.")
+        time.sleep(1)
+
     def run(self):
         if not os.path.exists(self.engine_path): self.try_compile_engine()
         
@@ -370,10 +381,8 @@ class MemoryExplorerAI:
             elif cmd == 'e': self.trigger_exploit()
             elif cmd == 'p': self.run_spray()
             elif cmd == 'c':
-                for p in self.spray_procs:
-                    try: os.kill(p, 9)
-                    except: pass
-                self.spray_procs = []
+                self.clear_sprays()
+                self.render_tui()
             elif cmd == 'r': self.check_root()
             elif cmd == 'b': self.try_compile_engine(); input("Press Enter...")
             elif cmd == 's':

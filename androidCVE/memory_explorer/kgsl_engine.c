@@ -20,6 +20,8 @@
 #define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000010
 #define KGSL_CMDLIST_IB 0x00000001
 #define KGSL_TIMESTAMP_RETIRED 0x00000001
+#define CP_MEM_WRITE 0x3D
+#define CP_MEM_TO_MEM 0x73
 
 static inline uint32_t pm4_calc_odd_parity_bit(uint32_t val)
 {
@@ -35,8 +37,6 @@ static inline uint32_t cp_type7_packet(uint32_t opcode, uint32_t cnt)
 {
     return (7u << 28) | ((cnt & 0x3FFFu) << 0) | (pm4_calc_odd_parity_bit(cnt) << 15) | ((opcode & 0x7Fu) << 16) | (pm4_calc_odd_parity_bit(opcode) << 23);
 }
-
-#define CP_MEM_TO_MEM 0x73
 
 static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi)
 {
@@ -160,8 +160,6 @@ cleanup:
     if (ctx_id_w) { struct kgsl_drawctxt_destroy dctx = { .drawctxt_id = ctx_id_w }; ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx); }
     return 0;
 }
-
-#define CP_MEM_WRITE 0x3D
 
 int init_kgsl() {
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
