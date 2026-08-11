@@ -50,6 +50,27 @@ static uint64_t ib_gpu = 0, dst_gpu = 0;
 static void *ib_vma = NULL, *dst_vma = NULL;
 static uint32_t ib_id = 0, dst_id = 0;
 
+void cleanup_kgsl() {
+    if (ib_vma && ib_vma != MAP_FAILED) munmap(ib_vma, PAGE_SIZE * 2);
+    if (dst_vma && dst_vma != MAP_FAILED) munmap(dst_vma, PAGE_SIZE);
+    
+    struct kgsl_gpuobj_free fr = {0};
+    if (ib_id) { fr.id = ib_id; ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    if (dst_id) { fr.id = dst_id; ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    
+    if (ctx_id) {
+        struct kgsl_drawctxt_destroy dctx = { .drawctxt_id = ctx_id };
+        ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx);
+    }
+    
+    if (kgsl_fd >= 0) close(kgsl_fd);
+    
+    ctx_id = 0;
+    ib_id = dst_id = 0;
+    ib_vma = dst_vma = NULL;
+    kgsl_fd = -1;
+}
+
 int init_kgsl() {
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) {
@@ -58,12 +79,11 @@ int init_kgsl() {
     }
 
     struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    int retries = 5;
+    int retries = 30; // Increased to match v6.c
     while (retries--) {
         if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) == 0) break;
         
         if (errno == EINVAL && (ctx.flags & KGSL_CONTEXT_PREAMBLE)) {
-            // Try without PREAMBLE if EINVAL
             ctx.flags &= ~KGSL_CONTEXT_PREAMBLE;
             continue;
         }
@@ -72,7 +92,7 @@ int init_kgsl() {
             fprintf(stderr, "IOCTL_KGSL_DRAWCTXT_CREATE failed: %s (flags: 0x%x)\n", strerror(errno), ctx.flags);
             return -2;
         }
-        usleep(100000); // Wait 100ms
+        usleep(100000); 
     }
     ctx_id = ctx.drawctxt_id;
 
@@ -207,6 +227,7 @@ int main(int argc, char **argv) {
     }
     if (init_kgsl() != 0) {
         fprintf(stderr, "GPU Init failed\n");
+        cleanup_kgsl();
         return 1;
     }
 
@@ -266,7 +287,7 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if ((va / PAGE_SIZE) % 100 == 0) usleep(10);
+                if ((va / PAGE_SIZE) % 50 == 0) usleep(1000); // Increased sleep for stability
             }
             printf("SCAN_DONE\n");
         } else if (strncmp(line, "quit", 4) == 0) {
@@ -274,5 +295,6 @@ int main(int argc, char **argv) {
         }
     }
 
+    cleanup_kgsl();
     return 0;
 }

