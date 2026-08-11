@@ -1,48 +1,37 @@
-# KGSL Memory Explorer & AI Classifier Architecture
+# KGSL Memory Explorer: AI-Driven Forensic Protocol
 
-## 1. Overview
-This project implements a kernel memory forensic tool disguised as a "File Manager" TUI. It leverages the KGSL UAF vulnerability to map physical pages into user-space and uses heuristic-based pattern recognition (AI-lite) to classify memory regions.
+## 1. Architecture Overview
+The system is divided into three functional layers to ensure stability on high-performance devices like the ASUS ROG 5S while maintaining deep analytical capabilities.
 
-## 2. Component Architecture
+### Layer 1: Hardware Interaction (GPU)
+- **Role**: Memory Mapping and Spraying.
+- **Implementation**: `kgsl_engine.c`.
+- **Strategy**: "Slow Spray" - mapping physical pages into user-space via CVE-2023-33107 in iterative batches.
+- **Constraints**: GPU operations are throttled to prevent thermal spikes and kernel panics.
 
-### A. GPU Spray Engine (The "Physical Eye")
-- **Mechanism**: Slow, targeted PTE manipulation via KGSL.
-- **Role**: Maps physical pages into a 64MB-128MB "View Window" in User Virtual Address (UVA) space.
-- **Optimization**: Minimal CPU load during mapping; most work is done by the GPU command processor.
+### Layer 2: Heuristic Analysis (CPU - AI Core)
+- **Role**: Content Classification and Pattern Recognition.
+- **Algorithm**: Multi-weighted Heuristic Scanner.
+- **Detection Vectors**:
+    - **Strings**: Searching for package names (`com.android.*`) and kernel symbols.
+    - **Binary Signatures**: Identifying AArch64 function prologues and `ADRP` instructions.
+    - **UID Patterns**: Detecting consecutive UID/GID fields in `cred` structures.
+    - **Pointers**: Identifying pointers within the `KERNEL_BASE` range.
 
-### B. CPU Intelligence Layer (Pattern Recognition / ML)
-- **Algorithm**: Signature-based classification with weighted probability.
-- **Classification Categories**:
-    - **Kernel Core**: `task_struct`, `cred`, `selinux_state`, `swapper` stack.
-    - **System Services**: `system_server`, `surfaceflinger`, `adbd`.
-    - **System Apps**: Clock, Calculator, Settings (identified via `comm` strings and UID 1000 range).
-    - **User Apps**: Chrome, Games, etc. (identified via high UID ranges and package-specific strings).
-- **Deep Analysis**: 
-    - Disassembles binary blobs into AArch64 instructions.
-    - Matches pointers against known `KERNEL_BASE` offsets to identify global variables.
+### Layer 3: Interactive Explorer (TUI)
+- **Role**: User Interface and Logic Translation.
+- **Style**: "Terminal-in-Terminal" File Manager.
+- **Logic Translation**: Converts raw bytes into human-readable descriptions of kernel intent.
 
-### C. TUI Interface (Memory Manager)
-- **Visuals**: A nested menu structure.
-    - `[Root]` -> `[Kernel]` / `[System]` / `[User Space]`
-- **Detail View**: 
-    - **Hex**: Traditional BIOS-style hexdump.
-    - **Binary**: Bit-level visualization.
-    - **Logic**: Translated human-readable descriptions (e.g., "This region contains a credential structure with UID 10237 and full capabilities").
-
-## 3. Communication Protocols
-
-### Protocol V1: Discovery
-1. GPU maps a 4KB page.
-2. CPU scans for "Markers" (e.g., `comm` names, magic numbers).
-3. If a marker is found, the page is flagged and classified.
-4. If no marker is found, GPU proceeds to the next physical address step.
-
-### Protocol V2: Classification Weights
-- **Weight 1.0**: Found string "com.android.settings".
+## 2. AI Classification Weights
+The classifier assigns confidence scores based on the following:
+- **Weight 1.0**: Exact match of known Android package names in process memory.
+- **Weight 0.9**: Match of unique kernel markers (e.g., `KETO0422` or `init_cred`).
 - **Weight 0.8**: Found pointer to `KERNEL_BASE` + `SELINUX_OFFSET`.
-- **Weight 0.5**: Found UID sequence `10237, 10237, 10237`.
+- **Weight 0.6**: Consecutive AArch64 stack frame setups.
 
-## 4. Hardware Resource Management
-- **GPU**: Handles the heavy lifting of physical-to-virtual translation.
-- **CPU**: Runs the TUI loop and the classification algorithms.
-- **RAM**: Managed via a sliding window to prevent Termux OOM crashes.
+## 3. Data Flow Protocol
+1. **Trigger**: GPU creates a "Memory Window" into the kernel.
+2. **Scan**: Engine reports "Interesting" VAs (non-zero or signature matches).
+3. **Analyze**: Python AI Core reads the page, runs heuristics, and populates the Explorer.
+4. **Interact**: User selects a "Memory File" to view BIOS-style HEX/Binary and AI Logic.
