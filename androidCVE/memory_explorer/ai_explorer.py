@@ -236,13 +236,23 @@ class MemoryExplorerAI:
         return f"Sprayed {len(self.spray_procs) - start_count} markers."
 
     def run(self):
-        if not os.path.exists(self.engine_path): self.try_compile_engine()
+        if not os.path.exists(self.engine_path): 
+            self.try_compile_engine()
         
         try:
             self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
-        except:
-            self.try_compile_engine()
-            self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
+        except (OSError, Exception) as e:
+            print(f"[*] Engine execution failed ({e}), attempting rebuild...")
+            if os.path.exists(self.engine_path):
+                try: os.remove(self.engine_path)
+                except: pass
+            if self.try_compile_engine():
+                try:
+                    self.exploit_proc = subprocess.Popen([self.engine_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False, bufsize=0)
+                except Exception as e2:
+                    print(f"[!] Critical Error: Could not start engine even after rebuild: {e2}")
+            else:
+                print("[!] Critical Error: Rebuild failed. Check GCC/Clang in Termux.")
 
         status_msg = "Engine Ready."
         while True:

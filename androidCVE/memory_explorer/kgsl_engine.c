@@ -203,7 +203,7 @@ int main(int argc, char **argv) {
                         int found_sig = 0;
                         if (memmem(buf, PAGE_SIZE, "KETO", 4)) found_sig = 1;
                         if (memmem(buf, PAGE_SIZE, "com.android.", 11)) found_sig = 2;
-                        if (memmem(buf, PAGE_SIZE, "\x7fELF", 4)) found_sig = 3;
+                        if (memmem(buf, PAGE_SIZE, "\x7f" "ELF", 4)) found_sig = 3;
                         
                         if (found_sig) {
                             // Automatically dump data for matches to avoid deadlock
