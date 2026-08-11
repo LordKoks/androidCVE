@@ -210,7 +210,19 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (non_zero) {
-                    printf("MATCH:%lx\n", (unsigned long)va);
+                    // Deep search for markers
+                    int found_keto = 0;
+                    for (int i = 0; i < PAGE_SIZE - 4; i++) {
+                        if (buf[i] == 'K' && buf[i+1] == 'E' && buf[i+2] == 'T' && buf[i+3] == 'O') {
+                            found_keto = 1;
+                            break;
+                        }
+                    }
+                    if (found_keto) {
+                        printf("MATCH_KETO:%lx\n", (unsigned long)va);
+                    } else {
+                        printf("MATCH_DATA:%lx\n", (unsigned long)va);
+                    }
                     fflush(stdout);
                 }
             }

