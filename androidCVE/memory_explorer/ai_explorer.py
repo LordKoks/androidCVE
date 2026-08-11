@@ -279,6 +279,44 @@ class MemoryExplorerAI:
             elif cmd.isdigit():
                 self.show_detail(int(cmd))
 
+    def test_run(self):
+        print("[*] Starting AI Explorer Test Suite...")
+        
+        # Test 1: Compilation Check
+        if os.path.exists(self.engine_path):
+            print("[+] Test 1: Engine binary exists.")
+        else:
+            print("[-] Test 1: Engine binary missing!")
+            return
+
+        # Test 2: AI Classification Logic (Dry Run)
+        dummy_data = b"Some random data with com.android.settings string inside"
+        res = self.classify_page(dummy_data, 0x12345678)
+        if res['type'] == "System App" and "Settings" in res['description']:
+            print("[+] Test 2: AI Classification works (System App detected).")
+        else:
+            print(f"[-] Test 2: AI Classification failed! Got: {res['type']}")
+
+        # Test 3: Kernel Structure Detection
+        kernel_data = b"KETO0422" + b"\x00" * 20
+        res = self.classify_page(kernel_data, 0xffffffc000000000)
+        if res['type'] == "Kernel Core":
+            print("[+] Test 3: Kernel Structure Detection works.")
+        else:
+            print("[-] Test 3: Kernel Detection failed!")
+
+        # Test 4: Logic Translation
+        item = {"type": "Kernel Core", "description": "task_struct (Active Process Marker)", "data": b"\x00"*0x548 + struct.pack("<I", 1337) + b"\x00"*1000}
+        translation = self.translate_logic(item)
+        if "PID 1337" in translation:
+            print("[+] Test 4: AI Logic Translation works.")
+        else:
+            print(f"[-] Test 4: Translation failed! Got: {translation}")
+
+        print("[*] Test Suite Complete. Launching Interactive TUI...")
+        time.sleep(2)
+
 if __name__ == "__main__":
     explorer = MemoryExplorerAI()
+    explorer.test_run()
     explorer.run()
