@@ -191,8 +191,14 @@ class MemoryExplorerAI:
         # error reason in TUI immediately (instead of waiting
         # for the first spray batch to fail). Also try software
         # UAF as a fallback path.
+        # IMPORTANT: kgsl_fd MUST be set BEFORE _kgsl_open() is
+        # called below, because _kgsl_open reads self.kgsl_fd
+        # to check if it's already open. If we don't set it
+        # first, _kgsl_open throws AttributeError.
         self.kgsl_path = ""
         self.kgsl_error = ""
+        self.kgsl_fd = None
+        self.kgsl_objects = []
         try:
             if self._kgsl_open():
                 self.live["last_msg"] = (
