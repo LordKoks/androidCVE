@@ -406,7 +406,8 @@ int main(int argc, char **argv) {
             }
             fflush(stdout);
         } else if (strncmp(line, "selinux ", 8) == 0) {
-            // Strict SELinux enforcing check: read multiple times, verify stable value
+            // Strict SELinux enforcing: 3 reads, must be stable 0/1, AND page
+            // must have non-zero data (real .data/.bss page, not zero-filled)
             uint64_t va;
             sscanf(line + 8, "%lx", &va);
             uint8_t p1[PAGE_SIZE], p2[PAGE_SIZE], p3[PAGE_SIZE];
@@ -422,11 +423,33 @@ int main(int argc, char **argv) {
                 memcpy(&v1, p1, 4);
                 memcpy(&v2, p2, 4);
                 memcpy(&v3, p3, 4);
-                // Must be stable across 3 reads, value 0 or 1
                 if (v1 == v2 && v2 == v3 && (v1 == 0 || v1 == 1)) {
-                    printf("SELINUX:OK:%lx:%u:stable\n", (unsigned long)va, v1);
+                    int nonzero = 0;
+                    int has_pointer = 0;
+                    for (int i = 0; i < PAGE_SIZE; i++) {
+                        if (p1[i] != 0) nonzero++;
+                    }
+                    for (int i = 0; i < PAGE_SIZE - 8; i += 8) {
+                        uint64_t kp;
+                        memcpy(&kp, p1 + i, 8);
+                        if ((kp >> 32) >= 0xffffff80 && (kp >> 40) <= 0xffffffcf && kp != 0) {
+                            has_pointer = 1;
+                            break;
+                        }
+                    }
+                    if (nonzero < 32) {
+                        // Page is mostly zero — not a real kernel data page
+                        printf("SELINUX:ZERO_PAGE:%lx:val=%u:nonzero=%d\n",
+                               (unsigned long)va, v1, nonzero);
+                    } else if (nonzero < 128) {
+                        printf("SELINUX:WEAK:%lx:val=%u:nonzero=%d:ptr=%d\n",
+                               (unsigned long)va, v1, nonzero, has_pointer);
+                    } else {
+                        printf("SELINUX:OK:%lx:%u:stable:nz=%d:ptr=%d\n",
+                               (unsigned long)va, v1, nonzero, has_pointer);
+                    }
                 } else if (v1 == v2 && v2 == v3) {
-                    printf("SELINUX:UNSTABLE:%lx:%u:changes_to_0_or_1\n",
+                    printf("SELINUX:UNSTABLE:%lx:%u:stable_not_01\n",
                            (unsigned long)va, v1);
                 } else {
                     printf("SELINUX:FAIL:%lx:%u:%u:%u\n",
