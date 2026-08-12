@@ -618,6 +618,13 @@ class MemoryExplorerAI:
     def input_cmd(self):
         self.is_reading_input = True
         try:
+            # Initial TUI render so the user sees the dashboard on
+            # the very first input prompt. Without this they'd only
+            # see "explorer >" with a blank screen above.
+            try:
+                self._tui_full_redraw_with_input("")
+            except Exception:
+                pass
             self._print_prompt("")
             fd = sys.stdin.fileno()
             old = termios.tcgetattr(fd)
@@ -685,6 +692,13 @@ class MemoryExplorerAI:
                     buf.append(c)
                     sys.stdout.write(c)
                     sys.stdout.flush()
+                    # Any keypress also triggers a redraw so the
+                    # TUI stays fresh even when the user is typing
+                    # quickly (otherwise 0.3s of burst typing could
+                    # miss the auto-redraw window).
+                    if now - last_redraw >= REDRAW_EVERY:
+                        self._tui_full_redraw_with_input("".join(buf))
+                        last_redraw = now
             finally:
                 try:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -829,10 +843,18 @@ class MemoryExplorerAI:
                    f"verified={C.GRN}{n_verified}{C.RST} "
                    f"falsePos={C.RED}{n_fp}{C.RST} "
                    f"hitRate={hr_color}{hit_rate:4.1f}%{C.RST}")
+        # kbase coloring — use a different color when we don't know it
+        # yet so the user can tell at a glance.
+        kbase_s   = f"{self.kernel_base:#x}" if self.kernel_base else "0x??????"
+        kbase_col = C.CYN if self.kernel_base else C.GRY
+        sel_s     = f"{self.selinux_va:#x}" if self.selinux_va else "0x??????"
+        sel_col   = C.RED if self.selinux_va else C.GRY
+        cred_s    = f"{self.cred_va:#x}" if self.cred_va else "0x??????"
+        cred_col  = C.GRN if self.cred_va else C.GRY
         out.append(f" {C.BOLD}KERNEL{C.RST}: "
-                   f"kbase={C.CYN}{self.kernel_base:#x}{C.RST if self.kernel_base else C.GRY+'0x??????'+C.RST} "
-                   f"selinux={C.RED if self.selinux_va else C.GRY}{self.selinux_va:#x}{C.RST} "
-                   f"init_cred={C.GRN if self.cred_va else C.GRY}{self.cred_va:#x}{C.RST}")
+                   f"kbase={kbase_col}{kbase_s}{C.RST} "
+                   f"selinux={sel_col}{sel_s}{C.RST} "
+                   f"init_cred={cred_col}{cred_s}{C.RST}")
         out.append(f" {C.DIM}found types: {types_line}{C.RST}")
 
         out.append(f"{C.GRY}{'─'*92}{C.RST}")

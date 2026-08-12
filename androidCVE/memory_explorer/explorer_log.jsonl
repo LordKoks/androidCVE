@@ -3815,3 +3815,28 @@
 {"ts": "2026-08-12T12:26:26.620754", "type": "kill", "pid": 8121}
 {"ts": "2026-08-12T12:26:26.672622", "type": "learning_done", "batches": 4, "matches": 0, "verified": 0, "false_positives": 0, "sprayed_total": 400}
 {"ts": "2026-08-12T13:07:13.352327", "type": "engine_start", "pid": 8558}
+{"ts": "2026-08-12T16:20:49.383866", "type": "engine_start", "pid": 11932}
+{"ts": "2026-08-12T16:20:49.384249", "type": "autopilot_start"}
+{"ts": "2026-08-12T16:20:49.384541", "type": "learning_start", "total_target": 1000, "batch": 100, "workers": 3}
+{"ts": "2026-08-12T16:20:49.386542", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T16:20:49.387857", "type": "engine_start", "pid": 11938}
+{"ts": "2026-08-12T16:20:49.397137", "type": "spray", "pid": 11942, "name": "KETW1333", "batch": 3, "worker": 1}
+{"ts": "2026-08-12T16:20:49.395238", "type": "spray", "pid": 11939, "name": "KETO0666", "batch": 6, "worker": 2}
+{"ts": "2026-08-12T16:20:49.395138", "type": "spray", "pid": 11940, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T16:20:49.405373", "type": "spray", "pid": 11943, "name": "KETO0334", "batch": 3, "worker": 1}
+{"ts": "2026-08-12T16:20:49.406211", "type": "root_verified", "uid": 0, "name": "root"}
+{"ts": "2026-08-12T16:20:49.407708", "type": "spray", "pid": 11944, "name": "KETW2667", "batch": 6, "worker": 2}
+{"ts": "2026-08-12T16:20:49.408939", "type": "spray", "pid": 11945, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T16:20:49.415109", "type": "spray", "pid": 11946, "name": "KETW1335", "batch": 3, "worker": 1}
+{"ts": "2026-08-12T16:20:49.416779", "type": "spray", "pid": 11947, "name": "KETO0668", "batch": 6, "worker": 2}
+{"ts": "2026-08-12T16:20:49.422039", "type": "spray", "pid": 11948, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T16:20:49.422669", "type": "spray", "pid": 11949, "name": "KETO0336", "batch": 3, "worker": 1}
+{"ts": "2026-08-12T16:20:49.428440", "type": "spray", "pid": 11950, "name": "KETW2669", "batch": 6, "worker": 2}
+{"ts": "2026-08-12T16:20:49.440482", "type": "spray", "pid": 11952, "name": "KETW1337", "batch": 3, "worker": 1}
+{"ts": "2026-08-12T16:20:49.440572", "type": "spray", "pid": 11951, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T16:21:05.547365", "type": "engine_start", "pid": 12049}
+{"ts": "2026-08-12T16:21:05.547733", "type": "autopilot_start"}
+{"ts": "2026-08-12T16:21:05.547988", "type": "learning_start", "total_target": 1000, "batch": 100, "workers": 3}
+{"ts": "2026-08-12T16:21:35.099629", "type": "engine_start", "pid": 12321}
+{"ts": "2026-08-12T16:21:35.100270", "type": "learning_start", "total_target": 1000, "batch": 100, "workers": 3}
+{"ts": "2026-08-12T16:21:35.100214", "type": "autopilot_start"}
