@@ -12144,3 +12144,862 @@
 {"ts": "2026-08-12T19:44:34.149031", "type": "spray", "pid": 10693, "name": "KETW0011", "batch": 0, "worker": 0}
 {"ts": "2026-08-12T19:44:34.151945", "type": "spray", "pid": 10694, "name": "KETO0338", "batch": 16, "worker": 1}
 {"ts": "2026-08-12T19:44:34.154018", "type": "spray", "pid": 10695, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:56.747589", "type": "engine_start", "pid": 10886}
+{"ts": "2026-08-12T19:53:58.748468", "type": "autopilot_start"}
+{"ts": "2026-08-12T19:53:58.748408", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.749927", "type": "learning_start", "total_target": 1000, "batch": 35, "workers": 3}
+{"ts": "2026-08-12T19:53:58.751833", "type": "engine_start", "pid": 10896}
+{"ts": "2026-08-12T19:53:58.756075", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.763469", "type": "spray", "pid": 10898, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.765153", "type": "engine_start", "pid": 10901}
+{"ts": "2026-08-12T19:53:58.769956", "type": "spray", "pid": 10900, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.770428", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.770111", "type": "spray", "pid": 10899, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.773902", "type": "spray", "pid": 10902, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.776600", "type": "engine_start", "pid": 10905}
+{"ts": "2026-08-12T19:53:58.777169", "type": "spray", "pid": 10903, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.778387", "type": "root_verified", "uid": 0, "name": "root"}
+{"ts": "2026-08-12T19:53:58.781186", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.781524", "type": "spray", "pid": 10904, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.789866", "type": "spray", "pid": 10906, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.789333", "type": "engine_start", "pid": 10909}
+{"ts": "2026-08-12T19:53:58.792034", "type": "spray", "pid": 10908, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.789962", "type": "spray", "pid": 10907, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.792740", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.797734", "type": "spray", "pid": 10910, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.799435", "type": "spray", "pid": 10911, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.800409", "type": "engine_start", "pid": 10913}
+{"ts": "2026-08-12T19:53:58.802778", "type": "engine_pipe_broken", "err": "[Errno 32] Broken pipe"}
+{"ts": "2026-08-12T19:53:58.805945", "type": "spray", "pid": 10912, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.806460", "type": "spray", "pid": 10914, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.810080", "type": "spray", "pid": 10915, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.813382", "type": "engine_start", "pid": 10918}
+{"ts": "2026-08-12T19:53:58.815979", "type": "spray", "pid": 10917, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.816398", "type": "spray", "pid": 10916, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.819557", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.822432", "type": "spray", "pid": 10919, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.823270", "type": "spray", "pid": 10920, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.826461", "type": "engine_start", "pid": 10923}
+{"ts": "2026-08-12T19:53:58.829101", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.828796", "type": "spray", "pid": 10921, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.832128", "type": "spray", "pid": 10922, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.836197", "type": "engine_start", "pid": 10926}
+{"ts": "2026-08-12T19:53:58.836392", "type": "spray", "pid": 10924, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.842521", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.842704", "type": "spray", "pid": 10925, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.847948", "type": "spray", "pid": 10927, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.848687", "type": "spray", "pid": 10928, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.850686", "type": "engine_start", "pid": 10930}
+{"ts": "2026-08-12T19:53:58.851924", "type": "spray", "pid": 10929, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.853705", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.856648", "type": "spray", "pid": 10931, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.861160", "type": "spray", "pid": 10932, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:58.862712", "type": "engine_start", "pid": 10935}
+{"ts": "2026-08-12T19:53:58.864684", "type": "spray", "pid": 10933, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.864974", "type": "spray", "pid": 10934, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:58.865586", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.869388", "type": "engine_start", "pid": 10937}
+{"ts": "2026-08-12T19:53:58.871657", "type": "spray", "pid": 10936, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:58.872428", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.873738", "type": "engine_start", "pid": 10938}
+{"ts": "2026-08-12T19:53:58.875990", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.876787", "type": "engine_start", "pid": 10939}
+{"ts": "2026-08-12T19:53:58.878972", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.879727", "type": "engine_start", "pid": 10940}
+{"ts": "2026-08-12T19:53:58.881794", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.882531", "type": "engine_start", "pid": 10941}
+{"ts": "2026-08-12T19:53:58.884202", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.884975", "type": "engine_start", "pid": 10942}
+{"ts": "2026-08-12T19:53:58.887113", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.887866", "type": "engine_start", "pid": 10943}
+{"ts": "2026-08-12T19:53:58.889979", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.890767", "type": "engine_start", "pid": 10944}
+{"ts": "2026-08-12T19:53:58.892954", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.893706", "type": "engine_start", "pid": 10945}
+{"ts": "2026-08-12T19:53:58.895764", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.896623", "type": "engine_start", "pid": 10946}
+{"ts": "2026-08-12T19:53:58.898833", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.899629", "type": "engine_start", "pid": 10947}
+{"ts": "2026-08-12T19:53:58.901714", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.902505", "type": "engine_start", "pid": 10948}
+{"ts": "2026-08-12T19:53:58.904668", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.905429", "type": "engine_start", "pid": 10949}
+{"ts": "2026-08-12T19:53:58.907438", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.908219", "type": "engine_start", "pid": 10950}
+{"ts": "2026-08-12T19:53:58.910209", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.911001", "type": "engine_start", "pid": 10951}
+{"ts": "2026-08-12T19:53:58.913184", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.913944", "type": "engine_start", "pid": 10952}
+{"ts": "2026-08-12T19:53:58.915970", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.916749", "type": "engine_start", "pid": 10953}
+{"ts": "2026-08-12T19:53:58.918928", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.919656", "type": "engine_start", "pid": 10954}
+{"ts": "2026-08-12T19:53:58.921700", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.922489", "type": "engine_start", "pid": 10955}
+{"ts": "2026-08-12T19:53:58.924616", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.925327", "type": "engine_start", "pid": 10956}
+{"ts": "2026-08-12T19:53:58.927317", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.928068", "type": "engine_start", "pid": 10957}
+{"ts": "2026-08-12T19:53:58.930080", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.930827", "type": "engine_start", "pid": 10958}
+{"ts": "2026-08-12T19:53:58.932982", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.933719", "type": "engine_start", "pid": 10959}
+{"ts": "2026-08-12T19:53:58.935795", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.936599", "type": "engine_start", "pid": 10960}
+{"ts": "2026-08-12T19:53:58.938700", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.939446", "type": "engine_start", "pid": 10961}
+{"ts": "2026-08-12T19:53:58.941867", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.942871", "type": "engine_start", "pid": 10962}
+{"ts": "2026-08-12T19:53:58.945434", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.946652", "type": "engine_start", "pid": 10963}
+{"ts": "2026-08-12T19:53:58.949068", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.950252", "type": "engine_start", "pid": 10964}
+{"ts": "2026-08-12T19:53:58.952678", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.953624", "type": "engine_start", "pid": 10965}
+{"ts": "2026-08-12T19:53:58.955808", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.956675", "type": "engine_start", "pid": 10966}
+{"ts": "2026-08-12T19:53:58.958884", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.959673", "type": "engine_start", "pid": 10967}
+{"ts": "2026-08-12T19:53:58.961807", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.962615", "type": "engine_start", "pid": 10968}
+{"ts": "2026-08-12T19:53:58.964816", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.965578", "type": "engine_start", "pid": 10969}
+{"ts": "2026-08-12T19:53:58.967674", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.968528", "type": "engine_start", "pid": 10970}
+{"ts": "2026-08-12T19:53:58.970688", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.971485", "type": "engine_start", "pid": 10971}
+{"ts": "2026-08-12T19:53:58.973559", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.974367", "type": "engine_start", "pid": 10972}
+{"ts": "2026-08-12T19:53:58.976552", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.977319", "type": "engine_start", "pid": 10973}
+{"ts": "2026-08-12T19:53:58.979411", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.980217", "type": "engine_start", "pid": 10974}
+{"ts": "2026-08-12T19:53:58.982240", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.983042", "type": "engine_start", "pid": 10975}
+{"ts": "2026-08-12T19:53:58.985293", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.986147", "type": "engine_start", "pid": 10976}
+{"ts": "2026-08-12T19:53:58.987922", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.988732", "type": "engine_start", "pid": 10977}
+{"ts": "2026-08-12T19:53:58.990871", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:58.991658", "type": "engine_start", "pid": 10978}
+{"ts": "2026-08-12T19:53:59.163031", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.164178", "type": "engine_start", "pid": 10979}
+{"ts": "2026-08-12T19:53:59.166552", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.167477", "type": "engine_start", "pid": 10980}
+{"ts": "2026-08-12T19:53:59.169688", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.170491", "type": "engine_start", "pid": 10981}
+{"ts": "2026-08-12T19:53:59.172638", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.173434", "type": "engine_start", "pid": 10982}
+{"ts": "2026-08-12T19:53:59.175581", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.176562", "type": "engine_start", "pid": 10983}
+{"ts": "2026-08-12T19:53:59.178603", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.179489", "type": "engine_start", "pid": 10984}
+{"ts": "2026-08-12T19:53:59.181707", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.182489", "type": "engine_start", "pid": 10985}
+{"ts": "2026-08-12T19:53:59.184683", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.185570", "type": "engine_start", "pid": 10986}
+{"ts": "2026-08-12T19:53:59.187734", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.188599", "type": "engine_start", "pid": 10987}
+{"ts": "2026-08-12T19:53:59.239129", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.240133", "type": "engine_start", "pid": 10988}
+{"ts": "2026-08-12T19:53:59.242245", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.243463", "type": "engine_start", "pid": 10990}
+{"ts": "2026-08-12T19:53:59.247288", "type": "spray", "pid": 10989, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.252575", "type": "spray", "pid": 10991, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.252252", "type": "spray", "pid": 10992, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.254339", "type": "engine_start", "pid": 10993}
+{"ts": "2026-08-12T19:53:59.258053", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.260072", "type": "spray", "pid": 10994, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.262127", "type": "engine_start", "pid": 10996}
+{"ts": "2026-08-12T19:53:59.266076", "type": "spray", "pid": 10995, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.270227", "type": "spray", "pid": 10997, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.274725", "type": "spray", "pid": 10999, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.275125", "type": "spray", "pid": 10998, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.276712", "type": "spray", "pid": 11000, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.282359", "type": "spray", "pid": 11001, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.288068", "type": "spray", "pid": 11002, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.288806", "type": "spray", "pid": 11003, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.290370", "type": "spray", "pid": 11004, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.299771", "type": "spray", "pid": 11006, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.301317", "type": "spray", "pid": 11005, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.302602", "type": "spray", "pid": 11007, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.309277", "type": "spray", "pid": 11008, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.315963", "type": "spray", "pid": 11009, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.316448", "type": "spray", "pid": 11010, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.323342", "type": "spray", "pid": 11011, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.324643", "type": "spray", "pid": 11012, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.329249", "type": "spray", "pid": 11013, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.333461", "type": "spray", "pid": 11014, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.334339", "type": "spray", "pid": 11015, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.341857", "type": "spray", "pid": 11016, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.342145", "type": "spray", "pid": 11017, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.348222", "type": "spray", "pid": 11018, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.353317", "type": "spray", "pid": 11019, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.359144", "type": "spray", "pid": 11020, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.363557", "type": "spray", "pid": 11021, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.368838", "type": "spray", "pid": 11022, "name": "KETO0010", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.373498", "type": "spray", "pid": 11023, "name": "KETW0011", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.378180", "type": "spray", "pid": 11024, "name": "KETO0012", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.383672", "type": "spray", "pid": 11025, "name": "KETW0013", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.388678", "type": "spray", "pid": 11026, "name": "KETO0014", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.394478", "type": "spray", "pid": 11027, "name": "KETW0015", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.400140", "type": "spray", "pid": 11028, "name": "KETO0016", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.405338", "type": "spray", "pid": 11029, "name": "KETW0017", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.410880", "type": "spray", "pid": 11030, "name": "KETO0018", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.416379", "type": "spray", "pid": 11031, "name": "KETW0019", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.634287", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.637187", "type": "engine_start", "pid": 11032}
+{"ts": "2026-08-12T19:53:59.639558", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.640530", "type": "engine_start", "pid": 11033}
+{"ts": "2026-08-12T19:53:59.642736", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.644991", "type": "engine_start", "pid": 11034}
+{"ts": "2026-08-12T19:53:59.647280", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.648179", "type": "engine_start", "pid": 11035}
+{"ts": "2026-08-12T19:53:59.650279", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.651318", "type": "engine_start", "pid": 11036}
+{"ts": "2026-08-12T19:53:59.653422", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.654243", "type": "engine_start", "pid": 11037}
+{"ts": "2026-08-12T19:53:59.656725", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.657469", "type": "engine_start", "pid": 11038}
+{"ts": "2026-08-12T19:53:59.716777", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.717770", "type": "engine_start", "pid": 11039}
+{"ts": "2026-08-12T19:53:59.723385", "type": "spray", "pid": 11040, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.727727", "type": "spray", "pid": 11041, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.730993", "type": "spray", "pid": 11042, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.735748", "type": "spray", "pid": 11043, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.737171", "type": "spray", "pid": 11044, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.742942", "type": "spray", "pid": 11045, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.745899", "type": "spray", "pid": 11046, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.750508", "type": "spray", "pid": 11047, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.752368", "type": "spray", "pid": 11048, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.757610", "type": "spray", "pid": 11049, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.759178", "type": "spray", "pid": 11050, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.765220", "type": "spray", "pid": 11051, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.768928", "type": "spray", "pid": 11052, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.771880", "type": "spray", "pid": 11053, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.776829", "type": "spray", "pid": 11054, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.779351", "type": "spray", "pid": 11055, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.782632", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:53:59.782730", "type": "spray", "pid": 11056, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.786552", "type": "engine_start", "pid": 11059}
+{"ts": "2026-08-12T19:53:59.785472", "type": "spray", "pid": 11057, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.794028", "type": "spray", "pid": 11058, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.798046", "type": "spray", "pid": 11061, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.799883", "type": "spray", "pid": 11062, "name": "KETO0676", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.799377", "type": "spray", "pid": 11060, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.808554", "type": "spray", "pid": 11063, "name": "KETW1343", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.813441", "type": "spray", "pid": 11064, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.813199", "type": "spray", "pid": 11065, "name": "KETW2677", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.814528", "type": "spray", "pid": 11066, "name": "KETO0344", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.825271", "type": "spray", "pid": 11067, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.824777", "type": "spray", "pid": 11068, "name": "KETO0678", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.825465", "type": "spray", "pid": 11069, "name": "KETW1345", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.838509", "type": "spray", "pid": 11070, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.838757", "type": "spray", "pid": 11071, "name": "KETW2679", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.842795", "type": "spray", "pid": 11072, "name": "KETO0346", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.845704", "type": "spray", "pid": 11073, "name": "KETO0680", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.849152", "type": "spray", "pid": 11074, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.850292", "type": "spray", "pid": 11075, "name": "KETW1347", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.854630", "type": "spray", "pid": 11076, "name": "KETW2681", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.861736", "type": "spray", "pid": 11077, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.861584", "type": "spray", "pid": 11078, "name": "KETO0682", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.869245", "type": "spray", "pid": 11079, "name": "KETO0348", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.875430", "type": "spray", "pid": 11080, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.875526", "type": "spray", "pid": 11081, "name": "KETW2683", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.877640", "type": "spray", "pid": 11082, "name": "KETW1349", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.886282", "type": "spray", "pid": 11083, "name": "KETO0684", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.890870", "type": "spray", "pid": 11085, "name": "KETO0350", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.891654", "type": "spray", "pid": 11084, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.894719", "type": "spray", "pid": 11086, "name": "KETW2685", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:53:59.899568", "type": "spray", "pid": 11087, "name": "KETW1351", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.904793", "type": "spray", "pid": 11088, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:53:59.908918", "type": "spray", "pid": 11089, "name": "KETO0352", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:53:59.911698", "type": "spray", "pid": 11090, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.199633", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.201096", "type": "engine_start", "pid": 11091}
+{"ts": "2026-08-12T19:54:00.203608", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.204527", "type": "engine_start", "pid": 11092}
+{"ts": "2026-08-12T19:54:00.207180", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.208122", "type": "engine_start", "pid": 11093}
+{"ts": "2026-08-12T19:54:00.210451", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.211322", "type": "engine_start", "pid": 11094}
+{"ts": "2026-08-12T19:54:00.213108", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.213935", "type": "engine_start", "pid": 11095}
+{"ts": "2026-08-12T19:54:00.216081", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.216872", "type": "engine_start", "pid": 11096}
+{"ts": "2026-08-12T19:54:00.219019", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.220177", "type": "engine_start", "pid": 11097}
+{"ts": "2026-08-12T19:54:00.222503", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.223376", "type": "engine_start", "pid": 11098}
+{"ts": "2026-08-12T19:54:00.225676", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.226541", "type": "engine_start", "pid": 11099}
+{"ts": "2026-08-12T19:54:00.228855", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.229697", "type": "engine_start", "pid": 11100}
+{"ts": "2026-08-12T19:54:00.258945", "type": "engine_start", "pid": 11101}
+{"ts": "2026-08-12T19:54:00.279365", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.280330", "type": "engine_start", "pid": 11102}
+{"ts": "2026-08-12T19:54:00.285667", "type": "spray", "pid": 11103, "name": "KETW2666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.290454", "type": "spray", "pid": 11104, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.292671", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.294244", "type": "engine_start", "pid": 11106}
+{"ts": "2026-08-12T19:54:00.300182", "type": "spray", "pid": 11105, "name": "KETW2668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.303839", "type": "spray", "pid": 11108, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.304195", "type": "spray", "pid": 11107, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.306677", "type": "spray", "pid": 11109, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.313487", "type": "spray", "pid": 11111, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.313622", "type": "spray", "pid": 11110, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.319433", "type": "spray", "pid": 11112, "name": "KETW2670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.320562", "type": "spray", "pid": 11113, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.327509", "type": "spray", "pid": 11114, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.329294", "type": "spray", "pid": 11115, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.332176", "type": "spray", "pid": 11116, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.338214", "type": "spray", "pid": 11117, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.338404", "type": "spray", "pid": 11118, "name": "KETW2672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.342009", "type": "spray", "pid": 11119, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.346051", "type": "spray", "pid": 11120, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.347302", "type": "spray", "pid": 11121, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.352412", "type": "spray", "pid": 11122, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.355520", "type": "spray", "pid": 11123, "name": "KETW2674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.355695", "type": "spray", "pid": 11124, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.358697", "type": "spray", "pid": 11125, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.362716", "type": "spray", "pid": 11126, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.369119", "type": "spray", "pid": 11127, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.373591", "type": "spray", "pid": 11129, "name": "KETW2676", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.372930", "type": "spray", "pid": 11128, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.378179", "type": "spray", "pid": 11130, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.383405", "type": "spray", "pid": 11131, "name": "KETW2677", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.384765", "type": "spray", "pid": 11132, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.387340", "type": "spray", "pid": 11133, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.394457", "type": "spray", "pid": 11135, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.394177", "type": "spray", "pid": 11134, "name": "KETW2678", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.400735", "type": "spray", "pid": 11136, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.401762", "type": "spray", "pid": 11137, "name": "KETW2679", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.407288", "type": "spray", "pid": 11138, "name": "KETW2680", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.412456", "type": "spray", "pid": 11139, "name": "KETW2681", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.417462", "type": "spray", "pid": 11140, "name": "KETW2682", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.422167", "type": "spray", "pid": 11141, "name": "KETW2683", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.426827", "type": "spray", "pid": 11142, "name": "KETW2684", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.431667", "type": "spray", "pid": 11143, "name": "KETW2685", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.695031", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.696334", "type": "engine_start", "pid": 11144}
+{"ts": "2026-08-12T19:54:00.698614", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.699444", "type": "engine_start", "pid": 11145}
+{"ts": "2026-08-12T19:54:00.701612", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.702384", "type": "engine_start", "pid": 11146}
+{"ts": "2026-08-12T19:54:00.704502", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.705289", "type": "engine_start", "pid": 11147}
+{"ts": "2026-08-12T19:54:00.707340", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.708114", "type": "engine_start", "pid": 11148}
+{"ts": "2026-08-12T19:54:00.710156", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.710934", "type": "engine_start", "pid": 11149}
+{"ts": "2026-08-12T19:54:00.713109", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.714101", "type": "engine_start", "pid": 11150}
+{"ts": "2026-08-12T19:54:00.732175", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.733231", "type": "engine_start", "pid": 11151}
+{"ts": "2026-08-12T19:54:00.735377", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.736247", "type": "engine_start", "pid": 11152}
+{"ts": "2026-08-12T19:54:00.738531", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.739350", "type": "engine_start", "pid": 11153}
+{"ts": "2026-08-12T19:54:00.741279", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.742123", "type": "engine_start", "pid": 11154}
+{"ts": "2026-08-12T19:54:00.773528", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.774802", "type": "engine_start", "pid": 11155}
+{"ts": "2026-08-12T19:54:00.783164", "type": "spray", "pid": 11157, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.783294", "type": "spray", "pid": 11156, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.788885", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.790793", "type": "engine_start", "pid": 11160}
+{"ts": "2026-08-12T19:54:00.791131", "type": "spray", "pid": 11159, "name": "KETO0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.792944", "type": "spray", "pid": 11158, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.799003", "type": "spray", "pid": 11161, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.801095", "type": "spray", "pid": 11163, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.806262", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:00.807337", "type": "spray", "pid": 11164, "name": "KETO0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.808878", "type": "engine_start", "pid": 11166}
+{"ts": "2026-08-12T19:54:00.809770", "type": "spray", "pid": 11165, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.813389", "type": "root_verified", "uid": 0, "name": "root"}
+{"ts": "2026-08-12T19:54:00.818707", "type": "spray", "pid": 11168, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.818555", "type": "spray", "pid": 11167, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.822523", "type": "spray", "pid": 11169, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.826178", "type": "spray", "pid": 11170, "name": "KETO0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.830645", "type": "spray", "pid": 11172, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.830383", "type": "spray", "pid": 11171, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.837860", "type": "spray", "pid": 11173, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.838277", "type": "spray", "pid": 11174, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.839629", "type": "spray", "pid": 11175, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.846347", "type": "spray", "pid": 11176, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.850251", "type": "spray", "pid": 11177, "name": "KETO0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.852492", "type": "spray", "pid": 11179, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.851915", "type": "spray", "pid": 11178, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.860057", "type": "spray", "pid": 11180, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.863461", "type": "spray", "pid": 11181, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.864348", "type": "spray", "pid": 11182, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.869936", "type": "spray", "pid": 11183, "name": "KETO0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.872900", "type": "spray", "pid": 11184, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:00.873950", "type": "spray", "pid": 11185, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.878294", "type": "spray", "pid": 11186, "name": "KETO0010", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.881379", "type": "spray", "pid": 11187, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.885443", "type": "spray", "pid": 11188, "name": "KETO0011", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.888961", "type": "spray", "pid": 11189, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.892840", "type": "spray", "pid": 11190, "name": "KETO0012", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.896277", "type": "spray", "pid": 11191, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:00.899123", "type": "spray", "pid": 11192, "name": "KETO0013", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.903869", "type": "spray", "pid": 11193, "name": "KETO0014", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.909204", "type": "spray", "pid": 11194, "name": "KETO0015", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.913890", "type": "spray", "pid": 11195, "name": "KETO0016", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.919575", "type": "spray", "pid": 11196, "name": "KETO0017", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.924161", "type": "spray", "pid": 11197, "name": "KETO0018", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:00.929093", "type": "spray", "pid": 11198, "name": "KETO0019", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.174954", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.179094", "type": "engine_start", "pid": 11199}
+{"ts": "2026-08-12T19:54:01.181802", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.183824", "type": "engine_start", "pid": 11200}
+{"ts": "2026-08-12T19:54:01.186883", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.187862", "type": "engine_start", "pid": 11201}
+{"ts": "2026-08-12T19:54:01.190345", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.191310", "type": "engine_start", "pid": 11202}
+{"ts": "2026-08-12T19:54:01.193446", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.194271", "type": "engine_start", "pid": 11203}
+{"ts": "2026-08-12T19:54:01.196895", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.197973", "type": "engine_start", "pid": 11204}
+{"ts": "2026-08-12T19:54:01.200334", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.201417", "type": "engine_start", "pid": 11205}
+{"ts": "2026-08-12T19:54:01.203531", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.204453", "type": "engine_start", "pid": 11206}
+{"ts": "2026-08-12T19:54:01.206658", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.207598", "type": "engine_start", "pid": 11207}
+{"ts": "2026-08-12T19:54:01.209831", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.210859", "type": "engine_start", "pid": 11208}
+{"ts": "2026-08-12T19:54:01.229678", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.230558", "type": "engine_start", "pid": 11209}
+{"ts": "2026-08-12T19:54:01.232651", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.233429", "type": "engine_start", "pid": 11210}
+{"ts": "2026-08-12T19:54:01.235464", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.236210", "type": "engine_start", "pid": 11211}
+{"ts": "2026-08-12T19:54:01.238198", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.238941", "type": "engine_start", "pid": 11212}
+{"ts": "2026-08-12T19:54:01.241030", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.241742", "type": "engine_start", "pid": 11213}
+{"ts": "2026-08-12T19:54:01.256726", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.257583", "type": "engine_start", "pid": 11214}
+{"ts": "2026-08-12T19:54:01.260549", "type": "engine_start", "pid": 11216}
+{"ts": "2026-08-12T19:54:01.263156", "type": "spray", "pid": 11215, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.267850", "type": "spray", "pid": 11217, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.272854", "type": "spray", "pid": 11218, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.274732", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.276427", "type": "engine_start", "pid": 11220}
+{"ts": "2026-08-12T19:54:01.279080", "type": "spray", "pid": 11219, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.283541", "type": "spray", "pid": 11221, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.286112", "type": "spray", "pid": 11222, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.290255", "type": "spray", "pid": 11223, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.293558", "type": "spray", "pid": 11224, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.297761", "type": "spray", "pid": 11225, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.300970", "type": "spray", "pid": 11226, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.305353", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.305541", "type": "spray", "pid": 11227, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.310195", "type": "spray", "pid": 11228, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.310669", "type": "engine_start", "pid": 11230}
+{"ts": "2026-08-12T19:54:01.314358", "type": "spray", "pid": 11229, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.319399", "type": "spray", "pid": 11231, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.322635", "type": "spray", "pid": 11232, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.324407", "type": "spray", "pid": 11233, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.329379", "type": "spray", "pid": 11234, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.333686", "type": "spray", "pid": 11236, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.333268", "type": "spray", "pid": 11235, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.336514", "type": "spray", "pid": 11237, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.340323", "type": "spray", "pid": 11238, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.343463", "type": "spray", "pid": 11239, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.347500", "type": "spray", "pid": 11240, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.350485", "type": "spray", "pid": 11241, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.354206", "type": "spray", "pid": 11242, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.357060", "type": "spray", "pid": 11243, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.360925", "type": "spray", "pid": 11244, "name": "KETO0676", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.363612", "type": "spray", "pid": 11245, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.368341", "type": "spray", "pid": 11246, "name": "KETW2677", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.371127", "type": "spray", "pid": 11247, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.374603", "type": "spray", "pid": 11248, "name": "KETO0678", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.377147", "type": "spray", "pid": 11249, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.381279", "type": "spray", "pid": 11250, "name": "KETW2679", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.384413", "type": "spray", "pid": 11251, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.387551", "type": "spray", "pid": 11252, "name": "KETO0680", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.396449", "type": "spray", "pid": 11253, "name": "KETW2681", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.401518", "type": "spray", "pid": 11254, "name": "KETO0682", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.407069", "type": "spray", "pid": 11255, "name": "KETW2683", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.412246", "type": "spray", "pid": 11256, "name": "KETO0684", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.417895", "type": "spray", "pid": 11257, "name": "KETW2685", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.635175", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.636489", "type": "engine_start", "pid": 11258}
+{"ts": "2026-08-12T19:54:01.638880", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.639766", "type": "engine_start", "pid": 11259}
+{"ts": "2026-08-12T19:54:01.642129", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.642927", "type": "engine_start", "pid": 11260}
+{"ts": "2026-08-12T19:54:01.645221", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.645921", "type": "engine_start", "pid": 11261}
+{"ts": "2026-08-12T19:54:01.648151", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.648909", "type": "engine_start", "pid": 11262}
+{"ts": "2026-08-12T19:54:01.684929", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.685798", "type": "engine_start", "pid": 11263}
+{"ts": "2026-08-12T19:54:01.687892", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.688685", "type": "engine_start", "pid": 11264}
+{"ts": "2026-08-12T19:54:01.690661", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.691448", "type": "engine_start", "pid": 11265}
+{"ts": "2026-08-12T19:54:01.693428", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.694168", "type": "engine_start", "pid": 11266}
+{"ts": "2026-08-12T19:54:01.711714", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.712543", "type": "engine_start", "pid": 11267}
+{"ts": "2026-08-12T19:54:01.717596", "type": "spray", "pid": 11268, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.719444", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.721203", "type": "engine_start", "pid": 11270}
+{"ts": "2026-08-12T19:54:01.723107", "type": "spray", "pid": 11269, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.724131", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.727139", "type": "engine_start", "pid": 11272}
+{"ts": "2026-08-12T19:54:01.729054", "type": "spray", "pid": 11271, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.729390", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.732348", "type": "engine_start", "pid": 11274}
+{"ts": "2026-08-12T19:54:01.734693", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.734598", "type": "spray", "pid": 11273, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.737369", "type": "engine_start", "pid": 11276}
+{"ts": "2026-08-12T19:54:01.739538", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.739707", "type": "spray", "pid": 11275, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.742366", "type": "engine_start", "pid": 11278}
+{"ts": "2026-08-12T19:54:01.744723", "type": "spray", "pid": 11277, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.749513", "type": "spray", "pid": 11279, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.754261", "type": "spray", "pid": 11280, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.757072", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.758931", "type": "engine_start", "pid": 11282}
+{"ts": "2026-08-12T19:54:01.761828", "type": "spray", "pid": 11281, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.766586", "type": "spray", "pid": 11283, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.769789", "type": "spray", "pid": 11284, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.774364", "type": "spray", "pid": 11285, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.778376", "type": "spray", "pid": 11286, "name": "KETW1343", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.782795", "type": "spray", "pid": 11287, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.787274", "type": "spray", "pid": 11288, "name": "KETO0344", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.790789", "type": "spray", "pid": 11289, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.794669", "type": "spray", "pid": 11290, "name": "KETW1345", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.799143", "type": "spray", "pid": 11291, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.802332", "type": "spray", "pid": 11292, "name": "KETO0346", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.805931", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:01.808517", "type": "engine_start", "pid": 11295}
+{"ts": "2026-08-12T19:54:01.808437", "type": "spray", "pid": 11293, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.810147", "type": "spray", "pid": 11294, "name": "KETW1347", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.814926", "type": "spray", "pid": 11296, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.820531", "type": "spray", "pid": 11297, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.821932", "type": "spray", "pid": 11298, "name": "KETO0348", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.826846", "type": "spray", "pid": 11299, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.830391", "type": "spray", "pid": 11300, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.831670", "type": "spray", "pid": 11301, "name": "KETW1349", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.838163", "type": "spray", "pid": 11302, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.841879", "type": "spray", "pid": 11303, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.842076", "type": "spray", "pid": 11304, "name": "KETO0350", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.846599", "type": "spray", "pid": 11305, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.850544", "type": "spray", "pid": 11307, "name": "KETW1351", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.851364", "type": "spray", "pid": 11306, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:01.852498", "type": "spray", "pid": 11308, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.858652", "type": "spray", "pid": 11309, "name": "KETO0352", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:01.861221", "type": "spray", "pid": 11310, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.865858", "type": "spray", "pid": 11311, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.870595", "type": "spray", "pid": 11312, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.874967", "type": "spray", "pid": 11313, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:01.879595", "type": "spray", "pid": 11314, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.153396", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.156823", "type": "engine_start", "pid": 11315}
+{"ts": "2026-08-12T19:54:02.159069", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.160180", "type": "engine_start", "pid": 11316}
+{"ts": "2026-08-12T19:54:02.170264", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.185144", "type": "engine_start", "pid": 11317}
+{"ts": "2026-08-12T19:54:02.192863", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.193983", "type": "engine_start", "pid": 11318}
+{"ts": "2026-08-12T19:54:02.196651", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.197544", "type": "engine_start", "pid": 11319}
+{"ts": "2026-08-12T19:54:02.199876", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.200784", "type": "engine_start", "pid": 11320}
+{"ts": "2026-08-12T19:54:02.202936", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.203767", "type": "engine_start", "pid": 11321}
+{"ts": "2026-08-12T19:54:02.206030", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.206915", "type": "engine_start", "pid": 11322}
+{"ts": "2026-08-12T19:54:02.209186", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.210074", "type": "engine_start", "pid": 11323}
+{"ts": "2026-08-12T19:54:02.212515", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.213778", "type": "engine_start", "pid": 11324}
+{"ts": "2026-08-12T19:54:02.264722", "type": "engine_start", "pid": 11325}
+{"ts": "2026-08-12T19:54:02.272831", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.274012", "type": "engine_start", "pid": 11327}
+{"ts": "2026-08-12T19:54:02.274817", "type": "spray", "pid": 11326, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.280037", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.281719", "type": "engine_start", "pid": 11330}
+{"ts": "2026-08-12T19:54:02.283892", "type": "spray", "pid": 11329, "name": "KETO0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.282823", "type": "spray", "pid": 11328, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.289698", "type": "spray", "pid": 11331, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.293492", "type": "spray", "pid": 11333, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.293251", "type": "spray", "pid": 11332, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.297232", "type": "spray", "pid": 11334, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.302641", "type": "spray", "pid": 11335, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.303832", "type": "spray", "pid": 11336, "name": "KETO0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.308294", "type": "spray", "pid": 11337, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.312530", "type": "spray", "pid": 11338, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.313014", "type": "spray", "pid": 11339, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.317590", "type": "spray", "pid": 11340, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.321569", "type": "spray", "pid": 11342, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.321755", "type": "spray", "pid": 11341, "name": "KETO0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.327254", "type": "spray", "pid": 11343, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.328395", "type": "spray", "pid": 11344, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.331626", "type": "spray", "pid": 11345, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.336632", "type": "spray", "pid": 11346, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.338134", "type": "spray", "pid": 11347, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.343095", "type": "spray", "pid": 11348, "name": "KETO0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.344491", "type": "spray", "pid": 11349, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.348253", "type": "spray", "pid": 11350, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.352649", "type": "spray", "pid": 11351, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.356363", "type": "spray", "pid": 11352, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.357406", "type": "spray", "pid": 11353, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.362629", "type": "spray", "pid": 11354, "name": "KETO0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.367166", "type": "spray", "pid": 11355, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.368013", "type": "spray", "pid": 11356, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.371621", "type": "spray", "pid": 11357, "name": "KETO0010", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.376121", "type": "spray", "pid": 11358, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.379501", "type": "spray", "pid": 11359, "name": "KETO0011", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.385208", "type": "spray", "pid": 11360, "name": "KETO0012", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.390643", "type": "spray", "pid": 11361, "name": "KETO0013", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.395729", "type": "spray", "pid": 11362, "name": "KETO0014", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.400670", "type": "spray", "pid": 11363, "name": "KETO0015", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.405949", "type": "spray", "pid": 11364, "name": "KETO0016", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.410590", "type": "spray", "pid": 11365, "name": "KETO0017", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.415606", "type": "spray", "pid": 11366, "name": "KETO0018", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.421111", "type": "spray", "pid": 11367, "name": "KETO0019", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.668960", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.670772", "type": "engine_start", "pid": 11368}
+{"ts": "2026-08-12T19:54:02.673316", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.674261", "type": "engine_start", "pid": 11369}
+{"ts": "2026-08-12T19:54:02.676645", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.677571", "type": "engine_start", "pid": 11370}
+{"ts": "2026-08-12T19:54:02.679906", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.680845", "type": "engine_start", "pid": 11371}
+{"ts": "2026-08-12T19:54:02.683004", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.683815", "type": "engine_start", "pid": 11372}
+{"ts": "2026-08-12T19:54:02.685955", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.686768", "type": "engine_start", "pid": 11373}
+{"ts": "2026-08-12T19:54:02.689228", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.690050", "type": "engine_start", "pid": 11374}
+{"ts": "2026-08-12T19:54:02.692285", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.693139", "type": "engine_start", "pid": 11375}
+{"ts": "2026-08-12T19:54:02.721500", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.722517", "type": "engine_start", "pid": 11376}
+{"ts": "2026-08-12T19:54:02.724673", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.725444", "type": "engine_start", "pid": 11377}
+{"ts": "2026-08-12T19:54:02.727568", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.728373", "type": "engine_start", "pid": 11378}
+{"ts": "2026-08-12T19:54:02.730404", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.731178", "type": "engine_start", "pid": 11379}
+{"ts": "2026-08-12T19:54:02.746265", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.747193", "type": "engine_start", "pid": 11380}
+{"ts": "2026-08-12T19:54:02.752453", "type": "spray", "pid": 11381, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.756067", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.757356", "type": "engine_start", "pid": 11383}
+{"ts": "2026-08-12T19:54:02.759401", "type": "spray", "pid": 11382, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.763418", "type": "spray", "pid": 11384, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.766638", "type": "spray", "pid": 11385, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.769904", "type": "spray", "pid": 11386, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.774149", "type": "spray", "pid": 11387, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.775643", "type": "spray", "pid": 11388, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.782793", "type": "spray", "pid": 11390, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.782704", "type": "spray", "pid": 11389, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.790400", "type": "spray", "pid": 11392, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.790479", "type": "spray", "pid": 11391, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.794553", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.796171", "type": "engine_start", "pid": 11395}
+{"ts": "2026-08-12T19:54:02.796603", "type": "spray", "pid": 11393, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.799041", "type": "spray", "pid": 11394, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.805891", "type": "spray", "pid": 11396, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.806170", "type": "spray", "pid": 11398, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.806303", "type": "spray", "pid": 11397, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.813699", "type": "spray", "pid": 11399, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.814285", "type": "spray", "pid": 11400, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.817899", "type": "spray", "pid": 11401, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.818605", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:02.822321", "type": "spray", "pid": 11402, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.824005", "type": "spray", "pid": 11403, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:02.827397", "type": "engine_start", "pid": 11406}
+{"ts": "2026-08-12T19:54:02.827501", "type": "spray", "pid": 11404, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.831375", "type": "spray", "pid": 11405, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.835868", "type": "spray", "pid": 11407, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:02.839105", "type": "spray", "pid": 11409, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.841653", "type": "root_verified", "uid": 0, "name": "root"}
+{"ts": "2026-08-12T19:54:02.844240", "type": "spray", "pid": 11410, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.849318", "type": "spray", "pid": 11411, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.853897", "type": "spray", "pid": 11412, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.859295", "type": "spray", "pid": 11413, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:02.864462", "type": "spray", "pid": 11414, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.127900", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.129222", "type": "engine_start", "pid": 11415}
+{"ts": "2026-08-12T19:54:03.131535", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.132478", "type": "engine_start", "pid": 11416}
+{"ts": "2026-08-12T19:54:03.134562", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.135388", "type": "engine_start", "pid": 11417}
+{"ts": "2026-08-12T19:54:03.137554", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.138415", "type": "engine_start", "pid": 11418}
+{"ts": "2026-08-12T19:54:03.140413", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.141543", "type": "engine_start", "pid": 11419}
+{"ts": "2026-08-12T19:54:03.143590", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.144559", "type": "engine_start", "pid": 11420}
+{"ts": "2026-08-12T19:54:03.146914", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.147835", "type": "engine_start", "pid": 11421}
+{"ts": "2026-08-12T19:54:03.150114", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.150892", "type": "engine_start", "pid": 11422}
+{"ts": "2026-08-12T19:54:03.164843", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.165685", "type": "engine_start", "pid": 11423}
+{"ts": "2026-08-12T19:54:03.167627", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.168408", "type": "engine_start", "pid": 11424}
+{"ts": "2026-08-12T19:54:03.170406", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.171183", "type": "engine_start", "pid": 11425}
+{"ts": "2026-08-12T19:54:03.173191", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.173932", "type": "engine_start", "pid": 11426}
+{"ts": "2026-08-12T19:54:03.207381", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.208334", "type": "engine_start", "pid": 11427}
+{"ts": "2026-08-12T19:54:03.213708", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.213815", "type": "spray", "pid": 11428, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.216702", "type": "engine_start", "pid": 11430}
+{"ts": "2026-08-12T19:54:03.220140", "type": "spray", "pid": 11429, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.224704", "type": "spray", "pid": 11431, "name": "KETO0333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.227248", "type": "spray", "pid": 11432, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.231856", "type": "spray", "pid": 11433, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.232261", "type": "spray", "pid": 11434, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.237341", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.238873", "type": "engine_start", "pid": 11437}
+{"ts": "2026-08-12T19:54:03.239213", "type": "spray", "pid": 11435, "name": "KETO0335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.240080", "type": "spray", "pid": 11436, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.247162", "type": "spray", "pid": 11438, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.249608", "type": "spray", "pid": 11439, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.251164", "type": "spray", "pid": 11440, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.256054", "type": "spray", "pid": 11441, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.259764", "type": "spray", "pid": 11442, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.260905", "type": "spray", "pid": 11443, "name": "KETO0337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.265230", "type": "spray", "pid": 11444, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.269063", "type": "spray", "pid": 11445, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.269214", "type": "spray", "pid": 11446, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.271630", "type": "engine_start", "pid": 11448}
+{"ts": "2026-08-12T19:54:03.275621", "type": "spray", "pid": 11447, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.280435", "type": "spray", "pid": 11449, "name": "KETO0339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.282131", "type": "spray", "pid": 11450, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.286732", "type": "spray", "pid": 11451, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.290420", "type": "spray", "pid": 11452, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.292595", "type": "spray", "pid": 11453, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.296633", "type": "spray", "pid": 11454, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.299736", "type": "spray", "pid": 11455, "name": "KETO0341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.303977", "type": "spray", "pid": 11456, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.308535", "type": "spray", "pid": 11457, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.313051", "type": "spray", "pid": 11458, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.315999", "type": "spray", "pid": 11459, "name": "KETO0343", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.320962", "type": "spray", "pid": 11460, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.324044", "type": "spray", "pid": 11461, "name": "KETO0344", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.328202", "type": "spray", "pid": 11462, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.331139", "type": "spray", "pid": 11463, "name": "KETO0345", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.336041", "type": "spray", "pid": 11464, "name": "KETO0010", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.339246", "type": "spray", "pid": 11465, "name": "KETO0346", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.343587", "type": "spray", "pid": 11466, "name": "KETW0011", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.347562", "type": "spray", "pid": 11467, "name": "KETO0347", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.353445", "type": "spray", "pid": 11468, "name": "KETO0012", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.357063", "type": "spray", "pid": 11469, "name": "KETO0348", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.361014", "type": "spray", "pid": 11470, "name": "KETW0013", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.365902", "type": "spray", "pid": 11471, "name": "KETO0349", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.370289", "type": "spray", "pid": 11472, "name": "KETO0014", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.374433", "type": "spray", "pid": 11473, "name": "KETO0350", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.379285", "type": "spray", "pid": 11474, "name": "KETW0015", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.382466", "type": "spray", "pid": 11475, "name": "KETO0351", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.388754", "type": "spray", "pid": 11476, "name": "KETO0016", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.392580", "type": "spray", "pid": 11477, "name": "KETO0352", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.395423", "type": "spray", "pid": 11478, "name": "KETW0017", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.400392", "type": "spray", "pid": 11479, "name": "KETO0018", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.405327", "type": "spray", "pid": 11480, "name": "KETW0019", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.593692", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.594992", "type": "engine_start", "pid": 11481}
+{"ts": "2026-08-12T19:54:03.597799", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.598703", "type": "engine_start", "pid": 11482}
+{"ts": "2026-08-12T19:54:03.601165", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.602007", "type": "engine_start", "pid": 11483}
+{"ts": "2026-08-12T19:54:03.604309", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.605079", "type": "engine_start", "pid": 11484}
+{"ts": "2026-08-12T19:54:03.607325", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.608124", "type": "engine_start", "pid": 11485}
+{"ts": "2026-08-12T19:54:03.670800", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.672008", "type": "engine_start", "pid": 11486}
+{"ts": "2026-08-12T19:54:03.677413", "type": "spray", "pid": 11487, "name": "KETO0666", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.682358", "type": "spray", "pid": 11488, "name": "KETW2667", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.686987", "type": "spray", "pid": 11489, "name": "KETO0668", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.692195", "type": "spray", "pid": 11490, "name": "KETW2669", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.693840", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.695375", "type": "engine_start", "pid": 11492}
+{"ts": "2026-08-12T19:54:03.697088", "type": "spray", "pid": 11491, "name": "KETO0670", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.698225", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.700683", "type": "engine_start", "pid": 11494}
+{"ts": "2026-08-12T19:54:03.703040", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.702961", "type": "spray", "pid": 11493, "name": "KETW2671", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.705869", "type": "engine_start", "pid": 11496}
+{"ts": "2026-08-12T19:54:03.708088", "type": "spray", "pid": 11495, "name": "KETO0672", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.708258", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.711227", "type": "engine_start", "pid": 11498}
+{"ts": "2026-08-12T19:54:03.713391", "type": "spray", "pid": 11497, "name": "KETW2673", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.714329", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.716885", "type": "engine_start", "pid": 11500}
+{"ts": "2026-08-12T19:54:03.718839", "type": "spray", "pid": 11499, "name": "KETO0674", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.720055", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.723045", "type": "engine_start", "pid": 11502}
+{"ts": "2026-08-12T19:54:03.725345", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.725441", "type": "spray", "pid": 11501, "name": "KETW2675", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.726915", "type": "engine_start", "pid": 11503}
+{"ts": "2026-08-12T19:54:03.732191", "type": "spray", "pid": 11504, "name": "KETO0676", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.736730", "type": "spray", "pid": 11505, "name": "KETW2677", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.741340", "type": "spray", "pid": 11506, "name": "KETO0678", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.746142", "type": "spray", "pid": 11507, "name": "KETW2679", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.750613", "type": "spray", "pid": 11508, "name": "KETO0680", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.752935", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.754867", "type": "engine_start", "pid": 11510}
+{"ts": "2026-08-12T19:54:03.756460", "type": "spray", "pid": 11509, "name": "KETW2681", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.761257", "type": "spray", "pid": 11511, "name": "KETO0682", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.766107", "type": "spray", "pid": 11512, "name": "KETW2683", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.770837", "type": "spray", "pid": 11513, "name": "KETO0684", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.775744", "type": "spray", "pid": 11514, "name": "KETW2685", "batch": 33, "worker": 2}
+{"ts": "2026-08-12T19:54:03.780329", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.781465", "type": "engine_start", "pid": 11515}
+{"ts": "2026-08-12T19:54:03.789988", "type": "spray", "pid": 11516, "name": "KETW1333", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.793452", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:03.797649", "type": "spray", "pid": 11517, "name": "KETO0334", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.797696", "type": "engine_start", "pid": 11518}
+{"ts": "2026-08-12T19:54:03.804781", "type": "spray", "pid": 11519, "name": "KETW1335", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.809403", "type": "spray", "pid": 11520, "name": "KETO0000", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.812574", "type": "spray", "pid": 11521, "name": "KETO0336", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.817029", "type": "spray", "pid": 11522, "name": "KETW0001", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.820628", "type": "spray", "pid": 11523, "name": "KETW1337", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.824743", "type": "spray", "pid": 11524, "name": "KETO0002", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.827543", "type": "spray", "pid": 11525, "name": "KETO0338", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.832228", "type": "spray", "pid": 11526, "name": "KETW0003", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.834863", "type": "spray", "pid": 11527, "name": "KETW1339", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.839435", "type": "spray", "pid": 11528, "name": "KETO0004", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.842596", "type": "spray", "pid": 11529, "name": "KETO0340", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.847822", "type": "spray", "pid": 11530, "name": "KETW0005", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.850648", "type": "spray", "pid": 11531, "name": "KETW1341", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.855206", "type": "spray", "pid": 11532, "name": "KETO0006", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.858000", "type": "spray", "pid": 11533, "name": "KETO0342", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.863179", "type": "spray", "pid": 11534, "name": "KETW0007", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.865705", "type": "spray", "pid": 11535, "name": "KETW1343", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.871121", "type": "spray", "pid": 11536, "name": "KETO0008", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.873634", "type": "spray", "pid": 11537, "name": "KETO0344", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.877455", "type": "spray", "pid": 11538, "name": "KETW0009", "batch": 0, "worker": 0}
+{"ts": "2026-08-12T19:54:03.879640", "type": "spray", "pid": 11539, "name": "KETW1345", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.884072", "type": "spray", "pid": 11540, "name": "KETO0346", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.889080", "type": "spray", "pid": 11541, "name": "KETW1347", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.893961", "type": "spray", "pid": 11542, "name": "KETO0348", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.899612", "type": "spray", "pid": 11543, "name": "KETW1349", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.904290", "type": "spray", "pid": 11544, "name": "KETO0350", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.909734", "type": "spray", "pid": 11545, "name": "KETW1351", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:03.914555", "type": "spray", "pid": 11546, "name": "KETO0352", "batch": 16, "worker": 1}
+{"ts": "2026-08-12T19:54:04.076152", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.077733", "type": "engine_start", "pid": 11547}
+{"ts": "2026-08-12T19:54:04.080227", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.081137", "type": "engine_start", "pid": 11548}
+{"ts": "2026-08-12T19:54:04.083217", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.084138", "type": "engine_start", "pid": 11549}
+{"ts": "2026-08-12T19:54:04.086383", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.087210", "type": "engine_start", "pid": 11550}
+{"ts": "2026-08-12T19:54:04.089409", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.090221", "type": "engine_start", "pid": 11551}
+{"ts": "2026-08-12T19:54:04.152841", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
+{"ts": "2026-08-12T19:54:04.153963", "type": "engine_start", "pid": 11552}

