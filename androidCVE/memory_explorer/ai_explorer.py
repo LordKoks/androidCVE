@@ -396,15 +396,23 @@ class MemoryExplorerAI:
                 out.append(f" {C.GRY}(No items yet — press {C.WHT}[E]{C.GRY} to exploit, "
                            f"{C.WHT}[L]{C.GRY} to learn, {C.WHT}[S]{C.GRY} to scan){C.RST}")
             else:
-                display = self.found_items[-12:]
+                # Show up to 20 most recent items, but indicate total count
+                # so the user knows there are more (use 'list' to enumerate).
+                total = len(self.found_items)
+                display = self.found_items[-20:]
                 for i, item in enumerate(display):
-                    idx = len(self.found_items) - len(display) + i
+                    idx = total - len(display) + i
                     color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
-                             "System App": C.BLU, "Kernel Code": C.MAG}.get(item['type'], C.GRY)
+                             "System App": C.BLU, "Kernel Code": C.MAG,
+                             "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
+                             "Privilege Struct (ROOTED)": C.GRN,
+                             "Kernel Global": C.CYN}.get(item['type'], C.GRY)
                     out.append(f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
-                               f"{color}{item['type']:<18}{C.RST} │ "
-                               f"{C.WHT}{item['description'][:40]:<40}{C.RST} │ "
+                               f"{color}{item['type']:<24}{C.RST} │ "
+                               f"{C.WHT}{item['description'][:48]:<48}{C.RST} │ "
                                f"{C.CYN}{item['va']}{C.RST}")
+                if total > 20:
+                    out.append(f" {C.DIM}… and {total - 20} more (type 'list' to see all){C.RST}")
 
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -420,6 +428,11 @@ class MemoryExplorerAI:
                 f"{C.BLU}[B]{C.RST} Rebuild Engine    "
                 f"{C.BLU}[Q]{C.RST} Exit Explorer     "
                 f"{C.BLU}[ID]{C.RST} Open File"
+            )
+            out.append(
+                f" {C.BLU}[list]{C.RST} Show All Items "
+                f" {C.BLU}[kb]{C.RST} Kernel Intel   "
+                f" {C.BLU}[log]{C.RST} Spray Log"
             )
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -996,11 +1009,33 @@ class MemoryExplorerAI:
                             continue
                         self.live["scan_offset"] = va - self.uaf_start
                         data = self._read_data_packet()
-                        if data and not any(int(it['va'], 16) == va for it in self.found_items):
+                        if not data:
+                            continue
+                        if any(int(it['va'], 16) == va for it in self.found_items):
+                            continue
+                        # Strong matches go in immediately
+                        if sig in (1, 3, 4, 6) or self._is_real_task_struct(data):
                             with self.bg_lock:
-                                self.found_items.append(self.classify_page(data, va, sig, off_in_page))
+                                self.found_items.append(
+                                    self.classify_page(data, va, sig, off_in_page))
                             self.log_event("scan_match", {"va": va,
-                                                           "type": self.found_items[-1]['type']})
+                                                           "type": self.found_items[-1]['type'],
+                                                           "sig": sig})
+                        else:
+                            # Keep weaker matches as "Unknown Object"
+                            interesting, reason, conf = self._is_page_interesting(data)
+                            if interesting:
+                                with self.bg_lock:
+                                    self.found_items.append({
+                                        "type": "Unknown Object",
+                                        "description": f"Auto-found ({reason})",
+                                        "va": hex(va),
+                                        "confidence": conf,
+                                        "data": data,
+                                        "ts": datetime.datetime.now().isoformat(),
+                                    })
+                                self.log_event("scan_auto", {"va": va, "reason": reason,
+                                                              "conf": conf})
 
                 self.live["scan_offset"] = self.scan_size
                 self.live["last_msg"] = f"Scan complete. Found {len(self.found_items)} items."
@@ -1137,26 +1172,46 @@ class MemoryExplorerAI:
                         if not data:
                             continue
                         self.learn_stats["matches"] += 1
-                        # 3) CLASSIFY & VERIFY (filter false positives)
-                        # Always require KETO0422 or kernel ELF/cred pointer to be 100%
+                        # 3) CLASSIFY & DECIDE (keep all interesting pages)
+                        already = any(int(it['va'], 16) == va for it in self.found_items)
+                        if already:
+                            continue
+                        # Strong matches (sig from engine or task_struct) go in
+                        # with high confidence immediately
                         if sig in (1, 3, 4, 6) or self._is_real_task_struct(data):
-                            if not any(int(it['va'], 16) == va for it in self.found_items):
-                                with self.bg_lock:
-                                    self.found_items.append(
-                                        self.classify_page(data, va, sig, off_in_page))
-                                self.log_event("scan_match", {"va": va,
-                                                               "type": self.found_items[-1]['type'],
-                                                               "sig": sig})
-                                self.learn_stats["verified"] += 1
-                                # Cross-correlate: if we found a task_struct, the kernel
-                                # base is likely nearby — record it
-                                if sig == 1 and off_in_page >= 0:
-                                    possible_kbase = va & ~0xFFFFFF  # 16MB aligned
-                                    self.knowledge_base.setdefault("candidate_kbases", []).append(hex(possible_kbase))
+                            with self.bg_lock:
+                                self.found_items.append(
+                                    self.classify_page(data, va, sig, off_in_page))
+                            self.log_event("scan_match", {"va": va,
+                                                           "type": self.found_items[-1]['type'],
+                                                           "sig": sig})
+                            self.learn_stats["verified"] += 1
+                            # Cross-correlate
+                            if sig == 1 and off_in_page >= 0:
+                                possible_kbase = va & ~0xFFFFFF
+                                self.knowledge_base.setdefault(
+                                    "candidate_kbases", []).append(hex(possible_kbase))
                         else:
-                            self.learn_stats["false_positives"] += 1
-                            self.log_event("scan_filter", {"va": va, "sig": sig,
-                                                            "reason": "weak signature"})
+                            # Keep weaker matches as "Unknown Object" so user
+                            # can inspect them manually
+                            interesting, reason, conf = self._is_page_interesting(data)
+                            if interesting:
+                                with self.bg_lock:
+                                    self.found_items.append({
+                                        "type": "Unknown Object",
+                                        "description": f"Auto-found ({reason})",
+                                        "va": hex(va),
+                                        "confidence": conf,
+                                        "data": data,
+                                        "ts": datetime.datetime.now().isoformat(),
+                                    })
+                                self.log_event("scan_auto", {"va": va, "reason": reason,
+                                                              "conf": conf})
+                                self.learn_stats["auto_kept"] = self.learn_stats.get("auto_kept", 0) + 1
+                            else:
+                                self.learn_stats["false_positives"] += 1
+                                self.log_event("scan_filter", {"va": va, "sig": sig,
+                                                                "reason": reason})
                 if scan_done:
                     done += batch
                     self.live["spray_count"] = done
@@ -1215,6 +1270,35 @@ class MemoryExplorerAI:
             return True
         return False
 
+    def _is_page_interesting(self, data):
+        """Less strict: does this page have ANY non-trivial data?
+        Returns (interesting, reason, confidence)."""
+        if not data or len(data) < 16:
+            return (False, "too small", 0)
+        # Count non-zero
+        nonzero = sum(1 for b in data if b != 0)
+        if nonzero < 16:
+            return (False, f"mostly zero ({nonzero}/4096)", 0)
+        # Look for kernel pointers
+        for i in range(0, len(data) - 8, 8):
+            v = int.from_bytes(data[i:i+8], "little")
+            if 0xffffff8000000000 <= v <= 0xffffffcfffffffff and v != 0:
+                return (True, f"kernel pointer at 0x{i:x}", 70)
+        # Look for strings
+        ascii_runs = 0
+        run = 0
+        for b in data:
+            if 0x20 <= b <= 0x7e:
+                run += 1
+                if run >= 4:
+                    ascii_runs += 1
+                    if ascii_runs >= 2:
+                        return (True, f"has strings ({ascii_runs} runs)", 50)
+            else:
+                run = 0
+        # Any non-zero data is at least "Unknown Object"
+        return (True, f"has data ({nonzero} bytes)", 30)
+
     def cmd_learning_cancel(self):
         """Cancel running learning loop (Ctrl+P shortcut)."""
         self.cancel_flag.set()
@@ -1230,21 +1314,34 @@ class MemoryExplorerAI:
         self.live["last_msg"] = "Learning cancelled by user."
         return "Cancelled"
 
-    # ============== INPUT (with Ctrl+P detection) ==============
+    # ============== INPUT (non-blocking, with Ctrl+P / history / live TUI) ==============
     def input_cmd(self):
-        """Read one line, with history (Up/Down), Ctrl+P cancel, Ctrl+E rewind, Ctrl+C quit."""
+        """Read one line using select() with a short timeout so the TUI can
+        auto-redraw every 0.3s even while the user is thinking (no key pressed).
+        Supports: Ctrl+C (quit), Ctrl+P (cancel learning), Ctrl+E (rewind),
+        Up/Down (history), Enter (submit), Backspace (erase)."""
         self.is_reading_input = True
         try:
-            with self.render_lock:
-                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
-                sys.stdout.flush()
+            # Initial prompt (rendered once)
+            self._print_prompt("")
             fd = sys.stdin.fileno()
             old = termios.tcgetattr(fd)
             try:
                 tty.setraw(fd)
                 buf = []
                 hist_idx = len(self.cmd_history)
+                last_redraw = 0.0
                 while True:
+                    # Wait for either a key (0.3s) or timeout
+                    r, _, _ = select.select([fd], [], [], 0.3)
+                    now = time.time()
+                    # Auto-redraw TUI every 0.3s while user is "thinking"
+                    if not r:
+                        if now - last_redraw >= 0.3:
+                            # Save cursor, redraw TUI in a separate scroll region
+                            self._tui_refresh_inline()
+                            last_redraw = now
+                        continue
                     ch = os.read(fd, 1)
                     if not ch:
                         break
@@ -1255,11 +1352,11 @@ class MemoryExplorerAI:
                     if c == "\x10":  # Ctrl+P  -> cancel learning
                         self.cmd_learning_cancel()
                         self.live["last_msg"] = "Press 'L' to start a new learning cycle."
-                        sys.stdout.write(f"\n{C.YEL}  [Ctrl+P] Learning cancelled. Press 'L' to restart.{C.RST}\n")
-                        sys.stdout.flush()
+                        self._print_prompt("".join(buf), extra="\n [Ctrl+P] Learning cancelled.\n")
                         continue
                     if c in ("\r", "\n"):
                         sys.stdout.write("\n")
+                        sys.stdout.flush()
                         break
                     if c == "\x7f" or c == "\b":
                         if buf:
@@ -1269,32 +1366,24 @@ class MemoryExplorerAI:
                         continue
                     if c == "\x05":  # Ctrl+E -> rewind to last command
                         if self.last_cmd_text:
-                            sys.stdout.write("\033[2K\r")
-                            sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.last_cmd_text}")
-                            sys.stdout.flush()
+                            self._print_prompt(self.last_cmd_text)
                             buf = list(self.last_cmd_text)
                         continue
                     if c == "\x1b":  # ESC sequence (arrow keys)
                         nxt = os.read(fd, 2)
-                        if nxt == b"[A":  # Up arrow -> previous in history
+                        if nxt == b"[A":  # Up arrow
                             if self.cmd_history and hist_idx > 0:
                                 hist_idx -= 1
-                                sys.stdout.write("\033[2K\r")
-                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
-                                sys.stdout.flush()
+                                self._print_prompt(self.cmd_history[hist_idx])
                                 buf = list(self.cmd_history[hist_idx])
-                        elif nxt == b"[B":  # Down arrow -> next in history
+                        elif nxt == b"[B":  # Down arrow
                             if self.cmd_history and hist_idx < len(self.cmd_history) - 1:
                                 hist_idx += 1
-                                sys.stdout.write("\033[2K\r")
-                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {self.cmd_history[hist_idx]}")
-                                sys.stdout.flush()
+                                self._print_prompt(self.cmd_history[hist_idx])
                                 buf = list(self.cmd_history[hist_idx])
-                            elif self.cmd_history and hist_idx == len(self.cmd_history) - 1:
-                                hist_idx += 1
-                                sys.stdout.write("\033[2K\r")
-                                sys.stdout.write(f"\n {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
-                                sys.stdout.flush()
+                            else:
+                                hist_idx = len(self.cmd_history)
+                                self._print_prompt("")
                                 buf = []
                         continue
                     buf.append(c)
@@ -1311,6 +1400,42 @@ class MemoryExplorerAI:
             return cmd
         finally:
             self.is_reading_input = False
+
+    def _print_prompt(self, buf, extra=""):
+        """Print the prompt + buffer on its own line, clearing any previous text."""
+        sys.stdout.write(f"\r\033[2K{extra} {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {buf}")
+        sys.stdout.flush()
+
+    def _tui_refresh_inline(self):
+        """Redraw a compact live status line just above the prompt while user
+        is typing. This makes the user feel like the TUI is alive without
+        disturbing their input. Skipped if a render is already in progress."""
+        if not self.render_lock.acquire(blocking=False):
+            return
+        try:
+            L = self.live
+            ram = L["ram"]
+            ram_c = C.GRN if ram < 50 else (C.YEL if ram < 75 else C.RED)
+            st = L["status"]
+            st_c = C.GRN if "ACTIVE" in st or "SCAN" in st or "EXPLOIT" in st else C.GRY
+            spray_pct = min(99, 100 * L["spray_count"] // max(1, L["spray_target"])) if L["spray_target"] else 0
+            # Use ANSI save/restore cursor so we don't disturb prompt position
+            sys.stdout.write(
+                f"\0337"  # save cursor
+                f"\033[1A\r\033[2K"  # up one line, clear
+                f" {C.DIM}live:{C.RST} "
+                f"{st_c}{st:<14}{C.RST} {C.GRY}│{C.RST} "
+                f"RAM {ram_c}{ram:5.1f}%{C.RST} {C.GRY}│{C.RST} "
+                f"AI {C.MAG}{L['ai_patterns']:>4}{C.RST} {C.GRY}│{C.RST} "
+                f"spray {C.CYN}{spray_pct:>3}%{C.RST} {C.GRY}│{C.RST} "
+                f"last: {C.YEL}{L['last_msg'][:60]}{C.RST}\n"
+                f"\0338"  # restore cursor
+            )
+            sys.stdout.flush()
+        except Exception:
+            pass
+        finally:
+            self.render_lock.release()
 
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
@@ -1438,6 +1563,73 @@ class MemoryExplorerAI:
                         sys.stdout.write(json.dumps(e) + "\n")
                 sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
                 sys.stdout.write(f"\n{C.GRY}Log file: {C.WHT}{self.log_path}{C.RST}\n")
+                sys.stdout.write("Press Enter to return...")
+                sys.stdout.flush()
+                try:
+                    self.input_cmd()
+                except Exception:
+                    pass
+            elif cmd in ("list", "ls", "items"):
+                # Show ALL found items (paginated 25 per page)
+                sys.stdout.write(C.CLR)
+                sys.stdout.write(f"{C.BOLD}{C.CYN}=== FOUND MEMORY OFFSETS ({len(self.found_items)} total) ==={C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+                if not self.found_items:
+                    sys.stdout.write(f"{C.GRY}(empty — no items yet){C.RST}\n")
+                else:
+                    page_size = 25
+                    total = len(self.found_items)
+                    pages = (total + page_size - 1) // page_size
+                    page = 0
+                    while page < pages:
+                        start = page * page_size
+                        end = min(start + page_size, total)
+                        sys.stdout.write(f"{C.MAG}── Page {page+1}/{pages} "
+                                         f"({start}..{end-1}) ──{C.RST}\n")
+                        for i in range(start, end):
+                            it = self.found_items[i]
+                            color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
+                                     "System App": C.BLU, "Kernel Code": C.MAG,
+                                     "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
+                                     "Privilege Struct (ROOTED)": C.GRN,
+                                     "Kernel Global": C.CYN}.get(it['type'], C.GRY)
+                            sys.stdout.write(f" {C.GRY}[{i:02d}]{C.RST} "
+                                             f"{color}{it['type']:<24}{C.RST} "
+                                             f"{C.WHT}{it.get('description','')[:50]:<50}{C.RST} "
+                                             f"{C.CYN}{it['va']}{C.RST}\n")
+                        page += 1
+                        if page < pages:
+                            sys.stdout.write(f"\n{C.GRY}-- More -- (Enter for next page, q to quit){C.RST}\n")
+                            sys.stdout.flush()
+                            nxt = self.input_cmd().strip().lower()
+                            if nxt in ("q", "quit", "x"):
+                                break
+                sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+                sys.stdout.write("Press Enter to return...")
+                sys.stdout.flush()
+                try:
+                    self.input_cmd()
+                except Exception:
+                    pass
+            elif cmd in ("kb", "kbase"):
+                # Show kernel base / SELinux / init_cred status
+                sys.stdout.write(C.CLR)
+                sys.stdout.write(f"{C.BOLD}{C.CYN}=== KERNEL INTELLIGENCE ==={C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Kernel base{C.RST} : "
+                                 f"{C.GRN if self.kernel_base else C.RED}"
+                                 f"{hex(self.kernel_base) if self.kernel_base else 'NOT FOUND'}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}SELinux VA {C.RST} : "
+                                 f"{C.GRN if self.selinux_va else C.RED}"
+                                 f"{hex(self.selinux_va) if self.selinux_va else 'NOT FOUND'}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}init_cred  {C.RST} : "
+                                 f"{C.GRN if self.cred_va else C.RED}"
+                                 f"{hex(self.cred_va) if self.cred_va else 'NOT FOUND'}{C.RST}\n")
+                sys.stdout.write(f"\n {C.DIM}AI patterns learned{C.RST}: "
+                                 f"{C.MAG}{self.live.get('ai_patterns', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.DIM}Knowledge base entries{C.RST}: "
+                                 f"{C.MAG}{sum(len(v) for v in self.knowledge_base.values() if isinstance(v, list))}{C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
                 sys.stdout.write("Press Enter to return...")
                 sys.stdout.flush()
                 try:
