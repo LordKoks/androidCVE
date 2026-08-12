@@ -918,7 +918,7 @@ class MemoryExplorerAI:
         wd_total = sum(wd.values()) if isinstance(wd, dict) else 0
         wd_str = f" WD={C.YEL}{wd_total}{C.RST}" if wd_total > 0 else ""
 
-        out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.1  {C.RST}"
+        out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.2 AUTO{C.RST}"
                    f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
                    f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
                    f"{C.MAG}{spray_p}{C.RST}  {C.GRY}│{C.RST}"
@@ -3624,6 +3624,35 @@ class MemoryExplorerAI:
         if not self.ensure_engine():
             print(f"{C.RED}[CRIT] Could not start engine. Check GCC/Clang.{C.RST}", flush=True)
             return
+
+        # === BIG AUTO-MODE BANNER ===
+        # Print a clear, eye-catching banner so the user knows the
+        # new version is running and the autopilot is starting.
+        # Without this, if TUI looks the same as before they might
+        # not realize auto-start is working. We clear the screen,
+        # print the banner, and pause briefly so it's visible.
+        import sys as _sys
+        _sys.stdout.write("\033[2J\033[H")  # clear screen + home
+        _sys.stdout.flush()
+        banner = f"""
+{C.CYN}{C.BOLD}╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║   {C.YEL}KGSL AI MEMORY EXPLORER v3.2 — AUTO MODE{C.CYN}                            ║
+║                                                                      ║
+║   {C.GRN}✓ autopilot: STARTING NOW{C.CYN}                                          ║
+║   {C.GRN}✓ learning : STARTING NOW (3 parallel workers){C.CYN}                     ║
+║   {C.GRN}✓ watchdog : ENABLED (auto-restart on crash){C.CYN}                      ║
+║   {C.GRN}✓ adaptive : ENABLED (5 ranges × 8MB = 40MB scan area){C.CYN}             ║
+║   {C.GRN}✓ engine   : pre-compiled at __init__{C.CYN}                              ║
+║                                                                      ║
+║   {C.MAG}You should NOT press any keys. Watch the TUI update.{C.CYN}                 ║
+║   {C.GRY}Wait 5-10 seconds for first SCAN_DONE in LAST MSG.{C.CYN}                  ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝{C.RST}
+"""
+        print(banner, flush=True)
+        import time as _t
+        _t.sleep(2.0)  # let user see the banner
 
         # === START THE DEDICATED RENDER THREAD ===
         # This is the key fix for "TUI doesn't update on Termux".
