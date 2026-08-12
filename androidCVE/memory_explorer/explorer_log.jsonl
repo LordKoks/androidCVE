@@ -14368,3 +14368,4 @@
 {"ts": "2026-08-12T19:57:49.534430", "type": "spray", "pid": 12795, "name": "KETW1343", "batch": 16, "worker": 1}
 {"ts": "2026-08-12T19:57:49.534925", "type": "engine_died", "code": 1, "err": "Error opening /dev/kgsl-3d0: No such file or directory\nGPU Init failed\n"}
 {"ts": "2026-08-12T19:57:49.537974", "type": "engine_start", "pid": 12798}
+{"ts": "2026-08-12T23:35:43.506633", "type": "Privilege Struct", "va": "0xffffffc000000000", "desc": "test init_cred", "confidence": 99}

