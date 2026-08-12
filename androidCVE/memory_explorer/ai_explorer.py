@@ -99,6 +99,22 @@ class MemoryExplorerAI:
         self.render_lock = threading.Lock()
         self.is_reading_input = False
 
+        # Engine I/O lock — CRITICAL. The KGSL engine has ONE stdin/stdout
+        # pair, and we have TWO Python threads that want to talk to it
+        # at the same time: _autopilot_worker (runs exploit/kbase/
+        # selinux/cred/patch pipeline) and _learning_worker (runs
+        # spray+scan). Without this lock, their bytes interleave in
+        # the engine's stdin pipe AND their responses interleave in
+        # the engine's stdout pipe. Result: the engine reads garbled
+        # commands, hangs waiting for input that never comes, or
+        # returns the wrong response to the wrong caller. The
+        # engine's read loop in C is single-threaded, so Python
+        # MUST serialize all engine I/O through this RLock.
+        # RLock (reentrant) is used because _read_data_packet calls
+        # _readline_timeout internally — nested acquisition must not
+        # deadlock.
+        self.engine_lock = threading.RLock()
+
         # Per-op busy flags (so TUI shows "EXPLOITING…" / "SCANNING…")
         self.op_busy = {"exploit": False, "scan": False}
         self.op_results = {"exploit": None, "scan": None}
@@ -800,42 +816,45 @@ class MemoryExplorerAI:
 
     # ============== ENGINE MANAGEMENT ==============
     def ensure_engine(self):
-        if self.exploit_proc:
-            if self.exploit_proc.poll() is None:
-                return True
-            else:
+        # engine_lock is RLock, so it's safe to call from inside
+        # _engine_write which also holds the lock.
+        with self.engine_lock:
+            if self.exploit_proc:
+                if self.exploit_proc.poll() is None:
+                    return True
+                else:
+                    try:
+                        err = self.exploit_proc.stderr.read().decode()
+                    except Exception:
+                        err = ""
+                    self.live["last_msg"] = f"Engine died: {err.strip()[:80]}"
+                    self.log_event("engine_died", {"code": self.exploit_proc.returncode, "err": err})
+                    self.exploit_proc = None
+
+            # Check format / missing
+            if os.path.exists(self.engine_path):
                 try:
-                    err = self.exploit_proc.stderr.read().decode()
+                    with open(self.engine_path, "rb") as f:
+                        head = f.read(4)
+                    if head[:4] != b"\x7fELF":
+                        self.try_compile_engine()
                 except Exception:
-                    err = ""
-                self.live["last_msg"] = f"Engine died: {err.strip()[:80]}"
-                self.log_event("engine_died", {"code": self.exploit_proc.returncode, "err": err})
-                self.exploit_proc = None
-
-        # Check format / missing
-        if os.path.exists(self.engine_path):
-            try:
-                with open(self.engine_path, "rb") as f:
-                    head = f.read(4)
-                if head[:4] != b"\x7fELF":
                     self.try_compile_engine()
-            except Exception:
+            else:
                 self.try_compile_engine()
-        else:
-            self.try_compile_engine()
 
-        try:
-            self.exploit_proc = subprocess.Popen(
-                [self.engine_path],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=False, bufsize=0,
-            )
-            self.live["last_msg"] = f"Engine started (pid={self.exploit_proc.pid})"
-            self.log_event("engine_start", {"pid": self.exploit_proc.pid})
-            return True
-        except Exception as e:
-            self.live["last_msg"] = f"Engine start failed: {e}"
-            return False
+            try:
+                self.exploit_proc = subprocess.Popen(
+                    [self.engine_path],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=False, bufsize=0,
+                )
+                self.live["last_msg"] = f"Engine started (pid={self.exploit_proc.pid})"
+                self.log_event("engine_start", {"pid": self.exploit_proc.pid})
+                return True
+            except Exception as e:
+                self.live["last_msg"] = f"Engine start failed: {e}"
+                return False
 
     def try_compile_engine(self):
         src = self.engine_path + ".c"
@@ -850,59 +869,64 @@ class MemoryExplorerAI:
         return False
 
     def _read_data_packet(self):
-        if not self._engine_alive():
-            return None
-        try:
-            # Wait briefly for the DATA: line
-            line = self._readline_timeout(timeout=2.0)
-            if not line or not line.startswith("DATA:"):
+        with self.engine_lock:
+            if not self._engine_alive():
                 return None
-            _, va_s, size_s = line.split(":")
-            va = int(va_s, 16)
-            size = int(size_s)
-            # Read raw bytes
-            data = b""
-            while len(data) < size:
-                if not self._engine_alive():
+            try:
+                # Wait briefly for the DATA: line
+                line = self._readline_timeout(timeout=2.0)
+                if not line or not line.startswith("DATA:"):
                     return None
-                r, _, _ = select.select([self.exploit_proc.stdout], [], [], 2.0)
-                if not r:
-                    break
-                chunk = self.exploit_proc.stdout.read(size - len(data))
-                if not chunk:
-                    break
-                data += chunk
-            # Consume DATA_END line
-            self._readline_timeout(timeout=0.5)
-            return data
-        except Exception as e:
-            self.live["last_msg"] = f"Read packet error: {e}"
-            self.log_event("engine_error", {"op": "read_packet", "err": str(e)})
-            return None
+                _, va_s, size_s = line.split(":")
+                va = int(va_s, 16)
+                size = int(size_s)
+                # Read raw bytes
+                data = b""
+                while len(data) < size:
+                    if not self._engine_alive():
+                        return None
+                    r, _, _ = select.select([self.exploit_proc.stdout], [], [], 2.0)
+                    if not r:
+                        break
+                    chunk = self.exploit_proc.stdout.read(size - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+                # Consume DATA_END line
+                self._readline_timeout(timeout=0.5)
+                return data
+            except Exception as e:
+                self.live["last_msg"] = f"Read packet error: {e}"
+                self.log_event("engine_error", {"op": "read_packet", "err": str(e)})
+                return None
 
     def _engine_alive(self):
         return self.exploit_proc is not None and self.exploit_proc.poll() is None
 
     def _engine_write(self, data):
-        """Write to engine stdin, restarting it on BrokenPipe."""
-        if not self.ensure_engine():
-            return False
-        try:
-            self.exploit_proc.stdin.write(data)
-            self.exploit_proc.stdin.flush()
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            self.live["last_msg"] = f"Pipe broken: {e} — restarting engine"
-            self.log_event("engine_pipe_broken", {"err": str(e)})
-            self.exploit_proc = None
-            if self.ensure_engine():
-                try:
-                    self.exploit_proc.stdin.write(data)
-                    self.exploit_proc.stdin.flush()
-                    return True
-                except Exception as e2:
-                    self.log_event("engine_restart_fail", {"err": str(e2)})
-            return False
+        """Write to engine stdin, restarting it on BrokenPipe.
+        All engine I/O goes through self.engine_lock so that the
+        autopilot and learning workers don't interleave commands
+        in the engine's pipe."""
+        with self.engine_lock:
+            if not self.ensure_engine():
+                return False
+            try:
+                self.exploit_proc.stdin.write(data)
+                self.exploit_proc.stdin.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                self.live["last_msg"] = f"Pipe broken: {e} — restarting engine"
+                self.log_event("engine_pipe_broken", {"err": str(e)})
+                self.exploit_proc = None
+                if self.ensure_engine():
+                    try:
+                        self.exploit_proc.stdin.write(data)
+                        self.exploit_proc.stdin.flush()
+                        return True
+                    except Exception as e2:
+                        self.log_event("engine_restart_fail", {"err": str(e2)})
+                return False
 
     def read_page(self, va):
         if not self._engine_write(f"read {hex(va)}\n".encode()):
@@ -1341,20 +1365,25 @@ class MemoryExplorerAI:
         Returns:
             ""  -> timeout (no data available)
             None -> engine died / EOF
-            str  -> the line read (already stripped)"""
-        if not self.exploit_proc or self.exploit_proc.poll() is not None:
-            return None
-        try:
-            fd = self.exploit_proc.stdout.fileno()
-            r, _, _ = select.select([fd], [], [], timeout)
-            if not r:
-                return ""
-            line = self.exploit_proc.stdout.readline()
-            if not line:
+            str  -> the line read (already stripped)
+
+        All engine I/O is serialized through self.engine_lock so
+        that the autopilot and learning workers don't steal each
+        other's responses."""
+        with self.engine_lock:
+            if not self.exploit_proc or self.exploit_proc.poll() is not None:
                 return None
-            return line.decode(errors="ignore").strip()
-        except Exception:
-            return None
+            try:
+                fd = self.exploit_proc.stdout.fileno()
+                r, _, _ = select.select([fd], [], [], timeout)
+                if not r:
+                    return ""
+                line = self.exploit_proc.stdout.readline()
+                if not line:
+                    return None
+                return line.decode(errors="ignore").strip()
+            except Exception:
+                return None
 
     # ============== AUTOPILOT MODE (full auto, no user input needed) ==============
     def cmd_autopilot_start(self):
@@ -1555,12 +1584,23 @@ class MemoryExplorerAI:
             if not self._engine_write(b"exploit\n"):
                 self.live["last_msg"] = "Engine write failed"
                 return
-            # Wait for UAF_READY / UAF_FAILED
+            # Wait for UAF_READY / UAF_FAILED — with a deadline so
+            # we don't hang forever if the learning worker is also
+            # holding the engine_lock for a long scan.
             deadline = time.time() + 30
+            idle_count = 0
             while time.time() < deadline:
                 line = self._readline_timeout(timeout=0.5)
                 if line is None:
                     break
+                if not line:
+                    idle_count += 1
+                    if idle_count % 20 == 0:
+                        self.live["last_msg"] = (
+                            f"AUTO: waiting for UAF_READY… "
+                            f"({int(deadline - time.time())}s left)")
+                    continue
+                idle_count = 0
                 if "UAF_READY" in line or "UAF_FAILED" in line:
                     if "UAF_FAILED" in line:
                         self.live["last_msg"] = f"WATCH: {line}"
@@ -1615,13 +1655,20 @@ class MemoryExplorerAI:
                 # Poll the engine for "UAF_READY" / "UAF_FAILED"
                 deadline = time.time() + 30
                 last_line = ""
+                idle_count = 0
                 while time.time() < deadline:
                     line = self._readline_timeout(timeout=0.5)
                     if line is None:
                         self.op_results["exploit"] = "Engine died during exploit"
                         break
                     if not line:
+                        idle_count += 1
+                        if idle_count % 20 == 0:
+                            self.live["last_msg"] = (
+                                f"EXPLOIT: waiting for UAF_READY… "
+                                f"({int(deadline - time.time())}s left)")
                         continue
+                    idle_count = 0
                     last_line = line
                     if "UAF_READY" in line or "UAF_FAILED" in line:
                         self.op_results["exploit"] = line
@@ -1998,6 +2045,10 @@ class MemoryExplorerAI:
             if not self.ensure_engine():
                 continue
             s_start, s_end = _adaptive_scan_range(done // batch)
+            # Set scan_total / scan_offset so the SCAN progress bar
+            # shows up in the TUI during learning.
+            self.live["scan_total"]   = s_end - s_start
+            self.live["scan_offset"]  = s_start
             if not self._engine_write(
                 f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
                 self.log_event("learning_scan_error", {"err": "engine write failed"})
@@ -2005,14 +2056,45 @@ class MemoryExplorerAI:
 
             try:
                 scan_done = False
+                # Overall deadline for this scan. If the scan doesn't
+                # finish in SCAN_TIMEOUT seconds, give up and continue
+                # the outer loop (this is what was causing the spray
+                # bar to get stuck: the learning worker was waiting
+                # forever for SCAN_DONE because the autopilot was
+                # holding the engine_lock for its own pipeline).
+                SCAN_TIMEOUT = 30.0
+                scan_deadline = time.time() + SCAN_TIMEOUT
+                no_progress_count = 0
                 while not scan_done and not self.cancel_flag.is_set():
+                    # Hard deadline check
+                    if time.time() > scan_deadline:
+                        self.live["last_msg"] = (
+                            f"LEARN: scan timeout after {SCAN_TIMEOUT}s, "
+                            f"giving up (engine busy?)")
+                        self.log_event("learning_scan_timeout", {
+                            "timeout_s": SCAN_TIMEOUT})
+                        break
                     line = self._readline_timeout(timeout=1.0)
                     if line is None:
+                        # Engine died
                         break
                     if not line:
+                        # Empty = timeout on this individual read.
+                        # If we've been silent for too long, log it
+                        # so the user can see what's happening.
+                        no_progress_count += 1
+                        if no_progress_count % 15 == 0:
+                            self.live["last_msg"] = (
+                                f"LEARN: waiting for SCAN_DONE… "
+                                f"({int(scan_deadline - time.time())}s left)")
                         continue
+                    no_progress_count = 0
                     if "SCAN_DONE" in line:
                         scan_done = True
+                        # Clear scan_total so the SCAN bar hides
+                        # until the next scan. We keep scan_offset
+                        # = last value for visual continuity.
+                        self.live["scan_total"] = 0
                         break
                     if "PROGRESS:" in line:
                         try:

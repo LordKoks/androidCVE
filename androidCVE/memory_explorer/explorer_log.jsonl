@@ -3814,3 +3814,4 @@
 {"ts": "2026-08-12T12:26:26.620628", "type": "kill", "pid": 8120}
 {"ts": "2026-08-12T12:26:26.620754", "type": "kill", "pid": 8121}
 {"ts": "2026-08-12T12:26:26.672622", "type": "learning_done", "batches": 4, "matches": 0, "verified": 0, "false_positives": 0, "sprayed_total": 400}
+{"ts": "2026-08-12T13:07:13.352327", "type": "engine_start", "pid": 8558}
