@@ -1250,30 +1250,72 @@ class MemoryExplorerAI:
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
         if item_idx < 0 or item_idx >= len(self.found_items):
+            self.live["last_msg"] = f"Invalid index: {item_idx} (have {len(self.found_items)} items)"
             return
         item = self.found_items[item_idx]
-        data = item['data']
+        # Fetch the data if we don't have it (auto-found items don't carry data)
+        data = item.get("data")
+        if data is None:
+            try:
+                va = int(item["va"], 16)
+            except Exception:
+                self.live["last_msg"] = f"Invalid VA: {item['va']}"
+                return
+            data = self.read_page(va) or b""
+            item["data"] = data
+        # Confidence is stored as 0-100 integer now
+        conf = item.get("confidence", 0)
+        conf_disp = f"{conf:.1f}%" if isinstance(conf, float) else f"{conf}%"
+
         sys.stdout.write(C.CLR)
-        sys.stdout.write(f"{C.BOLD}=== FILE VIEW: {item['va']} ==={C.RST}\n")
-        sys.stdout.write(f"Type: {item['type']} | Confidence: {item['confidence']*100:.1f}%\n")
-        sys.stdout.write(f"AI Logic: {self.translate_logic(item)}\n")
-        sys.stdout.write("─" * 75 + "\n")
-        for i in range(0, min(len(data), 256), 16):
-            chunk = data[i:i+16]
-            hex_row = " ".join(f"{b:02X}" for b in chunk)
-            printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
-            sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
-        sys.stdout.write("─" * 75 + "\n")
-        sys.stdout.write(f" [{C.GRN}K{C.RST}] Patch Root  [{C.GRN}S{C.RST}] Patch SELinux  "
+        sys.stdout.write(f"{C.BOLD}{C.CYN}=== FILE VIEW: [{item_idx:02d}] {item['va']} ==={C.RST}\n")
+        sys.stdout.write(f"{C.GRY}Type:{C.RST} {item['type']:<20} "
+                         f"{C.GRY}Confidence:{C.RST} {C.GRN}{conf_disp}{C.RST}\n")
+        sys.stdout.write(f"{C.GRY}AI Logic:{C.RST} {self.translate_logic(item)}\n")
+        sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+        if data:
+            for i in range(0, min(len(data), 256), 16):
+                chunk = data[i:i+16]
+                hex_row = " ".join(f"{b:02X}" for b in chunk)
+                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
+        else:
+            sys.stdout.write(f" {C.GRY}(no data — read failed){C.RST}\n")
+        sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+        sys.stdout.write(f" [{C.GRN}K{C.RST}] Patch Root  "
+                         f"[{C.GRN}S{C.RST}] Patch SELinux  "
+                         f"[{C.GRN}D{C.RST}] Delete from list  "
                          f"[{C.GRN}Enter{C.RST}] Back\n")
         sys.stdout.flush()
-        choice = self.input_cmd().lower()
+        try:
+            choice = self.input_cmd().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
         if choice == "k":
-            r = self.patch_mem(int(item['va'], 16), 0)
-            self.live["last_msg"] = f"Patch: {r}"
+            # Patch init_cred uid/gid to 0 (root) at this VA
+            try:
+                base = int(item["va"], 16)
+                results = []
+                for off in (4, 8, 12, 16, 20, 24):
+                    r = self.patch_mem(base + off, 0)
+                    results.append(str(r))
+                self.live["last_msg"] = f"Patch Root: {', '.join(results[:3])}"
+            except Exception as e:
+                self.live["last_msg"] = f"Patch error: {e}"
         elif choice == "s":
-            r = self.patch_mem(0xffffffc002caa000, 0)
-            self.live["last_msg"] = f"Patch SELinux: {r}"
+            # Patch SELinux enforcing to 0
+            try:
+                target = self.selinux_va or 0xffffffc002caa000
+                r = self.patch_mem(target, 0)
+                self.live["last_msg"] = f"Patch SELinux: {r}"
+            except Exception as e:
+                self.live["last_msg"] = f"Patch error: {e}"
+        elif choice == "d":
+            # Delete this item from the list
+            with self.bg_lock:
+                if 0 <= item_idx < len(self.found_items):
+                    self.found_items.pop(item_idx)
+            self.live["last_msg"] = f"Deleted item [{item_idx:02d}]"
 
     # ============== MAIN LOOP ==============
     def run(self):
