@@ -6357,6 +6357,46 @@ class MemoryExplorerAI:
                 # [N] — short form for show_detail(N)
                 idx = int(cmd[1:-1])
                 self.show_detail(idx)
+            elif cmd in ("open", "openfile", "file", "[id]"):
+                # [ID] Open File — opens file by index. The help
+                # text says [ID] so accept that keyword. Also
+                # "open" / "file". "id" alone is reserved for
+                # the uid/euid check command.
+                if cmd == "[id]":
+                    # Direct short form, no prompt
+                    print(f" {C.DIM}Enter item index to open "
+                          f"(or empty for list):{C.RST}",
+                          flush=True)
+                    try:
+                        idx_s = self.input_cmd().strip()
+                    except (EOFError, KeyboardInterrupt):
+                        return
+                    if not idx_s:
+                        # List items first
+                        self.cmd_list()
+                        print(f" {C.DIM}Enter item index to open:{C.RST}",
+                              flush=True)
+                        try:
+                            idx_s = self.input_cmd().strip()
+                        except (EOFError, KeyboardInterrupt):
+                            return
+                    if idx_s.isdigit():
+                        self.show_detail(int(idx_s))
+                    else:
+                        self.live["last_msg"] = (
+                            f"Invalid index: {idx_s}")
+                else:
+                    print(f" {C.DIM}Enter item index to open:{C.RST}",
+                          flush=True)
+                    try:
+                        idx_s = self.input_cmd().strip()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                    if idx_s.isdigit():
+                        self.show_detail(int(idx_s))
+                    else:
+                        self.live["last_msg"] = (
+                            f"Invalid index: {idx_s}")
             elif cmd.isdigit():
                 # Just a number → show_detail(int)
                 self.show_detail(int(cmd))
