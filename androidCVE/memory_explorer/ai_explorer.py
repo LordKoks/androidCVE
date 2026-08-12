@@ -152,6 +152,23 @@ class MemoryExplorerAI:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
 
+        # === PRE-FLIGHT: ensure engine binary exists ===
+        # If the C engine binary is missing or not ELF, compile it
+        # NOW (synchronously) so the very first auto-start has a
+        # working engine. Without this, the first ensure_engine()
+        # call tries to Popen a missing file and silently fails
+        # for several seconds while the user wonders why nothing
+        # is happening.
+        if not os.path.exists(self.engine_path):
+            self.try_compile_engine()
+        else:
+            try:
+                with open(self.engine_path, "rb") as _f:
+                    if _f.read(4) != b"\x7fELF":
+                        self.try_compile_engine()
+            except Exception:
+                self.try_compile_engine()
+
         self.uaf_start = 0x7001ff000
         self.scan_size  = 0x2000000
 
@@ -884,10 +901,19 @@ class MemoryExplorerAI:
         m, s = divmod(up, 60)
         h, m = divmod(m, 60)
 
+        # Watchdog counter — shows how many times the watchdog
+        # restarted something. If the user sees "restarts=N" growing,
+        # the workers are crashing repeatedly and the auto-restart is
+        # saving them.
+        wd = L.get("watchdog_restarts") or {}
+        wd_total = sum(wd.values()) if isinstance(wd, dict) else 0
+        wd_str = f" WD={C.YEL}{wd_total}{C.RST}" if wd_total > 0 else ""
+
         out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.1  {C.RST}"
                    f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
                    f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
-                   f"{C.MAG}{spray_p}{C.RST}")
+                   f"{C.MAG}{spray_p}{C.RST}  {C.GRY}│{C.RST}"
+                   f" {C.GRN}AUTO{C.RST}{wd_str}")
 
         ram_color = C.GRN if L["ram"] < 50 else (C.YEL if L["ram"] < 75 else C.RED)
         st_color  = C.GRN if "ACTIVE" in L["status"] else C.GRY
@@ -3555,43 +3581,78 @@ class MemoryExplorerAI:
         # Without this, if autopilot or learning crashes (e.g. SIGSYS
         # from a bad syscall, or engine pipe broken, or OOM), the
         # user has to press E, L, R manually to restart. The watchdog
-        # polls every 3s and restarts either worker if it's not
-        # alive. Disabled while the user explicitly pauses (P) or
-        # stops (X) the autopilot.
+        # polls every 1s and restarts any dead worker. It also
+        # restarts the engine if it died.
         def _watchdog():
             import time as _t
+            restart_count = {"autopilot": 0, "learning": 0, "engine": 0}
             last_check = 0.0
+            last_full_status = 0.0
             while not self.cancel_flag.is_set():
-                _t.sleep(1.0)
-                # Throttle restart attempts: don't spam restarts
-                # if engine is broken (e.g. /dev/kgsl-3d0 missing).
+                _t.sleep(0.5)
                 now = _t.time()
-                if now - last_check < 3.0:
+                # Throttle heavy checks to every 1s
+                if now - last_check < 1.0:
                     continue
                 last_check = now
-                # Skip if user paused or stopped
+                # Skip if user explicitly paused or stopped
                 if self.autopilot_paused or not self.autopilot_mode:
                     continue
-                # Restart autopilot if dead
+                # 1) Engine alive check
+                if (not self._engine_alive()
+                    and self.live.get("engine_pid", 0) != 0):
+                    # Engine was running but died
+                    restart_count["engine"] += 1
+                    try:
+                        self.live["last_msg"] = (
+                            f"Watchdog: engine died, restarting "
+                            f"(#{restart_count['engine']})")
+                        self.exploit_proc = None
+                        self.ensure_engine()
+                    except Exception:
+                        pass
+                # 2) Autopilot alive check
                 if (self.autopilot_mode
                     and not (self.autopilot_thread
                              and self.autopilot_thread.is_alive())):
-                    try:
+                    restart_count["autopilot"] += 1
+                    if restart_count["autopilot"] <= 5:
+                        try:
+                            self.live["last_msg"] = (
+                                f"Watchdog: restarting autopilot "
+                                f"(#{restart_count['autopilot']})")
+                            self.cmd_autopilot_start()
+                        except Exception:
+                            pass
+                    elif restart_count["autopilot"] == 6:
                         self.live["last_msg"] = (
-                            "Watchdog: restarting autopilot (was dead)")
-                        self.cmd_autopilot_start()
-                    except Exception:
-                        pass
-                # Restart learning if dead (autopilot worker also
-                # restarts it, but the watchdog is a safety net for
-                # the case where autopilot itself is dead).
+                            "Watchdog: autopilot keeps dying, giving up "
+                            "auto-restart. Press A to start manually.")
+                # 3) Learning alive check
                 if (not (self.bg_thread and self.bg_thread.is_alive())):
-                    try:
+                    restart_count["learning"] += 1
+                    if restart_count["learning"] <= 5:
+                        try:
+                            self.live["last_msg"] = (
+                                f"Watchdog: restarting learning "
+                                f"(#{restart_count['learning']})")
+                            self.cmd_learning_start()
+                        except Exception:
+                            pass
+                # 4) Periodic status broadcast (every 30s) so the
+                # user sees what's happening without pressing anything.
+                if now - last_full_status > 30.0:
+                    last_full_status = now
+                    total_restarts = sum(restart_count.values())
+                    if total_restarts > 0:
                         self.live["last_msg"] = (
-                            "Watchdog: restarting learning (was dead)")
-                        self.cmd_learning_start()
-                    except Exception:
-                        pass
+                            f"Watchdog OK: "
+                            f"engine={restart_count['engine']} "
+                            f"auto={restart_count['autopilot']} "
+                            f"learn={restart_count['learning']} restarts")
+                # 5) Publish restart counts to live so TUI can show
+                with self.stats_lock:
+                    self.live["watchdog_restarts"] = restart_count.copy()
         threading.Thread(target=_watchdog, daemon=True).start()
 
         # Main loop: read input. input_cmd() itself redraws the TUI
@@ -3639,6 +3700,43 @@ class MemoryExplorerAI:
                     self.cmd_autopilot_stop()
                 else:
                     self.cmd_autopilot_start()
+            elif cmd in ("auto!", "forceauto", "all"):
+                # Force-restart EVERYTHING: cancel all threads, kill
+                # all sprays, restart engine, restart autopilot,
+                # restart learning. Use this if the user pressed
+                # 'A' but it didn't help, or if everything is stuck.
+                try:
+                    self.cmd_autopilot_stop()
+                except Exception:
+                    pass
+                self.cancel_flag.set()
+                time.sleep(0.3)
+                self.cancel_flag.clear()
+                # Kill all per-worker sprays
+                for wid, pids in list(self.spray_procs_by_worker.items()):
+                    for pid in list(pids):
+                        try:
+                            os.kill(pid, 9)
+                        except Exception:
+                            pass
+                    pids.clear()
+                # Force-kill engine
+                if self.exploit_proc:
+                    try:
+                        self.exploit_proc.terminate()
+                    except Exception:
+                        pass
+                    self.exploit_proc = None
+                self.live["engine_pid"] = 0
+                # Re-compile engine (in case it's stale)
+                self.try_compile_engine()
+                time.sleep(0.5)
+                # Reset watchdog counters
+                self.live["watchdog_restarts"] = {"autopilot": 0, "learning": 0, "engine": 0}
+                # Start everything fresh
+                self.cmd_autopilot_start()
+                self.cmd_learning_start()
+                self.live["last_msg"] = "FORCE-RESTART: autopilot + learning re-started"
             elif cmd in ("e", "exploit"):
                 self.trigger_exploit()
             elif cmd in ("l", "learn"):
