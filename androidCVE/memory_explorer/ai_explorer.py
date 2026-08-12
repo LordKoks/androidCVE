@@ -5395,104 +5395,155 @@ class MemoryExplorerAI:
 
     # ============== DETAIL VIEW ==============
     def show_detail(self, item_idx):
+        """Show item detail by ID. Always prints metadata FIRST
+        so the user sees something even if read fails.
+        """
         if item_idx < 0 or item_idx >= len(self.found_items):
-            self.live["last_msg"] = f"Invalid index: {item_idx} (have {len(self.found_items)} items)"
+            print(f"{C.RED}Invalid index: {item_idx} "
+                  f"(have {len(self.found_items)} items){C.RST}",
+                  flush=True)
+            self.live["last_msg"] = f"Invalid idx: {item_idx}"
             return
         item = self.found_items[item_idx]
-        sys.stdout.write(C.CLR)
-        sys.stdout.write(f"{C.BOLD}{C.CYN}=== FILE VIEW: [{item_idx:02d}] {item['va']} ==={C.RST}\n")
-        sys.stdout.write(f"{C.GRY}Type:{C.RST} {item['type']:<20} "
-                         f"{C.GRY}Confidence:{C.RST} {C.GRN}"
-                         f"{item.get('confidence', 0)}%{C.RST}\n")
-        sys.stdout.write(f"{C.GRY}Description:{C.RST} {item.get('description','')}\n")
-        sys.stdout.write(f"{C.GRY}AI Logic:{C.RST} {self.translate_logic(item)}\n")
-        sys.stdout.flush()
-        # Fetch the data if we don't have it
+        # STEP 1: Always show metadata first (instant)
+        try:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            print(f"{C.BOLD}{C.CYN}═══ FILE VIEW: "
+                  f"[{item_idx:02d}] {item['va']} ═══{C.RST}",
+                  flush=True)
+            print(f"{C.GRY}Type       :{C.RST} {item.get('type','')}",
+                  flush=True)
+            print(f"{C.GRY}Confidence :{C.RST} {C.GRN}"
+                  f"{item.get('confidence', 0)}%{C.RST}",
+                  flush=True)
+            print(f"{C.GRY}Description:{C.RST} "
+                  f"{item.get('description','')}",
+                  flush=True)
+            try:
+                logic = self.translate_logic(item)
+                if logic:
+                    print(f"{C.GRY}AI Logic   :{C.RST} {logic}",
+                          flush=True)
+            except Exception:
+                pass
+            print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
+        except Exception as e:
+            print(f"{C.RED}show_detail error: {e}{C.RST}", flush=True)
+            return
+        # STEP 2: Check if data already cached
         data = item.get("data")
-        data_prev = item.get("data_prev")
-        data_next = item.get("data_next")
-        if data is None or len(data) < 0x1000:
+        if data and len(data) >= 0x1000:
+            self._hex_dump(data, item['va'])
+            self._detail_submenu(item, item_idx)
+            return
+        # STEP 3: No cached data — ask user
+        print(f" {C.YEL}? Read page? (y=yes / n=skip / rva=read VA){C.RST}",
+              flush=True)
+        sys.stdout.flush()
+        try:
+            choice = self.input_cmd().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not choice or choice in ("n", "no", "b", "back", "q", ""):
+            print(f" {C.DIM}Skipped.{C.RST}", flush=True)
+            return
+        if choice in ("rva", "va"):
+            default_va = item['va']
+            print(f" {C.DIM}Enter VA (default {default_va}):{C.RST}",
+                  flush=True)
+            sys.stdout.flush()
+            try:
+                va_in = self.input_cmd().strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not va_in:
+                va_in = default_va
+            self._rva_read(va_in)
+            return
+        if choice in ("y", "yes"):
             try:
                 va = int(item["va"], 16)
             except Exception:
                 self.live["last_msg"] = f"Invalid VA: {item['va']}"
                 return
-            # Try multiple read methods in order of preference
-            data = b""
-            # Method 1: engine
-            sys.stdout.write(f" {C.DIM}Reading via engine...{C.RST}\n")
-            sys.stdout.flush()
-            try:
-                if self.ensure_engine():
-                    triple = self.read_with_neighbors(va) or b""
-                    if len(triple) == 12288:
-                        data_prev, data, data_next = (
-                            triple[0:0x1000],
-                            triple[0x1000:0x2000],
-                            triple[0x2000:0x3000])
-                    elif triple:
-                        data = triple
-            except Exception as e:
-                sys.stdout.write(f"{C.YEL}engine read fail: {e}{C.RST}\n")
-            # Method 2: KGSL GPU read (if engine failed)
-            if (not data or len(data) < 0x1000) and self.kgsl_fd is not None:
-                sys.stdout.write(f" {C.DIM}Reading via GPU KGSL...{C.RST}\n")
-                sys.stdout.flush()
-                try:
-                    gpu_data = self._kgsl_read_virt(va, 0x1000)
-                    if gpu_data and len(gpu_data) >= 0x1000:
-                        data = gpu_data
-                except Exception as e:
-                    sys.stdout.write(f"{C.YEL}GPU read fail: {e}{C.RST}\n")
-            # Method 3: try kernel read via /proc/kcore or fallback
-            if (not data or len(data) < 0x1000):
-                sys.stdout.write(f" {C.YEL}All read methods failed.{C.RST}\n")
-                sys.stdout.write(f" {C.DIM}Try running with KGSL on or "
-                                 f"engine alive.{C.RST}\n")
+            data = self._read_page_robust(va, item)
+            if data and len(data) >= 0x1000:
+                self._hex_dump(data, item['va'])
+                self._detail_submenu(item, item_idx)
             else:
-                item["data"] = data
-                item["data_prev"] = data_prev
-                item["data_next"] = data_next
-        if data_prev:
-            sys.stdout.write(f" {C.DIM}── PREV PAGE @ "
-                             f"0x{int(item['va'], 16) - 0x1000:x} ──{C.RST}\n")
-            for i in range(0, min(len(data_prev), 256), 16):
-                chunk = data_prev[i:i+16]
-                hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(
-                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(
-                    f" {i:04X} | {hex_row:<48} | {printable}\n")
-        if data:
-            sys.stdout.write(
-                f" {C.DIM}── THIS PAGE @ {item['va']} ──{C.RST}\n")
-            for i in range(0, min(len(data), 0x1000), 16):
-                chunk = data[i:i+16]
-                hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(
-                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(
-                    f" {i:04X} | {hex_row:<48} | {printable}\n")
-        else:
-            sys.stdout.write(f" {C.GRY}(no data — read failed){C.RST}\n")
-        if data_next:
-            sys.stdout.write(
-                f" {C.DIM}── NEXT PAGE @ "
-                f"0x{int(item['va'], 16) + 0x1000:x} ──{C.RST}\n")
-            for i in range(0, min(len(data_next), 256), 16):
-                chunk = data_next[i:i+16]
-                hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(
-                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(
-                    f" {i:04X} | {hex_row:<48} | {printable}\n")
-        sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-        sys.stdout.write(
-            f" [{C.GRN}K{C.RST}] Patch Root  "
-            f"[{C.GRN}S{C.RST}] Patch SELinux  "
-            f"[{C.GRN}D{C.RST}] Delete  "
-            f"[{C.GRN}V{C.RST}] Re-verify  "
-            f"[{C.GRN}Enter{C.RST}] Back\n")
+                print(f" {C.RED}✗ Read failed for {item['va']}.{C.RST}",
+                      flush=True)
+                print(f" {C.DIM}Engine alive: {self._engine_alive()}, "
+                      f"KGSL fd: {self.kgsl_fd is not None}.{C.RST}",
+                      flush=True)
+                self.live["last_msg"] = (
+                    f"[{item_idx}] read failed")
+
+    def _read_page_robust(self, va, item=None):
+        """Read a page with multiple fallbacks. Returns bytes or None."""
+        data = b""
+        # Method 1: engine
+        if self.ensure_engine():
+            try:
+                if self._engine_write(f"read {hex(va)}\n".encode()):
+                    data = self._read_data_packet() or b""
+                    if data and len(data) >= 0x1000:
+                        if item is not None:
+                            item["data"] = data
+                        return data
+            except Exception:
+                pass
+        # Method 2: read_with_neighbors (3 pages)
+        try:
+            triple = self.read_with_neighbors(va) or b""
+            if len(triple) == 12288:
+                if item is not None:
+                    item["data_prev"] = triple[0:0x1000]
+                    item["data_next"] = triple[0x2000:0x3000]
+                data = triple[0x1000:0x2000]
+                if item is not None:
+                    item["data"] = data
+                return data
+        except Exception:
+            pass
+        # Method 3: KGSL GPU read
+        if self.kgsl_fd is not None:
+            try:
+                gpu_data = self._kgsl_read_virt(va, 0x1000)
+                if gpu_data and len(gpu_data) >= 0x1000:
+                    if item is not None:
+                        item["data"] = gpu_data
+                    return gpu_data
+            except Exception:
+                pass
+        return data if data else None
+
+    def _hex_dump(self, data, va):
+        """Print hex dump of data (up to 4KB) with VA annotation."""
+        try:
+            va_int = int(va, 16)
+        except Exception:
+            va_int = 0
+        print(f" {C.DIM}── PAGE @ {va} ──{C.RST}", flush=True)
+        for i in range(0, min(len(data), 0x1000), 16):
+            chunk = data[i:i+16]
+            hex_row = " ".join(f"{b:02X}" for b in chunk)
+            printable = "".join(
+                chr(b) if 32 <= b <= 126 else "." for b in chunk)
+            cur_va = va_int + i
+            print(f" {cur_va:016X} | {hex_row:<48} | {printable}",
+                  flush=True)
+
+    def _detail_submenu(self, item, item_idx):
+        """Detail-view submenu (K/S/D/V)."""
+        print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
+        print(f" [{C.GRN}K{C.RST}] Patch Root  "
+              f"[{C.GRN}S{C.RST}] Patch SELinux  "
+              f"[{C.GRN}D{C.RST}] Delete  "
+              f"[{C.GRN}V{C.RST}] Re-verify  "
+              f"[{C.GRN}Enter{C.RST}] Back",
+              flush=True)
         sys.stdout.flush()
         try:
             choice = self.input_cmd().strip().lower()
@@ -5501,35 +5552,53 @@ class MemoryExplorerAI:
         if not choice or choice in ("enter", "b", "back", "q"):
             return
         if choice == "k":
-            # Patch init_cred uid/gid to 0 (root) at this VA
             try:
                 base = int(item["va"], 16)
                 results = []
                 for off in (4, 8, 12, 16, 20, 24):
                     r = self.patch_mem(base + off, 0)
                     results.append(str(r))
-                self.live["last_msg"] = f"Patch Root: {', '.join(results[:3])}"
+                self.live["last_msg"] = (
+                    f"Patch Root: {', '.join(results[:3])}")
             except Exception as e:
                 self.live["last_msg"] = f"Patch error: {e}"
         elif choice == "s":
-            # Patch SELinux enforcing to 0
             try:
-                target = self.selinux_va or 0xffffffc002caa000
+                target = getattr(self, "selinux_va", None) or 0xffffffc002caa000
                 r = self.patch_mem(target, 0)
                 self.live["last_msg"] = f"Patch SELinux: {r}"
             except Exception as e:
                 self.live["last_msg"] = f"Patch error: {e}"
         elif choice == "d":
-            # Delete this item from the list
             with self.bg_lock:
                 if 0 <= item_idx < len(self.found_items):
                     self.found_items.pop(item_idx)
             self.live["last_msg"] = f"Deleted item [{item_idx:02d}]"
         elif choice == "v":
-            # Re-verify using 3-page read (with neighbors)
             self.verify_item(item_idx)
-            # Re-enter the detail view so the user sees the new data
             self.show_detail(item_idx)
+
+    def _rva_read(self, va_in):
+        """Read arbitrary VA and show hex dump."""
+        try:
+            va = int(va_in, 16) if va_in.startswith("0x") else int(va_in, 16)
+        except ValueError:
+            print(f"{C.RED}Invalid hex: {va_in}{C.RST}", flush=True)
+            return
+        data = self._read_page_robust(va)
+        if data and len(data) >= 0x1000:
+            self._hex_dump(data, f"0x{va:x}")
+            self.live["last_msg"] = (
+                f"rva 0x{va:x}: read {len(data)} bytes")
+        else:
+            print(f"{C.RED}✗ rva 0x{va:x}: read failed.{C.RST}",
+                  flush=True)
+            print(f" {C.DIM}Engine alive: {self._engine_alive()}, "
+                  f"KGSL fd: {self.kgsl_fd is not None}.{C.RST}",
+                  flush=True)
+            self.live["last_msg"] = (
+                f"rva 0x{va:x}: read failed")
+        sys.stdout.flush()
 
     # ============== MAIN LOOP ==============
 
