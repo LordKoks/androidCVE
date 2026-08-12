@@ -93,6 +93,22 @@ class MemoryExplorerAI:
 
         # Render lock — auto-render thread and input thread share the TUI
         self.render_lock = threading.Lock()
+        # Render thread — continuously redraws the TUI at a fixed rate
+        # (5 Hz by default). This is the proper way to do live TUI
+        # updates on Termux / Android: a SEPARATE thread does the
+        # rendering so that input never blocks, and input never has
+        # to do its own redraw. The main loop just calls input()
+        # or cbreak-reads chars; meanwhile the render thread keeps
+        # the screen fresh.
+        self._render_thread = None
+        self._render_stop = threading.Event()
+        self._render_paused = threading.Event()  # set = pause (input typing)
+        # Refresh rate of the render thread (Hz). 5 Hz = 200ms per
+        # frame — fast enough to feel live, slow enough not to spam
+        # the terminal. User can change with `rate` command.
+        self.render_hz = 5.0
+        self._render_frame = 0  # monotonic counter for animation particles
+        self.is_reading_input = False
 
         # Per-op busy flags (so TUI shows "EXPLOITING…" / "SCANNING…")
         self.op_busy = {"exploit": False, "scan": False}
@@ -275,11 +291,12 @@ class MemoryExplorerAI:
         }
         self.offsets = {"pid": 0x548, "comm": 0x718, "cred": 0x770, "real_cred": 0x768, "tasks": 0x3f0}
 
-        # Start live updater
+        # Start live updater (updates live{} dict only; does NOT draw)
         self._stop_live = threading.Event()
         threading.Thread(target=self._live_updater, daemon=True).start()
-        # Start auto renderer (updates TUI every 0.3s without user input)
-        threading.Thread(target=self._auto_renderer, daemon=True).start()
+        # NOTE: The render thread (_render_thread) is started later in
+        # run() — it is the sole render thread. We do NOT start
+        # _auto_renderer() here to avoid double-render deadlocks.
 
     # ============== KNOWLEDGE BASE ==============
     def load_kb(self):
@@ -470,29 +487,31 @@ class MemoryExplorerAI:
 
             time.sleep(0.2)
 
-    # ============== AUTO RENDERER (redraws TUI without waiting for input) ==============
-    def _auto_renderer(self):
-        """Continuously redraws the TUI every 0.3s, independent of user input.
-        This makes all live values (RAM, AI, spray, scan, particles) update
-        online without the user having to press anything."""
-        while not self._stop_live.is_set():
-            time.sleep(0.3)
-            try:
-                # Skip if user is currently typing at the prompt
-                if getattr(self, "is_reading_input", False):
-                    continue
-                # Only redraw if we can grab the lock (don't block input).
-                if self.render_lock.acquire(blocking=False):
-                    self.render_tui()
-                    self.render_lock.release()
-            except Exception:
-                pass
+    # ============== AUTO RENDERER ==============
+    # NOTE: The actual render thread is _render_loop() / _start_render_thread()
+    # defined near the top of the class (around line 729). It is the
+    # SOLE render thread. We do NOT start the older _auto_renderer()
+    # here anymore — that one was conflicting with the new one and
+    # causing deadlocks on the render_lock.
+    # The _live_updater() below ONLY updates the live{} dict; the
+    # render thread is what paints the screen.
 
     # ============== TUI ==============
     def render_tui(self, hint=""):
+        """Build the TUI as a list of lines and write it to stdout.
+
+        Two modes:
+        - FULL redraw (default): clears screen and redraws everything.
+        - PATCH redraw: just emits the lines to stdout WITHOUT clearing
+          (used during input, so the prompt line is preserved).
+        """
         with self.render_lock:
             out = []
             L = self.live
+            # Advance the particle animation frame
+            self._render_frame += 1
+            L["particle_idx"] = self._render_frame
+            L["spray_pulse"]   = self._render_frame // 2
             up = int(time.time() - L["uptime_start"])
             m, s = divmod(up, 60)
             h, m = divmod(m, 60)
@@ -589,6 +608,7 @@ class MemoryExplorerAI:
             out.append(
                 f" {C.BLU}[v<N>]{C.RST} Re-verify    "
                 f" {C.BLU}[walk]{C.RST} Cred chain   "
+                f" {C.BLU}[rate<N>]{C.RST} FPS        "
                 f" {C.BLU}[help]{C.RST} Help"
             )
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
@@ -616,18 +636,259 @@ class MemoryExplorerAI:
             if hint:
                 out.append(f" {C.MAG}HINT{C.RST}: {C.WHT}{hint}{C.RST}")
             out.append(f" {C.GRY}LAST CMD{C.RST}: {C.CYN}{L['last_command']}{C.RST}    "
-                       f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump){C.RST}")
+                       f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump, FPS {self.render_hz:.1f}){C.RST}")
 
-            # Render atomically
+            # Add the prompt line as the LAST line so the cursor is
+            # right after the prompt. The user can type after it.
+            # If the input area is currently occupied, the render
+            # thread will not redraw (it checks is_reading_input and
+            # _render_paused), so the prompt line is stable.
+            out.append(f" {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} ")
+
+            # Render atomically:
+            # 1. Move cursor home, clear screen.
+            # 2. Write all lines with explicit \r\n endings (Termux-safe).
+            # 3. The very last char printed is the trailing space after
+            #    the prompt " > ", so the cursor sits ready for input.
+            #
+            # IMPORTANT: We use os.write(1, ...) instead of print() or
+            # sys.stdout.write() because the latter two can deadlock
+            # when called from a background thread that also touches
+            # other file objects. os.write goes directly to the
+            # underlying fd and never blocks on Python's I/O lock.
+            # Termux/Android exposes the terminal as a normal fd, so
+            # os.write(1, bytes) is the most reliable way to paint.
             try:
-                sys.stdout.write(C.CLR + "\n".join(out) + "\n")
-                sys.stdout.flush()
+                fd = sys.stdout.fileno()
+            except Exception:
+                fd = 1
+            try:
+                # Build the full payload with explicit \r\n endings.
+                # C.CLR = \033[2J\033[H (clear + home)
+                # \r\n at the end so the cursor lands on a new line
+                # after the prompt space, ready for input.
+                payload = C.CLR + "\r\n".join(out) + "\r\n"
+                # Hide cursor (0x25 = '%', 0x6c = 'l' — the \033[?25l
+                # is "hide cursor" sequence)
+                try:
+                    os.write(fd, b"\033[?25l")
+                except Exception:
+                    pass
+                # Write the actual TUI payload as one big os.write
+                try:
+                    os.write(fd, payload.encode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+                # Re-show cursor so the user can type
+                try:
+                    os.write(fd, b"\033[?25h")
+                except Exception:
+                    pass
             except Exception:
                 pass
 
     def _bar(self, pct, width, color):
         filled = int(width * pct / 100)
         return f"{C.GRY}[{color}{'█' * filled}{'░' * (width - filled)}{C.GRY}]{C.RST}"
+
+    # ============== RENDER THREAD ==============
+    def _start_render_thread(self):
+        """Start the dedicated background render thread.
+
+        This is the CORRECT way to do live TUI updates on Termux:
+        the rendering is decoupled from input. The render thread
+        continuously redraws the TUI at self.render_hz. The main
+        thread just reads input and does its work. The two threads
+        coordinate via _render_paused (so the render thread does not
+        clobber the user's input line) and self.render_lock (so they
+        never write to stdout at the same time).
+        """
+        if self._render_thread and self._render_thread.is_alive():
+            return  # already running
+        self._render_stop.clear()
+        self._render_paused.clear()
+        self._render_thread = threading.Thread(
+            target=self._render_loop, name="tui-render", daemon=True
+        )
+        self._render_thread.start()
+        self.live["last_msg"] = f"Render thread started @ {self.render_hz:.1f} Hz."
+
+    def _stop_render_thread(self):
+        """Stop the render thread gracefully (called on exit)."""
+        self._render_stop.set()
+        if self._render_thread and self._render_thread.is_alive():
+            # Give it up to 500ms to exit cleanly
+            self._render_thread.join(timeout=0.5)
+        # Make sure cursor is visible after we stop rendering
+        try:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _render_loop(self):
+        """The render thread's main loop. Runs at self.render_hz."""
+        next_frame_at = time.time()
+        while not self._render_stop.is_set():
+            try:
+                if self._render_paused.is_set():
+                    time.sleep(0.05)
+                    next_frame_at = time.time()
+                    continue
+                now = time.time()
+                if now < next_frame_at:
+                    remaining = next_frame_at - now
+                    time.sleep(min(0.05, max(0.005, remaining)))
+                    continue
+                # Update schedule for the NEXT frame BEFORE we render
+                next_frame_at = max(now + (1.0 / max(0.1, self.render_hz)),
+                                    time.time() + 0.005)
+                # Do the actual redraw
+                try:
+                    self.render_tui()
+                except Exception as e:
+                    # Don't kill the thread on render errors
+                    import traceback
+                    try:
+                        sys.stderr.write(f"[render-loop] {e}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+            except Exception as e:
+                # Defensive: never let this thread die
+                try:
+                    sys.stderr.write(f"[render-loop OUTER] {e}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+    def cmd_set_rate(self, args):
+        """User command: rate<N> — change render FPS (1-30 Hz)."""
+        try:
+            n = float(args.strip())
+            if 0.5 <= n <= 30:
+                self.render_hz = n
+                self.live["last_msg"] = f"Render rate set to {n:.1f} Hz."
+            else:
+                self.live["last_msg"] = f"Rate must be 0.5-30 Hz, got {n}"
+        except Exception:
+            self.live["last_msg"] = f"Usage: rate<Hz>  e.g. rate10"
+
+    # ============== INPUT (now simpler — render thread handles redraws) ==============
+    def input_cmd(self):
+        """Read one command line from the user, with history, Ctrl+P
+        (cancel learning), Ctrl+E (rewind), Ctrl+C (quit).
+
+        This function does NOT try to redraw the TUI — the dedicated
+        render thread (started by run()) handles all redraws. This
+        is the proper separation for Termux/Android: input thread
+        just reads, render thread just paints.
+
+        The render thread checks self.is_reading_input and pauses
+        when set, so it never clobbers our prompt + buffer.
+        """
+        self.is_reading_input = True
+        self._render_paused.set()   # tell render thread: don't redraw
+        try:
+            # Print the prompt on its own line. (Render thread is
+            # paused so this line stays put.)
+            self._print_prompt("")
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                # cbreak: char-by-char input, OPOST ON, \n→\r\n
+                # translation preserved. This is the right mode for
+                # our prompt — it lets us capture arrow keys, Ctrl+C
+                # etc. without breaking output.
+                tty.setcbreak(fd)
+                buf = []
+                hist_idx = len(self.cmd_history)
+                while True:
+                    r, _, _ = select.select([fd], [], [], 0.5)
+                    if not r:
+                        # No key — just keep waiting, render thread
+                        # is paused so nothing is racing us.
+                        continue
+                    ch = os.read(fd, 1)
+                    if not ch:
+                        break
+                    c = ch.decode("utf-8", errors="ignore")
+                    if c == "\x03":  # Ctrl+C
+                        buf = ["q"]
+                        # Print a newline so the prompt wraps cleanly
+                        print("", flush=True)
+                        break
+                    if c == "\x10":  # Ctrl+P  -> cancel learning
+                        self.cmd_learning_cancel()
+                        self.live["last_msg"] = "Press 'L' to start a new learning cycle."
+                        self._print_prompt("".join(buf), extra="\n [Ctrl+P] Learning cancelled.\n")
+                        continue
+                    if c in ("\r", "\n"):
+                        # Enter — finish the line. Print \r\n so the
+                        # next render starts cleanly below the prompt.
+                        print("", flush=True)
+                        break
+                    if c == "\x7f" or c == "\b":
+                        if buf:
+                            buf.pop()
+                            # Erase one char in place — works in
+                            # both cbreak and cooked modes.
+                            print("\b \b", end="", flush=True)
+                        continue
+                    if c == "\x05":  # Ctrl+E -> rewind to last command
+                        if self.last_cmd_text:
+                            self._print_prompt(self.last_cmd_text)
+                            buf = list(self.last_cmd_text)
+                        continue
+                    if c == "\x1b":  # ESC sequence (arrow keys)
+                        nxt = os.read(fd, 2)
+                        if nxt == b"[A":  # Up arrow
+                            if self.cmd_history and hist_idx > 0:
+                                hist_idx -= 1
+                                self._print_prompt(self.cmd_history[hist_idx])
+                                buf = list(self.cmd_history[hist_idx])
+                        elif nxt == b"[B":  # Down arrow
+                            if self.cmd_history and hist_idx < len(self.cmd_history) - 1:
+                                hist_idx += 1
+                                self._print_prompt(self.cmd_history[hist_idx])
+                                buf = list(self.cmd_history[hist_idx])
+                            else:
+                                hist_idx = len(self.cmd_history)
+                                self._print_prompt("")
+                                buf = []
+                        continue
+                    buf.append(c)
+                    # Echo the char — explicit \r\n in case OPOST
+                    # is off (defensive — cbreak keeps it on anyway).
+                    print(c, end="", flush=True)
+            finally:
+                # ALWAYS restore terminal settings, even on exception.
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
+            cmd = "".join(buf).strip()
+            if cmd:
+                self.cmd_history.append(cmd)
+                if len(self.cmd_history) > 100:
+                    self.cmd_history = self.cmd_history[-100:]
+                self.last_cmd_text = cmd
+            return cmd
+        finally:
+            self.is_reading_input = False
+            self._render_paused.clear()  # tell render thread: resume
+
+    def _print_prompt(self, buf, extra=""):
+        """Print the prompt + buffer on its own line, clearing any
+        previous text. Uses print(flush=True) for Termux reliability
+        and explicit \\r\\n so the line is clean even if OPOST is off.
+        """
+        # \r returns to col 0, \033[2K clears the whole line
+        # Then we print the prompt + buffer, then \r\n so the next
+        # render or the cursor move starts on a fresh line.
+        line = f"\r\033[2K{extra} {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {buf}"
+        print(line, end="\r\n", flush=True)
 
     # ============== ENGINE MANAGEMENT ==============
     def ensure_engine(self):
@@ -2153,212 +2414,10 @@ class MemoryExplorerAI:
         self.live["last_msg"] = "Learning cancelled by user."
         return "Cancelled"
 
-    # ============== INPUT (non-blocking, with Ctrl+P / history / live TUI) ==============
-    def input_cmd(self):
-        """Read one line using select() with a short timeout so the TUI can
-        auto-redraw every 0.3s even while the user is thinking (no key pressed).
-        Supports: Ctrl+C (quit), Ctrl+P (cancel learning), Ctrl+E (rewind),
-        Up/Down (history), Enter (submit), Backspace (erase)."""
-        self.is_reading_input = True
-        try:
-            # Initial prompt (rendered once)
-            self._print_prompt("")
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                buf = []
-                hist_idx = len(self.cmd_history)
-                last_redraw = 0.0
-                # Auto-redraw the WHOLE TUI every 0.3s while no key is pressed,
-                # so the user sees the live state without pressing anything.
-                # The cursor + the input buffer are preserved across the redraw
-                # so typing is not interrupted.
-                while True:
-                    r, _, _ = select.select([fd], [], [], 0.3)
-                    now = time.time()
-                    if not r:
-                        # No key pressed → auto-redraw the whole TUI.
-                        if now - last_redraw >= 0.3:
-                            self._tui_full_redraw_with_input("".join(buf))
-                            last_redraw = now
-                        continue
-                    ch = os.read(fd, 1)
-                    if not ch:
-                        break
-                    c = ch.decode("utf-8", errors="ignore")
-                    if c == "\x03":  # Ctrl+C
-                        buf = ["q"]
-                        break
-                    if c == "\x10":  # Ctrl+P  -> cancel learning
-                        self.cmd_learning_cancel()
-                        self.live["last_msg"] = "Press 'L' to start a new learning cycle."
-                        self._print_prompt("".join(buf), extra="\n [Ctrl+P] Learning cancelled.\n")
-                        continue
-                    if c in ("\r", "\n"):
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        break
-                    if c == "\x7f" or c == "\b":
-                        if buf:
-                            buf.pop()
-                            sys.stdout.write("\b \b")
-                            sys.stdout.flush()
-                        continue
-                    if c == "\x05":  # Ctrl+E -> rewind to last command
-                        if self.last_cmd_text:
-                            self._print_prompt(self.last_cmd_text)
-                            buf = list(self.last_cmd_text)
-                        continue
-                    if c == "\x1b":  # ESC sequence (arrow keys)
-                        nxt = os.read(fd, 2)
-                        if nxt == b"[A":  # Up arrow
-                            if self.cmd_history and hist_idx > 0:
-                                hist_idx -= 1
-                                self._print_prompt(self.cmd_history[hist_idx])
-                                buf = list(self.cmd_history[hist_idx])
-                        elif nxt == b"[B":  # Down arrow
-                            if self.cmd_history and hist_idx < len(self.cmd_history) - 1:
-                                hist_idx += 1
-                                self._print_prompt(self.cmd_history[hist_idx])
-                                buf = list(self.cmd_history[hist_idx])
-                            else:
-                                hist_idx = len(self.cmd_history)
-                                self._print_prompt("")
-                                buf = []
-                        continue
-                    buf.append(c)
-                    sys.stdout.write(c)
-                    sys.stdout.flush()
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            cmd = "".join(buf).strip()
-            if cmd:
-                self.cmd_history.append(cmd)
-                if len(self.cmd_history) > 100:
-                    self.cmd_history = self.cmd_history[-100:]
-                self.last_cmd_text = cmd
-            return cmd
-        finally:
-            self.is_reading_input = False
-
-    def _print_prompt(self, buf, extra=""):
-        """Print the prompt + buffer on its own line, clearing any previous text."""
-        sys.stdout.write(f"\r\033[2K{extra} {C.BOLD}{C.GRN}explorer{C.RST} {C.GRY}>{C.RST} {buf}")
-        sys.stdout.flush()
-
-    def _tui_refresh_inline(self):
-        """Redraw a compact live status line just above the prompt while user
-        is typing. This makes the user feel like the TUI is alive without
-        disturbing their input. Skipped if a render is already in progress."""
-        if not self.render_lock.acquire(blocking=False):
-            return
-        try:
-            L = self.live
-            ram = L["ram"]
-            ram_c = C.GRN if ram < 50 else (C.YEL if ram < 75 else C.RED)
-            st = L["status"]
-            st_c = (C.GRN if "ACTIVE" in st or "AUTOPILOT" in st
-                    or "EXPLOIT" in st or "SCAN" in st else C.GRY)
-            spray_pct = min(99, 100 * L["spray_count"] // max(1, L["spray_target"])) if L["spray_target"] else 0
-            n_found = len(self.found_items)
-            n_spray = len(self.spray_procs)
-            if self.kernel_base:
-                kbase_str = f"{C.GRN}0x{self.kernel_base & 0xffffffffffffffff:016x}{C.RST}"
-            else:
-                kbase_str = f"{C.RED}none{C.RST}"
-            selinux_str = (C.RED + "ON " + C.RST) if self.selinux_va is None else (C.GRN + "OFF" + C.RST)
-            # Root status (uid/user)
-            uid = L.get("uid", -1)
-            if uid == 0:
-                root_str = C.GRN + "ROOT" + C.RST
-            elif uid > 0:
-                root_str = f"{C.YEL}u{uid}{C.RST}"
-            else:
-                root_str = C.GRY + "—" + C.RST
-            # Pause indicator
-            pause_str = ""
-            if self.autopilot_paused:
-                pause_str = C.YEL + " ⏸PAUSE" + C.RST
-            sys.stdout.write(
-                f"\0337"  # save cursor
-                f"\033[1A\r\033[2K"  # up one line, clear
-                f" {C.DIM}▸{C.RST} "
-                f"{st_c}{st:<14}{C.RST}{pause_str}·"
-                f"RAM{ram_c}{ram:4.0f}%{C.RST}·"
-                f"AI{C.MAG}{L['ai_patterns']:>3}{C.RST}·"
-                f"sp{C.CYN}{spray_pct:>3}%{C.RST}·"
-                f"#found{C.YEL}{n_found:>3}{C.RST}·"
-                f"kbase{kbase_str}·"
-                f"selinux{selinux_str}·"
-                f"uid{root_str}\n"
-                f"\0338"  # restore cursor
-            )
-            sys.stdout.flush()
-        except Exception:
-            pass
-        finally:
-            self.render_lock.release()
-
-    def _tui_full_redraw_with_input(self, input_buf):
-        """Redraw the WHOLE TUI while preserving the input buffer.
-        Called from input_cmd() every 0.3s of no-keypress so the user
-        sees live updates without having to press anything.
-
-        Strategy:
-        1. Save cursor (absolute row/col — we'll restore it to the
-           end of the input_buf after the redraw).
-        2. Move to top-left.
-        3. Call render_tui() — it clears the screen and draws the
-           whole TUI. The last line is the prompt "explorer > " with
-           the cursor at the end of the prompt (no input yet).
-        4. Re-print the input_buf after the prompt.
-        5. Cursor is now at end of input_buf — exactly where it was
-           before the redraw.
-        """
-        if not self.render_lock.acquire(blocking=False):
-            return
-        try:
-            # Hide cursor during the redraw to avoid flicker
-            sys.stdout.write("\033[?25l")
-            # Save cursor (row/col of the current input position)
-            sys.stdout.write("\0337")
-            # Move to top-left
-            sys.stdout.write("\033[H")
-            # Re-render the whole TUI. It will clear the screen
-            # (C.CLR = \\033[2J\\033[H) and redraw everything.
-            # The cursor ends up at the end of "explorer > " (the prompt)
-            # at the bottom of the screen.
-            try:
-                self.render_tui(hint="auto-redraw")
-            except Exception:
-                pass
-            # Re-print the input buffer after the prompt.
-            # The cursor is now at the position where the user was
-            # typing before the redraw.
-            sys.stdout.write(f"\r\033[2K {C.BOLD}{C.GRN}explorer{C.RST} "
-                             f"{C.GRY}>{C.RST} {input_buf}")
-            sys.stdout.flush()
-            # Restore cursor (it should be at the same position as
-            # before the redraw, which was at the end of input_buf).
-            # Actually since we just wrote input_buf fresh, the cursor
-            # is now at the right place — we don't strictly need \0338,
-            # but using it as a safety net.
-            sys.stdout.write("\0338")
-            sys.stdout.flush()
-            # Show cursor again
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
-        except Exception:
-            pass
-        finally:
-            # Always re-show cursor even on error
-            try:
-                sys.stdout.write("\033[?25h")
-                sys.stdout.flush()
-            except Exception:
-                pass
-            self.render_lock.release()
+    # ============== INPUT (render thread handles all redraws) ==============
+    # Note: the actual input_cmd / _print_prompt / cmd_set_rate are
+    # defined earlier (around line 769-895) where they live next to
+    # the render thread. This is the only definition now.
 
     # ============== ITEM VERIFICATION ==============
     def verify_item(self, item_idx):
@@ -2527,8 +2586,15 @@ class MemoryExplorerAI:
         if not os.path.exists(self.engine_path):
             self.try_compile_engine()
         if not self.ensure_engine():
-            sys.stdout.write(f"{C.RED}[CRIT] Could not start engine. Check GCC/Clang.{C.RST}\n")
+            print(f"{C.RED}[CRIT] Could not start engine. Check GCC/Clang.{C.RST}", flush=True)
             return
+
+        # === START THE DEDICATED RENDER THREAD ===
+        # This is the key fix for "TUI doesn't update on Termux".
+        # A SEPARATE background thread continuously redraws the TUI
+        # at self.render_hz (default 5 Hz). The main thread just
+        # reads input — no select()-timeout hacks needed.
+        self._start_render_thread()
 
         # === AUTO-START AUTOPILOT ===
         # The whole point of this mode: user shouldn't have to press anything.
@@ -2540,8 +2606,10 @@ class MemoryExplorerAI:
             if not (self.bg_thread and self.bg_thread.is_alive()):
                 self.cmd_learning_start()
 
+        # Main loop: just read input, do NOT call render_tui() here.
+        # The render thread is doing the redraws at self.render_hz.
+        # This means the user sees live updates WITHOUT pressing keys.
         while True:
-            self.render_tui()
             try:
                 cmd = self.input_cmd().lower()
             except (EOFError, KeyboardInterrupt):
@@ -2562,6 +2630,7 @@ class MemoryExplorerAI:
                         os.waitpid(pid, 0)
                     except Exception:
                         pass
+                self._stop_render_thread()
                 break
             elif cmd in ("p", "pause"):
                 self.cmd_autopilot_pause()
@@ -2592,116 +2661,136 @@ class MemoryExplorerAI:
                 self.cmd_verify_root()
             elif cmd in ("b", "build"):
                 self.cmd_rebuild()
+            elif cmd.startswith("rate"):
+                # rate<N> — change render FPS live
+                self.cmd_set_rate(cmd[4:])
             elif cmd in ("log", "logs"):
                 # show last 20 spray log entries
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== SPRAY LOG (last 20) ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-                if not self.spray_log:
-                    sys.stdout.write(f"{C.GRY}(empty — no sprays yet){C.RST}\n")
-                else:
-                    for e in self.spray_log[-20:]:
-                        sys.stdout.write(json.dumps(e) + "\n")
-                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-                sys.stdout.write(f"\n{C.GRY}Log file: {C.WHT}{self.log_path}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
+                # We pause the render thread so the user can see the
+                # log clearly without it being overwritten.
+                self._render_paused.set()
                 try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== SPRAY LOG (last 20) ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
+                    if not self.spray_log:
+                        print(f"{C.GRY}(empty — no sprays yet){C.RST}", flush=True)
+                    else:
+                        for e in self.spray_log[-20:]:
+                            print(json.dumps(e), flush=True)
+                    print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
+                    print(f"\n{C.GRY}Log file: {C.WHT}{self.log_path}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    self._render_paused.clear()
             elif cmd in ("list", "ls", "items"):
                 # Show ALL found items (paginated 25 per page)
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== FOUND MEMORY OFFSETS ({len(self.found_items)} total) ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-                if not self.found_items:
-                    sys.stdout.write(f"{C.GRY}(empty — no items yet){C.RST}\n")
-                else:
-                    page_size = 25
-                    total = len(self.found_items)
-                    pages = (total + page_size - 1) // page_size
-                    page = 0
-                    while page < pages:
-                        start = page * page_size
-                        end = min(start + page_size, total)
-                        sys.stdout.write(f"{C.MAG}── Page {page+1}/{pages} "
-                                         f"({start}..{end-1}) ──{C.RST}\n")
-                        for i in range(start, end):
-                            it = self.found_items[i]
-                            color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
-                                     "System App": C.BLU, "Kernel Code": C.MAG,
-                                     "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
-                                     "Privilege Struct (ROOTED)": C.GRN,
-                                     "Kernel Global": C.CYN}.get(it['type'], C.GRY)
-                            sys.stdout.write(f" {C.GRY}[{i:02d}]{C.RST} "
-                                             f"{color}{it['type']:<24}{C.RST} "
-                                             f"{C.WHT}{it.get('description','')[:50]:<50}{C.RST} "
-                                             f"{C.CYN}{it['va']}{C.RST}\n")
-                        page += 1
-                        if page < pages:
-                            sys.stdout.write(f"\n{C.GRY}-- More -- (Enter for next page, q to quit){C.RST}\n")
-                            sys.stdout.flush()
-                            nxt = self.input_cmd().strip().lower()
-                            if nxt in ("q", "quit", "x"):
-                                break
-                sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
+                # Pause the render thread so it doesn't clobber our output.
+                self._render_paused.set()
                 try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== FOUND MEMORY OFFSETS ({len(self.found_items)} total) ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*92}{C.RST}", flush=True)
+                    if not self.found_items:
+                        print(f"{C.GRY}(empty — no items yet){C.RST}", flush=True)
+                    else:
+                        page_size = 25
+                        total = len(self.found_items)
+                        pages = (total + page_size - 1) // page_size
+                        page = 0
+                        while page < pages:
+                            start = page * page_size
+                            end = min(start + page_size, total)
+                            print(f"{C.MAG}── Page {page+1}/{pages} "
+                                  f"({start}..{end-1}) ──{C.RST}", flush=True)
+                            for i in range(start, end):
+                                it = self.found_items[i]
+                                color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
+                                         "System App": C.BLU, "Kernel Code": C.MAG,
+                                         "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
+                                         "Privilege Struct (ROOTED)": C.GRN,
+                                         "Kernel Global": C.CYN}.get(it['type'], C.GRY)
+                                print(f" {C.GRY}[{i:02d}]{C.RST} "
+                                      f"{color}{it['type']:<24}{C.RST} "
+                                      f"{C.WHT}{it.get('description','')[:50]:<50}{C.RST} "
+                                      f"{C.CYN}{it['va']}{C.RST}", flush=True)
+                            page += 1
+                            if page < pages:
+                                print(f"\n{C.GRY}-- More -- (Enter for next page, q to quit){C.RST}", flush=True)
+                                nxt = self.input_cmd().strip().lower()
+                                if nxt in ("q", "quit", "x"):
+                                    break
+                    print(f"{C.GRY}{'─'*92}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    self._render_paused.clear()
             elif cmd in ("kb", "kbase"):
                 # Show kernel base / SELinux / init_cred status
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== KERNEL INTELLIGENCE ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Kernel base{C.RST} : "
-                                 f"{C.GRN if self.kernel_base else C.RED}"
-                                 f"{hex(self.kernel_base) if self.kernel_base else 'NOT FOUND'}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}SELinux VA {C.RST} : "
-                                 f"{C.GRN if self.selinux_va else C.RED}"
-                                 f"{hex(self.selinux_va) if self.selinux_va else 'NOT FOUND'}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}init_cred  {C.RST} : "
-                                 f"{C.GRN if self.cred_va else C.RED}"
-                                 f"{hex(self.cred_va) if self.cred_va else 'NOT FOUND'}{C.RST}\n")
-                sys.stdout.write(f"\n {C.DIM}AI patterns learned{C.RST}: "
-                                 f"{C.MAG}{self.live.get('ai_patterns', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.DIM}Knowledge base entries{C.RST}: "
-                                 f"{C.MAG}{sum(len(v) for v in self.knowledge_base.values() if isinstance(v, list))}{C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
+                self._render_paused.set()
                 try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== KERNEL INTELLIGENCE ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Kernel base{C.RST} : "
+                          f"{C.GRN if self.kernel_base else C.RED}"
+                          f"{hex(self.kernel_base) if self.kernel_base else 'NOT FOUND'}{C.RST}", flush=True)
+                    print(f" {C.BOLD}SELinux VA {C.RST} : "
+                          f"{C.GRN if self.selinux_va else C.RED}"
+                          f"{hex(self.selinux_va) if self.selinux_va else 'NOT FOUND'}{C.RST}", flush=True)
+                    print(f" {C.BOLD}init_cred  {C.RST} : "
+                          f"{C.GRN if self.cred_va else C.RED}"
+                          f"{hex(self.cred_va) if self.cred_va else 'NOT FOUND'}{C.RST}", flush=True)
+                    print(f"\n {C.DIM}AI patterns learned{C.RST}: "
+                          f"{C.MAG}{self.live.get('ai_patterns', 0)}{C.RST}", flush=True)
+                    print(f" {C.DIM}Knowledge base entries{C.RST}: "
+                          f"{C.MAG}{sum(len(v) for v in self.knowledge_base.values() if isinstance(v, list))}{C.RST}", flush=True)
+                    print(f" {C.DIM}Render rate{C.RST}: "
+                          f"{C.MAG}{self.render_hz:.1f} Hz{C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    self._render_paused.clear()
             elif cmd in ("stats", "stat"):
                 # Detailed learning statistics
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== AI LEARNING STATS ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                s = getattr(self, "learn_stats", {}) or {}
-                sys.stdout.write(f" {C.BOLD}Batches run{C.RST}      : {C.MAG}{s.get('batches', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Sprays total{C.RST}     : {C.MAG}{s.get('sprayed_total', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Matches{C.RST}          : {C.YEL}{s.get('matches', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Verified{C.RST}         : {C.GRN}{s.get('verified', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Auto-kept{C.RST}        : {C.CYN}{s.get('auto_kept', 0)}{C.RST} (weak-but-interesting)\n")
-                sys.stdout.write(f" {C.BOLD}False positives{C.RST}  : {C.RED}{s.get('false_positives', 0)}{C.RST}\n")
-                if s.get("matches", 0) > 0:
-                    rate = 100.0 * s.get("verified", 0) / s["matches"]
-                    sys.stdout.write(f" {C.BOLD}Verify rate{C.RST}      : {C.MAG}{rate:.1f}%{C.RST}\n")
-                sys.stdout.write(f"\n {C.DIM}Found items in list{C.RST}: {C.MAG}{len(self.found_items)}{C.RST}\n")
-                sys.stdout.write(f" {C.DIM}Spray procs alive{C.RST}  : {C.MAG}{len(self.spray_procs)}{C.RST}\n")
-                sys.stdout.write(f" {C.DIM}Engine PID{C.RST}        : {C.MAG}{self.live.get('engine_pid', 0)}{C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
+                self._render_paused.set()
                 try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== AI LEARNING STATS ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    s = getattr(self, "learn_stats", {}) or {}
+                    print(f" {C.BOLD}Batches run{C.RST}      : {C.MAG}{s.get('batches', 0)}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Sprays total{C.RST}     : {C.MAG}{s.get('sprayed_total', 0)}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Matches{C.RST}          : {C.YEL}{s.get('matches', 0)}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Verified{C.RST}         : {C.GRN}{s.get('verified', 0)}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Auto-kept{C.RST}        : {C.CYN}{s.get('auto_kept', 0)}{C.RST} (weak-but-interesting)", flush=True)
+                    print(f" {C.BOLD}False positives{C.RST}  : {C.RED}{s.get('false_positives', 0)}{C.RST}", flush=True)
+                    if s.get("matches", 0) > 0:
+                        rate = 100.0 * s.get("verified", 0) / s["matches"]
+                        print(f" {C.BOLD}Verify rate{C.RST}      : {C.MAG}{rate:.1f}%{C.RST}", flush=True)
+                    print(f"\n {C.DIM}Found items in list{C.RST}: {C.MAG}{len(self.found_items)}{C.RST}", flush=True)
+                    print(f" {C.DIM}Spray procs alive{C.RST}  : {C.MAG}{len(self.spray_procs)}{C.RST}", flush=True)
+                    print(f" {C.DIM}Engine PID{C.RST}        : {C.MAG}{self.live.get('engine_pid', 0)}{C.RST}", flush=True)
+                    print(f" {C.DIM}Render rate{C.RST}       : {C.MAG}{self.render_hz:.1f} Hz{C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    self._render_paused.clear()
             elif cmd in ("save", "dump", "export"):
                 # Save found items to JSON file
                 out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -2723,42 +2812,46 @@ class MemoryExplorerAI:
                     self.live["last_msg"] = f"Save failed: {e}"
             elif cmd in ("device", "dev", "info"):
                 # Show device / runtime info
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== DEVICE / RUNTIME INFO ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                # Try getprop
-                for prop, label in [
-                    ("ro.product.manufacturer", "Manufacturer"),
-                    ("ro.product.model",        "Model"),
-                    ("ro.product.brand",        "Brand"),
-                    ("ro.product.device",       "Device"),
-                    ("ro.build.version.release", "Android ver"),
-                    ("ro.build.version.sdk",    "SDK"),
-                    ("ro.product.cpu.abi",      "ABI"),
-                    ("ro.boot.hardware",        "Hardware"),
-                    ("ro.kernel.qemu",          "QEMU"),
-                ]:
+                self._render_paused.set()
+                try:
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== DEVICE / RUNTIME INFO ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    # Try getprop
+                    for prop, label in [
+                        ("ro.product.manufacturer", "Manufacturer"),
+                        ("ro.product.model",        "Model"),
+                        ("ro.product.brand",        "Brand"),
+                        ("ro.product.device",       "Device"),
+                        ("ro.build.version.release", "Android ver"),
+                        ("ro.build.version.sdk",    "SDK"),
+                        ("ro.product.cpu.abi",      "ABI"),
+                        ("ro.boot.hardware",        "Hardware"),
+                        ("ro.kernel.qemu",          "QEMU"),
+                    ]:
+                        try:
+                            val = subprocess.check_output(["getprop", prop], text=True, timeout=1).strip()
+                        except Exception:
+                            val = "—"
+                        print(f" {C.BOLD}{label:<14}{C.RST}: {C.WHT}{val}{C.RST}", flush=True)
+                    # Engine path + size
                     try:
-                        val = subprocess.check_output(["getprop", prop], text=True, timeout=1).strip()
+                        sz = os.path.getsize(self.engine_path)
                     except Exception:
-                        val = "—"
-                    sys.stdout.write(f" {C.BOLD}{label:<14}{C.RST}: {C.WHT}{val}{C.RST}\n")
-                # Engine path + size
-                try:
-                    sz = os.path.getsize(self.engine_path)
-                except Exception:
-                    sz = 0
-                sys.stdout.write(f"\n {C.BOLD}Engine{C.RST}     : {C.CYN}{self.engine_path}{C.RST} ({sz} bytes)\n")
-                sys.stdout.write(f" {C.BOLD}PID{C.RST}        : {C.CYN}{self.live.get('engine_pid', 0)}{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}Uptime{C.RST}     : {C.CYN}{int(time.time() - self.live['uptime_start'])}s{C.RST}\n")
-                sys.stdout.write(f" {C.BOLD}RAM{C.RST}        : {C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*60}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
-                try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                        sz = 0
+                    print(f"\n {C.BOLD}Engine{C.RST}     : {C.CYN}{self.engine_path}{C.RST} ({sz} bytes)", flush=True)
+                    print(f" {C.BOLD}PID{C.RST}        : {C.CYN}{self.live.get('engine_pid', 0)}{C.RST}", flush=True)
+                    print(f" {C.BOLD}Uptime{C.RST}     : {C.CYN}{int(time.time() - self.live['uptime_start'])}s{C.RST}", flush=True)
+                    print(f" {C.BOLD}RAM{C.RST}        : {C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}", flush=True)
+                    print(f" {C.BOLD}Render rate{C.RST}: {C.CYN}{self.render_hz:.1f} Hz{C.RST}", flush=True)
+                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    print("Press Enter to return...", flush=True)
+                    try:
+                        self.input_cmd()
+                    except Exception:
+                        pass
+                finally:
+                    self._render_paused.clear()
             elif cmd in ("clear_kb", "reset_kb"):
                 # Reset knowledge base
                 self.knowledge_base = {
