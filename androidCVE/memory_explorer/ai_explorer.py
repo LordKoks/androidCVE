@@ -534,7 +534,72 @@ class MemoryExplorerAI:
             return {"type": "Unknown Object",
                     "description": f"Auto-classified ({reason})",
                     "va": hex(va), "confidence": conf, "data": page_data}
-        return {"type": "Unknown Object", "description": "Unclassified Data Fragment",
+
+        # === EXTENDED FALLBACK HEURISTICS ===
+        # The code below catches pages that didn't match any of the
+        # explicit sigs (1-17) and didn't pass _is_page_interesting.
+        # We try a wider set of patterns so the user sees meaningful
+        # types in the File Manager instead of "Unclassified".
+        # Kernel comm strings (Linux 5.4 default set)
+        kernel_comms = (
+            b"swapper/", b"kthreadd\x00", b"init\x00", b"kworker/",
+            b"migration/", b"ksoftirqd/", b"rcu_", b"kdevtmpfs",
+            b"oom_reaper", b"writeback", b"kcompactd", b"crypto",
+            b"watchdog/", b"cpuhp/", b"kblockd", b"systemd",
+            b"kswapd", b"kthrotld", b"irq/", b"scsi_", b"xfs",
+            b"ipv6_addrconf", b"kworker",
+        )
+        for kc in kernel_comms:
+            if kc in page_data:
+                idx = page_data.find(kc)
+                tail = page_data[idx:idx+16].split(b"\x00")[0].decode(errors="ignore")
+                return {"type": "Task Struct",
+                        "description": (f"kernel comm '{tail}' @ 0x{idx:x}"),
+                        "va": hex(va), "confidence": 80, "data": page_data}
+        # Any KETO* / KETW* pattern (4-7 byte ASCII + NUL pad) anywhere
+        for marker in (b"KETO", b"KETW"):
+            idx = page_data.find(marker)
+            if idx >= 0:
+                tail = page_data[idx:idx+8].split(b"\x00")[0].decode(errors="ignore")
+                return {"type": "Spray Marker",
+                        "description": (f"spray comm '{tail}' @ 0x{idx:x}"),
+                        "va": hex(va), "confidence": 85, "data": page_data}
+        # KGSL/ioctl strings (kernel driver-specific memory)
+        for kgsl_str in (b"kgsl-3d0", b"adreno", b"msm_gpu", b"kgsl",
+                         b"i915", b"drm", b"mali", b"pvr"):
+            if kgsl_str in page_data:
+                idx = page_data.find(kgsl_str)
+                return {"type": "Kernel Driver",
+                        "description": (f"GPU/KGSL string '{kgsl_str.decode()}' @ 0x{idx:x}"),
+                        "va": hex(va), "confidence": 70, "data": page_data}
+        # High kernel pointer density (>= 5 kptrs, > 30% non-zero)
+        kptrs = 0
+        nz = 0
+        for qi in range(0, 4096, 8):
+            qv = struct.unpack("<Q", page_data[qi:qi+8])[0]
+            if qv: nz += 1
+            if (qv >> 32) >= 0xffffff80 and (qv >> 40) <= 0xffffffcf and qv:
+                kptrs += 1
+        if kptrs >= 5 and nz > 1200:
+            return {"type": "Kernel Heap",
+                    "description": f"dense kernel heap ({kptrs} kptrs, {nz*8/4096*100:.0f}% nz)",
+                    "va": hex(va), "confidence": 65, "data": page_data}
+        if kptrs >= 3:
+            return {"type": "Kernel Heap",
+                    "description": f"kernel heap ({kptrs} kptrs, {nz*8/4096*100:.0f}% nz)",
+                    "va": hex(va), "confidence": 50, "data": page_data}
+        # ELF magic (kernel .text segment)
+        if page_data[:4] == b"\x7fELF":
+            return {"type": "Kernel Code",
+                    "description": "ELF header (kernel .text)",
+                    "va": hex(va), "confidence": 100, "data": page_data}
+        # If page is fully zero, mark as such
+        if nz == 0:
+            return {"type": "Empty Page",
+                    "description": "all-zero (unallocated)",
+                    "va": hex(va), "confidence": 0, "data": page_data}
+        return {"type": "Unknown Object",
+                "description": f"Unclassified (kptrs={kptrs} nz={nz*8/4096*100:.0f}%)",
                 "va": hex(va), "confidence": 10, "data": page_data}
 
     def translate_logic(self, item):
@@ -3486,6 +3551,49 @@ class MemoryExplorerAI:
             if not (self.bg_thread and self.bg_thread.is_alive()):
                 self.cmd_learning_start()
 
+        # === WATCHDOG THREAD ===
+        # Without this, if autopilot or learning crashes (e.g. SIGSYS
+        # from a bad syscall, or engine pipe broken, or OOM), the
+        # user has to press E, L, R manually to restart. The watchdog
+        # polls every 3s and restarts either worker if it's not
+        # alive. Disabled while the user explicitly pauses (P) or
+        # stops (X) the autopilot.
+        def _watchdog():
+            import time as _t
+            last_check = 0.0
+            while not self.cancel_flag.is_set():
+                _t.sleep(1.0)
+                # Throttle restart attempts: don't spam restarts
+                # if engine is broken (e.g. /dev/kgsl-3d0 missing).
+                now = _t.time()
+                if now - last_check < 3.0:
+                    continue
+                last_check = now
+                # Skip if user paused or stopped
+                if self.autopilot_paused or not self.autopilot_mode:
+                    continue
+                # Restart autopilot if dead
+                if (self.autopilot_mode
+                    and not (self.autopilot_thread
+                             and self.autopilot_thread.is_alive())):
+                    try:
+                        self.live["last_msg"] = (
+                            "Watchdog: restarting autopilot (was dead)")
+                        self.cmd_autopilot_start()
+                    except Exception:
+                        pass
+                # Restart learning if dead (autopilot worker also
+                # restarts it, but the watchdog is a safety net for
+                # the case where autopilot itself is dead).
+                if (not (self.bg_thread and self.bg_thread.is_alive())):
+                    try:
+                        self.live["last_msg"] = (
+                            "Watchdog: restarting learning (was dead)")
+                        self.cmd_learning_start()
+                    except Exception:
+                        pass
+        threading.Thread(target=_watchdog, daemon=True).start()
+
         # Main loop: read input. input_cmd() itself redraws the TUI
         # every 0.3s of no-keypress, so the user sees live updates
         # WITHOUT pressing any keys.
@@ -3507,12 +3615,16 @@ class MemoryExplorerAI:
                         self.exploit_proc.terminate()
                     except Exception:
                         pass
-                for pid in list(self.spray_procs):
-                    try:
-                        os.kill(pid, 9)
-                        os.waitpid(pid, 0)
-                    except Exception:
-                        pass
+                # Kill from per-worker sets (not the stale self.spray_procs
+                # which is no longer the source of truth).
+                for wid, pids in list(self.spray_procs_by_worker.items()):
+                    for pid in list(pids):
+                        try:
+                            os.kill(pid, 9)
+                            os.waitpid(pid, 0)
+                        except Exception:
+                            pass
+                    pids.clear()
                 pass
                 break
             elif cmd in ("p", "pause"):
