@@ -2170,15 +2170,17 @@ class MemoryExplorerAI:
                 buf = []
                 hist_idx = len(self.cmd_history)
                 last_redraw = 0.0
+                # Auto-redraw the WHOLE TUI every 0.3s while no key is pressed,
+                # so the user sees the live state without pressing anything.
+                # The cursor + the input buffer are preserved across the redraw
+                # so typing is not interrupted.
                 while True:
-                    # Wait for either a key (0.3s) or timeout
                     r, _, _ = select.select([fd], [], [], 0.3)
                     now = time.time()
-                    # Auto-redraw TUI every 0.3s while user is "thinking"
                     if not r:
+                        # No key pressed → auto-redraw the whole TUI.
                         if now - last_redraw >= 0.3:
-                            # Save cursor, redraw TUI in a separate scroll region
-                            self._tui_refresh_inline()
+                            self._tui_full_redraw_with_input("".join(buf))
                             last_redraw = now
                         continue
                     ch = os.read(fd, 1)
@@ -2296,6 +2298,66 @@ class MemoryExplorerAI:
         except Exception:
             pass
         finally:
+            self.render_lock.release()
+
+    def _tui_full_redraw_with_input(self, input_buf):
+        """Redraw the WHOLE TUI while preserving the input buffer.
+        Called from input_cmd() every 0.3s of no-keypress so the user
+        sees live updates without having to press anything.
+
+        Strategy:
+        1. Save cursor (absolute row/col — we'll restore it to the
+           end of the input_buf after the redraw).
+        2. Move to top-left.
+        3. Call render_tui() — it clears the screen and draws the
+           whole TUI. The last line is the prompt "explorer > " with
+           the cursor at the end of the prompt (no input yet).
+        4. Re-print the input_buf after the prompt.
+        5. Cursor is now at end of input_buf — exactly where it was
+           before the redraw.
+        """
+        if not self.render_lock.acquire(blocking=False):
+            return
+        try:
+            # Hide cursor during the redraw to avoid flicker
+            sys.stdout.write("\033[?25l")
+            # Save cursor (row/col of the current input position)
+            sys.stdout.write("\0337")
+            # Move to top-left
+            sys.stdout.write("\033[H")
+            # Re-render the whole TUI. It will clear the screen
+            # (C.CLR = \\033[2J\\033[H) and redraw everything.
+            # The cursor ends up at the end of "explorer > " (the prompt)
+            # at the bottom of the screen.
+            try:
+                self.render_tui(hint="auto-redraw")
+            except Exception:
+                pass
+            # Re-print the input buffer after the prompt.
+            # The cursor is now at the position where the user was
+            # typing before the redraw.
+            sys.stdout.write(f"\r\033[2K {C.BOLD}{C.GRN}explorer{C.RST} "
+                             f"{C.GRY}>{C.RST} {input_buf}")
+            sys.stdout.flush()
+            # Restore cursor (it should be at the same position as
+            # before the redraw, which was at the end of input_buf).
+            # Actually since we just wrote input_buf fresh, the cursor
+            # is now at the right place — we don't strictly need \0338,
+            # but using it as a safety net.
+            sys.stdout.write("\0338")
+            sys.stdout.flush()
+            # Show cursor again
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        finally:
+            # Always re-show cursor even on error
+            try:
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+            except Exception:
+                pass
             self.render_lock.release()
 
     # ============== ITEM VERIFICATION ==============
