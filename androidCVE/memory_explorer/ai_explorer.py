@@ -1647,7 +1647,9 @@ class MemoryExplorerAI:
         out.append(
             f" {C.BLU}[v<N>]{C.RST} Re-verify    "
             f" {C.BLU}[walk]{C.RST} Cred chain   "
-            f" {C.BLU}[w3]{C.RST} Deep-scan"
+            f" {C.BLU}[w3]{C.RST} Deep-scan   "
+            f" {C.BLU}[rva]{C.RST} Read VA  "
+            f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -5397,81 +5399,107 @@ class MemoryExplorerAI:
             self.live["last_msg"] = f"Invalid index: {item_idx} (have {len(self.found_items)} items)"
             return
         item = self.found_items[item_idx]
-        # Fetch the data if we don't have it (auto-found items don't carry data).
-        # We use read_with_neighbors so we can show prev/next pages and catch
-        # cross-page patterns (kernel pointer at page end, comm at boundary, …).
+        sys.stdout.write(C.CLR)
+        sys.stdout.write(f"{C.BOLD}{C.CYN}=== FILE VIEW: [{item_idx:02d}] {item['va']} ==={C.RST}\n")
+        sys.stdout.write(f"{C.GRY}Type:{C.RST} {item['type']:<20} "
+                         f"{C.GRY}Confidence:{C.RST} {C.GRN}"
+                         f"{item.get('confidence', 0)}%{C.RST}\n")
+        sys.stdout.write(f"{C.GRY}Description:{C.RST} {item.get('description','')}\n")
+        sys.stdout.write(f"{C.GRY}AI Logic:{C.RST} {self.translate_logic(item)}\n")
+        sys.stdout.flush()
+        # Fetch the data if we don't have it
         data = item.get("data")
         data_prev = item.get("data_prev")
         data_next = item.get("data_next")
-        if data is None:
+        if data is None or len(data) < 0x1000:
             try:
                 va = int(item["va"], 16)
             except Exception:
                 self.live["last_msg"] = f"Invalid VA: {item['va']}"
                 return
-            triple = self.read_with_neighbors(va) or b""
-            if len(triple) == 12288:
-                data_prev, data, data_next = triple[0:0x1000], triple[0x1000:0x2000], triple[0x2000:0x3000]
+            # Try multiple read methods in order of preference
+            data = b""
+            # Method 1: engine
+            sys.stdout.write(f" {C.DIM}Reading via engine...{C.RST}\n")
+            sys.stdout.flush()
+            try:
+                if self.ensure_engine():
+                    triple = self.read_with_neighbors(va) or b""
+                    if len(triple) == 12288:
+                        data_prev, data, data_next = (
+                            triple[0:0x1000],
+                            triple[0x1000:0x2000],
+                            triple[0x2000:0x3000])
+                    elif triple:
+                        data = triple
+            except Exception as e:
+                sys.stdout.write(f"{C.YEL}engine read fail: {e}{C.RST}\n")
+            # Method 2: KGSL GPU read (if engine failed)
+            if (not data or len(data) < 0x1000) and self.kgsl_fd is not None:
+                sys.stdout.write(f" {C.DIM}Reading via GPU KGSL...{C.RST}\n")
+                sys.stdout.flush()
+                try:
+                    gpu_data = self._kgsl_read_virt(va, 0x1000)
+                    if gpu_data and len(gpu_data) >= 0x1000:
+                        data = gpu_data
+                except Exception as e:
+                    sys.stdout.write(f"{C.YEL}GPU read fail: {e}{C.RST}\n")
+            # Method 3: try kernel read via /proc/kcore or fallback
+            if (not data or len(data) < 0x1000):
+                sys.stdout.write(f" {C.YEL}All read methods failed.{C.RST}\n")
+                sys.stdout.write(f" {C.DIM}Try running with KGSL on or "
+                                 f"engine alive.{C.RST}\n")
+            else:
+                item["data"] = data
                 item["data_prev"] = data_prev
                 item["data_next"] = data_next
-            elif triple:
-                data = triple
-            else:
-                data = self.read_page(va) or b""
-            item["data"] = data
-        # Confidence is stored as 0-100 integer now
-        conf = item.get("confidence", 0)
-        conf_disp = f"{conf:.1f}%" if isinstance(conf, float) else f"{conf}%"
-
-        sys.stdout.write(C.CLR)
-        try:
-            va_int = int(item["va"], 16)
-            va_prev = f"0x{va_int - 0x1000:x}" if data_prev else "—"
-            va_next = f"0x{va_int + 0x1000:x}" if data_next else "—"
-        except Exception:
-            va_prev, va_next = "—", "—"
-        sys.stdout.write(f"{C.BOLD}{C.CYN}=== FILE VIEW: [{item_idx:02d}] {item['va']} ==={C.RST}\n")
-        sys.stdout.write(f"{C.GRY}Type:{C.RST} {item['type']:<20} "
-                         f"{C.GRY}Confidence:{C.RST} {C.GRN}{conf_disp}{C.RST}\n")
-        sys.stdout.write(f"{C.GRY}AI Logic:{C.RST} {self.translate_logic(item)}\n")
-        sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-        # Show prev page (if any) — useful for cross-page patterns
         if data_prev:
-            sys.stdout.write(f" {C.DIM}── PREV PAGE @ {va_prev} ──{C.RST}\n")
+            sys.stdout.write(f" {C.DIM}── PREV PAGE @ "
+                             f"0x{int(item['va'], 16) - 0x1000:x} ──{C.RST}\n")
             for i in range(0, min(len(data_prev), 256), 16):
                 chunk = data_prev[i:i+16]
                 hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
+                printable = "".join(
+                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(
+                    f" {i:04X} | {hex_row:<48} | {printable}\n")
         if data:
-            sys.stdout.write(f" {C.DIM}── THIS PAGE @ {item['va']} ──{C.RST}\n")
-            for i in range(0, min(len(data), 256), 16):
+            sys.stdout.write(
+                f" {C.DIM}── THIS PAGE @ {item['va']} ──{C.RST}\n")
+            for i in range(0, min(len(data), 0x1000), 16):
                 chunk = data[i:i+16]
                 hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
+                printable = "".join(
+                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(
+                    f" {i:04X} | {hex_row:<48} | {printable}\n")
         else:
             sys.stdout.write(f" {C.GRY}(no data — read failed){C.RST}\n")
         if data_next:
-            sys.stdout.write(f" {C.DIM}── NEXT PAGE @ {va_next} ──{C.RST}\n")
+            sys.stdout.write(
+                f" {C.DIM}── NEXT PAGE @ "
+                f"0x{int(item['va'], 16) + 0x1000:x} ──{C.RST}\n")
             for i in range(0, min(len(data_next), 256), 16):
                 chunk = data_next[i:i+16]
                 hex_row = " ".join(f"{b:02X}" for b in chunk)
-                printable = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
-                sys.stdout.write(f" {i:04X} | {hex_row:<48} | {printable}\n")
+                printable = "".join(
+                    chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                sys.stdout.write(
+                    f" {i:04X} | {hex_row:<48} | {printable}\n")
         sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-        sys.stdout.write(f" [{C.GRN}K{C.RST}] Patch Root  "
-                         f"[{C.GRN}S{C.RST}] Patch SELinux  "
-                         f"[{C.GRN}D{C.RST}] Delete from list  "
-                         f"[{C.GRN}V{C.RST}] Re-verify (3pg)  "
-                         f"[{C.GRN}Enter{C.RST}] Back\n")
+        sys.stdout.write(
+            f" [{C.GRN}K{C.RST}] Patch Root  "
+            f"[{C.GRN}S{C.RST}] Patch SELinux  "
+            f"[{C.GRN}D{C.RST}] Delete  "
+            f"[{C.GRN}V{C.RST}] Re-verify  "
+            f"[{C.GRN}Enter{C.RST}] Back\n")
         sys.stdout.flush()
         try:
             choice = self.input_cmd().strip().lower()
         except (EOFError, KeyboardInterrupt):
             return
         if not choice or choice in ("enter", "b", "back", "q"):
-            return  # Enter (empty) goes back to TUI
+            return
         if choice == "k":
             # Patch init_cred uid/gid to 0 (root) at this VA
             try:
@@ -6191,7 +6219,71 @@ class MemoryExplorerAI:
                     self.verify_item(idx)
                 else:
                     self.live["last_msg"] = f"Invalid idx: {idx}"
+            elif cmd.startswith("rva") or cmd.startswith("read "):
+                # rva <hex> — read any virtual address and show
+                # hex dump. Useful when you know the VA from
+                # kallsyms or other source. Uses engine first,
+                # then KGSL GPU read.
+                parts = cmd.split()
+                if len(parts) < 2:
+                    self.live["last_msg"] = "Usage: rva <hex_addr> [size]"
+                    print("Usage: rva <hex_addr> [size]", flush=True)
+                    continue
+                try:
+                    va = int(parts[1], 16)
+                except ValueError:
+                    self.live["last_msg"] = (
+                        f"Invalid hex: {parts[1]}")
+                    print(f"Invalid hex: {parts[1]}", flush=True)
+                    continue
+                size = 0x1000
+                if len(parts) >= 3:
+                    try:
+                        size = min(0x10000, max(0x100, int(parts[2], 0)))
+                    except Exception:
+                        pass
+                data = b""
+                # Method 1: engine
+                if self.ensure_engine():
+                    if not self._engine_write(
+                            f"read {hex(va)}\n".encode()):
+                        pass
+                    else:
+                        data = self._read_data_packet() or b""
+                # Method 2: KGSL GPU read
+                if (not data or len(data) < size) and self.kgsl_fd is not None:
+                    try:
+                        gpu_data = self._kgsl_read_virt(va, size)
+                        if gpu_data and len(gpu_data) >= size:
+                            data = gpu_data
+                    except Exception as e:
+                        print(f"GPU read error: {e}", flush=True)
+                if not data:
+                    self.live["last_msg"] = (
+                        f"rva 0x{va:x}: read failed")
+                    print(f"Read failed for 0x{va:x}", flush=True)
+                    continue
+                # Hex dump
+                print(f"\n{C.CYN}=== RVA: 0x{va:x} ==={C.RST}",
+                      flush=True)
+                for i in range(0, min(len(data), size), 16):
+                    chunk = data[i:i+16]
+                    hex_row = " ".join(f"{b:02X}" for b in chunk)
+                    printable = "".join(
+                        chr(b) if 32 <= b <= 126 else "." for b in chunk)
+                    print(f" {i:04X} | {hex_row:<48} | {printable}",
+                          flush=True)
+                print(flush=True)
+                self.live["last_msg"] = (
+                    f"rva 0x{va:x}: read {len(data)} bytes")
+            elif (cmd.startswith("[")
+                  and cmd.endswith("]")
+                  and cmd[1:-1].isdigit()):
+                # [N] — short form for show_detail(N)
+                idx = int(cmd[1:-1])
+                self.show_detail(idx)
             elif cmd.isdigit():
+                # Just a number → show_detail(int)
                 self.show_detail(int(cmd))
             elif cmd:
                 self.live["last_msg"] = f"Unknown: {cmd}"
