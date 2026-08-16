@@ -15,14 +15,13 @@ import select
 import termios
 import tty
 
-# v4.1.8-tui-trace: visible build tag shown in TUI so the
-# user can verify they have the latest code. The suffix
-# "-tui-trace" indicates the new _kgsl_open with in-memory
-# trace buffer (self._kgsl_trace) displayed directly in
-# the TUI KGSL status line. This replaces file-based
-# logging because Android scoped storage often blocks
-# Termux from writing to /sdcard.
-_BUILD_TAG = "v4.1.8-tui-trace"
+# v4.1.9-fd-preserve: visible build tag. The "-fd-preserve"
+# suffix marks the CRITICAL FIX where self.kgsl_fd was being
+# reset to None AFTER _kgsl_open() successfully set it to a
+# valid integer (e.g. fd=4). This caused ioctl=0, kgsl=off
+# in the TUI even though the device was openable. Now the fd
+# is preserved through the rest of __init__.
+_BUILD_TAG = "v4.1.9-fd-preserve"
 import datetime
 import fcntl
 import ctypes
@@ -318,8 +317,17 @@ class MemoryExplorerAI:
         # without root. KGSL_IOC_GPUOBJ_ALLOC creates a GPU object
         # that lives in kernel memory. The UAF reclaim on KGSL
         # often lands in this allocator.
-        self.kgsl_fd = None
-        self.kgsl_objects = []  # list of (fd, gpuaddr, size)
+        #
+        # CRITICAL FIX v4.1.8: do NOT re-init self.kgsl_fd here!
+        # The fd was already set to a valid integer by _kgsl_open
+        # (we just saw RDWR OK fd=4 in the trace). Re-initializing
+        # to None overwrites the success and breaks EVERYTHING
+        # downstream. The kgsl_objects list is also re-init here,
+        # which is fine because it's a fresh container. But the
+        # fd MUST be preserved.
+        # v4.1.8: only init objects, NEVER touch kgsl_fd here.
+        if not hasattr(self, "kgsl_objects") or self.kgsl_objects is None:
+            self.kgsl_objects = []  # list of (gpuaddr, size)
         # KGSL ioctl numbers (from v6.c msm_kgsl.h — verified
         # against the actual kernel headers for Android 5.4 GKI).
         # _IOWR(TYPE,NUM,SIZE) = (0x80000000 | ((SIZE&0x3fff)<<16) |
