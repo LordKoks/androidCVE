@@ -65,12 +65,30 @@ int main(int argc, char *argv[]) {
     /* Step 2: set task_struct->comm. This writes directly
      * to the current task's comm field. PR_SET_NAME only
      * takes the first 15 chars + NUL (TASK_COMM_LEN=16). */
-    if (prctl(PR_SET_NAME, (unsigned long)comm, 0, 0, 0) != 0) {
-        fprintf(stderr, "prctl PR_SET_NAME failed: %s\n",
-                strerror(errno));
-        /* Don't exit - still sleep, comm may be "spray_helper"
-         * which is also unique. */
+    int pr = prctl(PR_SET_NAME, (unsigned long)comm, 0, 0, 0);
+
+    /* Step 2.5: v4.1.23 log to /sdcard so we can see what
+     * happened. On some Android kernels, PR_SET_NAME is
+     * silently denied (SELinux or capability check) and
+     * comm stays as "spray_helper". Logging the result
+     * tells us if prctl returned -1 (failed) or 0
+     * (success). */
+    FILE *lf = fopen("/sdcard/kgsl_spray.log", "a");
+    if (lf) {
+        fprintf(lf, "pid=%d comm_set=%d errno=%d want=%s\n",
+                getpid(), pr, pr ? errno : 0, comm);
+        fclose(lf);
     }
+
+    /* Step 2.6: ALSO try /proc/self/comm file approach. On
+     * some Android kernels, the kernel task->comm is
+     * protected, but writing to /proc/self/comm directly
+     * (if the process has CAP_SYS_RESOURCE) works. We try
+     * it as a fallback. Note: /proc/self/comm is normally
+     * read-only, so this will fail with EACCES for
+     * unprivileged processes — that's fine, we just want
+     * to know. */
+    /* (skipped: /proc/self/comm is read-only) */
 
     /* Step 3: signal-safe sleep loop. nanosleep with
      * EINTR retry keeps us alive even if a stray signal

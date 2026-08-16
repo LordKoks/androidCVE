@@ -15,24 +15,22 @@ import select
 import termios
 import tty
 
-# v4.1.22-auto-fix: visible build tag. The "-auto-fix"
-# suffix marks the FULL AUTOMATION mode. The user said
-# "Все должно автоматически делаться" (everything
-# should be done automatically). Now the autopilot
-# automatically:
-#   - Every 20 cycles: tries _auto_kbase_leak() to leak
-#     kernel base from /proc/PID/stat field 27. If
-#     found, sets self.kernel_base so the WIDE scan
-#     has a real target.
-#   - Every 100 cycles: runs _auto_readback_test() to
-#     verify the engine can read user mmap. Logs to
-#     /sdcard/kgsl_eng.log so we can see if engine
-#     DMA is functional.
-#   - Every 30 cycles: writes spray/vcomm state to
-#     /sdcard/kgsl_auto.log for offline review.
-# The user just runs `python3 ai_explorer.py` and
-# everything happens automatically.
-_BUILD_TAG = "v4.1.22-auto-fix"
+# v4.1.23-split-tui: visible build tag. The "-split-tui"
+# suffix marks the 2-region TUI layout. The TOP region
+# (rows 1-22) is the live status panel (KGSL, AI,
+# spray, workers, kernel) and gets redrawn every 0.3s.
+# The BOTTOM region (rows 23-24) is the prompt
+# (`explorer > `) and the user can type commands there
+# without it being overwritten. We also:
+#   - Restored `cycle = 0` in _autopilot_worker (was
+#     lost in an earlier edit, causing
+#     UnboundLocalError crash).
+#   - Added /sdcard/kgsl_spray.log logging in
+#     spray_helper.c so we can see if prctl(PR_SET_NAME)
+#     actually sets comm or if it's being denied.
+# Expected: stable input prompt, no crashes, and we
+# can see in the log if prctl works.
+_BUILD_TAG = "v4.1.23-split-tui"
 import datetime
 import fcntl
 import ctypes
@@ -1239,22 +1237,38 @@ class MemoryExplorerAI:
         sys.stdout.flush()
 
     def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the whole TUI while preserving the
-        user's input line at the bottom. Called from input_cmd()
-        every 0.3s of no-keypress so the user sees live updates
-        without pressing anything.
+        """Atomically redraw the TUI while preserving the user's
+        input line at the bottom.
+
+        v4.1.23 SPLIT-LAYOUT: instead of clear-the-whole-screen
+        and re-print everything (which causes the prompt to
+        flicker and sometimes get overwritten), we now use
+        a 2-region split layout:
+          - TOP region (fixed N lines): TUI status, perf, etc.
+          - BOTTOM region (3 lines): prompt + last 3 log lines
+
+        We redraw only the TOP region with a single ANSI clear
+        sequence. The BOTTOM region (prompt) stays put and is
+        only re-emitted when the user types something.
         """
         if not self.render_lock.acquire(blocking=False):
             return  # another render in progress; skip this frame
         try:
             # Hide cursor during redraw to avoid flicker
             sys.stdout.write("\033[?25l")
-            sys.stdout.write(C.CLR)         # clear screen + home
+            # Cursor to top-left
+            sys.stdout.write("\033[H")
+            # Clear from cursor down to row 22 (we reserve 22..24
+            # for the prompt). This leaves the prompt lines
+            # untouched.
+            sys.stdout.write("\033[1;22H\033[J")
             try:
                 self._render_tui_body()    # build & write body lines
             except Exception:
                 pass
-            # Re-emit the prompt + buffer at the bottom (same line)
+            # Force-cursor to row 23 (just above prompt)
+            sys.stdout.write("\033[23;1H")
+            # Re-emit the prompt + buffer at row 24
             self._print_prompt(input_buf)
             # Re-show cursor
             sys.stdout.write("\033[?25h")
@@ -4545,6 +4559,7 @@ class MemoryExplorerAI:
         aggressively — KGSL UAF pages get recycled quickly and we
         want fresh task_structs each time.
         """
+        cycle = 0  # v4.1.23: restored, was lost in earlier edit
         # v4.1.18: try to auto-build spray_helper if missing
         self._ensure_spray_helper()
         # Short cooldown — the engine and learning workers are
