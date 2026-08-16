@@ -15,20 +15,18 @@ import select
 import termios
 import tty
 
-# v4.1.25-bottom-lock: visible build tag. The
-# "-bottom-lock" suffix marks the fix for the user's
-# complaint that buttons and prompt were
-# "disappearing for 0.001s" during TUI redraws.
-# Solution: removed buttons from the TUI body
-# (_render_tui_body). Buttons are now rendered ONCE
-# on startup in the bottom region (rows 22+). Each
-# subsequent TUI redraw only clears and rewrites
-# rows 1-21 (the TUI body). The buttons and prompt
-# stay put, the user can type without anything
-# flickering. TUI body is also truncated to 20
-# lines so it can never bleed into the bottom
-# region.
-_BUILD_TAG = "v4.1.25-bottom-lock"
+# v4.1.26-clean-revert: visible build tag. The
+# "-clean-revert" suffix marks the FULL revert to
+# v4.1.22 working state. v4.1.23-25 introduced
+# bottom-lock / split-layout / truncation changes
+# that broke the TUI multiple times. The user
+# reported "сломал ты плохо" and "сломал всё".
+# TUI is back to simple clear-and-redraw (which
+# was working in v4.1.22). The user accepted
+# prompt flicker before. The C helper logging and
+# cycle=0 fix from v4.1.23+ are kept (they were
+# the only useful changes).
+_BUILD_TAG = "v4.1.26-clean-revert"
 import datetime
 import fcntl
 import ctypes
@@ -1131,15 +1129,6 @@ class MemoryExplorerAI:
             # Initial TUI render so the user sees the dashboard on
             # the very first input prompt. Without this they'd only
             # see "explorer >" with a blank screen above.
-            # v4.1.25: also print the static buttons in the
-            # bottom region ONCE. Subsequent TUI redraws
-            # never touch the bottom region.
-            if not self._static_bottom_printed:
-                try:
-                    self._render_static_bottom()
-                except Exception:
-                    pass
-                self._static_bottom_printed = True
             try:
                 self._tui_full_redraw_with_input("")
             except Exception:
@@ -1305,49 +1294,32 @@ class MemoryExplorerAI:
         sys.stdout.flush()
 
     def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the TUI body without touching
-        the bottom region (buttons + prompt).
+        """Atomically redraw the whole TUI while preserving the
+        user's input line at the bottom. Called from input_cmd()
+        every 0.3s of no-keypress so the user sees live updates
+        without pressing anything.
 
-        v4.1.25 BOTTOM-LOCK: the user complained that
-        buttons and prompt "disappear for 0.001s and
-        come back" during TUI redraws. The reason was
-        that the TUI body contained the buttons, so
-        every clear-and-redraw destroyed and re-emitted
-        them. We now:
-          1. Print buttons ONCE on startup, into the
-             bottom region (rows 22+).
-          2. Each TUI redraw: clear only rows 1-22
-             (the TUI body region), then print the
-             live body, then leave the bottom alone.
-          3. The user's typing buffer is re-emitted on
-             the last line of the TUI body
-             (overwriting the LIVE LOG STREAM area).
-
-        The user can now see the buttons and prompt
-        permanently and type commands without them
-        flickering.
+        v4.1.26: REVERTED TO WORKING v4.1.22 APPROACH.
+        v4.1.23-25 broke the TUI with various bottom-lock
+        attempts. The user reported "сломал всё" multiple
+        times. Going back to simple clear-and-redraw
+        (which was working fine in v4.1.22). The user
+        complained about prompt flicker but accepted it
+        before. The TUI layout was clean and stable.
+        Only the C helper logging and cycle=0 fix
+        remain from v4.1.23+.
         """
         if not self.render_lock.acquire(blocking=False):
             return  # another render in progress; skip this frame
         try:
             # Hide cursor during redraw to avoid flicker
             sys.stdout.write("\033[?25l")
-            # Cursor to top-left
-            sys.stdout.write("\033[H")
-            # Clear from cursor down to row 21 (we reserve
-            # rows 22+ for the static bottom region).
-            sys.stdout.write("\033[1;21H\033[J")
+            sys.stdout.write(C.CLR)         # clear screen + home
             try:
                 self._render_tui_body()    # build & write body lines
             except Exception:
                 pass
-            # Re-emit the prompt + buffer at the BOTTOM of
-            # the body region (row 21 or so, just above
-            # the static buttons which start at row 22).
-            # The user types here, and the TUI body
-            # redraws above this line. The buttons
-            # below stay put.
-            sys.stdout.write("\033[21;1H\033[2K")
+            # Re-emit the prompt + buffer at the bottom (same line)
             self._print_prompt(input_buf)
             # Re-show cursor
             sys.stdout.write("\033[?25h")
@@ -1899,48 +1871,42 @@ class MemoryExplorerAI:
             if total > 20:
                 out.append(f" {C.DIM}… and {total - 20} more (type 'list' to see all){C.RST}")
 
-        # v4.1.25: removed buttons from TUI body. They are
-        # now rendered ONCE on startup in the bottom region
-        # and never touched by TUI redraws. The TUI body
-        # only contains the live status data; the buttons
-        # and prompt are static and stay in the bottom
-        # region forever.
-        # out.append(f"{C.GRY}{'─'*92}{C.RST}")
-        # out.append(
-        #     f" {C.GRN}[A]{C.RST} AUTOPILOT       "
-        #     f" {C.GRN}[P]{C.RST} Pause           "
-        #     f" {C.GRN}[G]{C.RST} Resume          "
-        #     f" {C.GRN}[X]{C.RST} Stop"
-        # )
-        # out.append(
-        #     f" {C.BLU}[R]{C.RST} Verify Root       "
-        #     f" {C.BLU}[B]{C.RST} Rebuild Engine    "
-        #     f" {C.BLU}[Q]{C.RST} Exit Explorer     "
-        #     f" {C.BLU}[ID]{C.RST} Open File"
-        # )
-        # out.append(
-        #     f" {C.BLU}[list]{C.RST} Show All Items "
-        #     f" {C.BLU}[kb]{C.RST} Kernel Intel   "
-        #     f" {C.BLU}[log]{C.RST} Spray Log"
-        # )
-        # out.append(
-        #     f" {C.BLU}[stats]{C.RST} AI Stats    "
-        #     f" {C.BLU}[save]{C.RST} Export JSON  "
-        #     f" {C.BLU}[dev]{C.RST} Device Info"
-        # )
-        # out.append(
-        #     f" {C.BLU}[v<N>]{C.RST} Re-verify    "
-        #     f" {C.BLU}[walk]{C.RST} Cred chain   "
-        #     f" {C.BLU}[w3]{C.RST} Deep-scan   "
-        #     f" {C.BLU}[rva]{C.RST} Read VA  "
-        #     f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
-        #     f" {C.BLU}[health]{C.RST} Health   "
-        #     f" {C.BLU}[englog]{C.RST} Engine Stderr   "
-        #     f" {C.BLU}[tstack]{C.RST} Task Stacks   "
-        #     f" {C.BLU}[vcomm]{C.RST} Verify Comm   "
-        #     f" {C.BLU}[kb]{C.RST} Kernel Bases"
-        # )
-        # out.append(f"{C.GRY}{'─'*92}{C.RST}")
+        out.append(f"{C.GRY}{'─'*92}{C.RST}")
+        out.append(
+            f" {C.GRN}[A]{C.RST} AUTOPILOT       "
+            f" {C.GRN}[P]{C.RST} Pause           "
+            f" {C.GRN}[G]{C.RST} Resume          "
+            f" {C.GRN}[X]{C.RST} Stop"
+        )
+        out.append(
+            f" {C.BLU}[R]{C.RST} Verify Root       "
+            f" {C.BLU}[B]{C.RST} Rebuild Engine    "
+            f" {C.BLU}[Q]{C.RST} Exit Explorer     "
+            f" {C.BLU}[ID]{C.RST} Open File"
+        )
+        out.append(
+            f" {C.BLU}[list]{C.RST} Show All Items "
+            f" {C.BLU}[kb]{C.RST} Kernel Intel   "
+            f" {C.BLU}[log]{C.RST} Spray Log"
+        )
+        out.append(
+            f" {C.BLU}[stats]{C.RST} AI Stats    "
+            f" {C.BLU}[save]{C.RST} Export JSON  "
+            f" {C.BLU}[dev]{C.RST} Device Info"
+        )
+        out.append(
+            f" {C.BLU}[v<N>]{C.RST} Re-verify    "
+            f" {C.BLU}[walk]{C.RST} Cred chain   "
+            f" {C.BLU}[w3]{C.RST} Deep-scan   "
+            f" {C.BLU}[rva]{C.RST} Read VA  "
+            f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
+            f" {C.BLU}[health]{C.RST} Health   "
+            f" {C.BLU}[englog]{C.RST} Engine Stderr   "
+            f" {C.BLU}[tstack]{C.RST} Task Stacks   "
+            f" {C.BLU}[vcomm]{C.RST} Verify Comm   "
+            f" {C.BLU}[kb]{C.RST} Kernel Bases"
+        )
+        out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
         if self.spray_log:
             out.append(f" {C.BOLD}{C.MAG}LIVE LOG STREAM{C.RST} {C.GRY}(last 3){C.RST}")
@@ -1964,14 +1930,6 @@ class MemoryExplorerAI:
             out.append(f" {C.MAG}HINT{C.RST}: {C.WHT}{hint}{C.RST}")
         out.append(f" {C.GRY}LAST CMD{C.RST}: {C.CYN}{L['last_command']}{C.RST}    "
                    f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump){C.RST}")
-
-        # v4.1.25: limit TUI body to 20 lines. The bottom
-        # region (rows 22+) is reserved for the static
-        # buttons + prompt. If we wrote more than 20 lines
-        # here, we'd overwrite the buttons. Truncate to 20
-        # to keep the layout stable.
-        if len(out) > 20:
-            out = out[:20]
 
         # Write with EXPLICIT \r\n between lines (Termux-safe,
         # works whether OPOST is on or off). NO trailing \r\n —
