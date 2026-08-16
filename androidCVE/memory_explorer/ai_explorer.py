@@ -14,6 +14,13 @@ import json
 import select
 import termios
 import tty
+
+# v4.1.7-debug-log: visible build tag shown in TUI so the
+# user can verify they have the latest code. The suffix
+# "-debug-log" indicates the new _kgsl_open with full
+# /data/data/.../kgsl_debug.log tracing and CTX/kptr
+# diagnostic line in the TUI header.
+_BUILD_TAG = "v4.1.7-debug-log"
 import datetime
 import fcntl
 import ctypes
@@ -1279,6 +1286,11 @@ class MemoryExplorerAI:
                    f" {C.GRY}│{C.RST} {C.BOLD}AI LEARNING{C.RST}: {C.MAG}{L['ai_patterns']:>4}{C.RST} patterns"
                    f" {C.GRY}│{C.RST} {C.BOLD}ENGINE{C.RST}: {C.CYN}{L['engine_pid']:>6}{C.RST}"
                    f" {C.GRY}│{C.RST} {C.BOLD}SPRAY/s{C.RST}: {C.YEL}{L['sprays_per_sec']:5.1f}{C.RST}")
+        # v4.1: visible build tag so user can verify they
+        # have the latest code (e.g. "v4.1.7-debug-log").
+        # If you see v4.1 with NO suffix, you are running
+        # the old copy and need to sync.
+        out.append(f" {C.DIM}BUILD: {_BUILD_TAG}{C.RST}")
 
         out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
 
