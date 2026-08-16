@@ -15,26 +15,23 @@ import select
 import termios
 import tty
 
-# v4.1.28-zone-fix: visible build tag. The "-zone-fix"
-# suffix marks the FINAL 2-zone TUI layout:
-#   - TOP ZONE (rows 1-15): TUI body (status, perf,
-#     workers, spray, scan, AI). Hard-truncated to
-#     15 lines. TUI redraws only touch rows 1-15.
-#   - BOTTOM ZONE (rows 16-26): SEPARATE command
-#     terminal. Static separator at row 16, command
-#     output panel rows 17-24, separator row 25,
-#     prompt at row 26. NEVER touched by TUI
-#     redraws. When the user types a command (e.g.
-#     vcomm, kb, list, dev), the output is appended
-#     to self._cmd_out_buf and re-rendered ONLY in
-#     rows 17-24. The user sees the live status on
-#     top, command output on the bottom, and types
-#     at the prompt on the very last line.
-# The user said: "вынеси терминал в другую зону
-# так что бы он не обновлялся онлайн". This is
-# exactly that: the terminal is in a SEPARATE
-# zone that does NOT update with the live TUI.
-_BUILD_TAG = "v4.1.28-zone-fix"
+# v4.1.29-back-simple: visible build tag. The
+# "-back-simple" suffix marks the FULL revert to
+# v4.1.22 working TUI behavior. The user reported
+# that command output (log, vcomm, kb, etc.)
+# "disappears in 1ms" because the TUI redraws
+# 0.3s later overwrite it. v4.1.23-28 introduced
+# various 2-zone / bottom-lock layouts but all of
+# them had this same problem.
+# Solution in v4.1.29:
+#   - Simple clear-and-redraw TUI (v4.1.22)
+#   - Command output: clear screen, print output,
+#     sleep 0.5s, then wait for user input
+#   - This way the user has 0.5s to see the output
+#     before TUI redraws on next input
+# The user said "верни назад" (revert it back).
+# This is that.
+_BUILD_TAG = "v4.1.29-back-simple"
 import datetime
 import fcntl
 import ctypes
@@ -1156,22 +1153,7 @@ class MemoryExplorerAI:
     def input_cmd(self):
         self.is_reading_input = True
         try:
-            # v4.1.28: print the static bottom command
-            # terminal ONCE on startup. The TUI body
-            # (rows 1..15) is redrawn every 0.3s but the
-            # bottom terminal (rows 16..26) is NEVER
-            # touched by TUI redraws. The user types
-            # commands at the prompt (row 26) and the
-            # output appears in the bottom panel.
-            if not getattr(self, "_static_bottom_printed", False):
-                sys.stdout.write(C.CLR)
-                try:
-                    self._render_static_bottom()
-                except Exception:
-                    pass
-                self._static_bottom_printed = True
-            # Initial TUI render so the user sees the dashboard on
-            # the very first input prompt.
+            # Initial TUI render
             try:
                 self._tui_full_redraw_with_input("")
             except Exception:
@@ -1415,33 +1397,30 @@ class MemoryExplorerAI:
         return re.sub(r'\033\[[0-9;]*[A-Za-z]', '', s)
 
     def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the TUI body without touching
-        the bottom command-output panel.
+        """Atomically redraw the TUI while preserving the
+        user's input line at the bottom.
 
-        v4.1.28 FINAL LAYOUT: TUI body is HARD-FIXED at
-        15 lines (rows 1..15). The bottom region (rows
-        16+) is the SEPARATE command-output terminal +
-        prompt. TUI redraws only clear/write rows 1..15.
-        The bottom region is NEVER touched by TUI
-        redraws. The user can type commands into the
-        prompt at the bottom, and the output appears in
-        the bottom panel.
+        v4.1.29 BACK-TO-SIMPLE: revert to v4.1.22
+        working approach. The 2-zone layout and various
+        bottom-lock attempts in v4.1.23-28 made the
+        command output disappear in 1ms because:
+          - User types `log` -> output prints to TUI
+          - TUI redraws 0.3s later -> overwrites it
+        The user said "верни назад" (revert it back).
+        Going back to the working v4.1.22 approach:
+        simple clear + render TUI body + emit prompt.
         """
         if not self.render_lock.acquire(blocking=False):
             return
         try:
-            TUI_LINES = 15  # MUST match _render_tui_body truncate
-            # Hide cursor during redraw
+            # Hide cursor during redraw to avoid flicker
             sys.stdout.write("\033[?25l")
-            # Cursor to top-left
-            sys.stdout.write("\033[H")
-            # Clear only the body region (rows 1..15)
-            sys.stdout.write(f"\033[1;{TUI_LINES}H\033[J")
+            sys.stdout.write(C.CLR)
             try:
                 self._render_tui_body()
             except Exception:
                 pass
-            # Re-show cursor
+            self._print_prompt(input_buf)
             sys.stdout.write("\033[?25h")
             sys.stdout.flush()
         except Exception:
@@ -2054,13 +2033,7 @@ class MemoryExplorerAI:
         # Write with EXPLICIT \r\n between lines (Termux-safe,
         # works whether OPOST is on or off). NO trailing \r\n —
         # the prompt is on the same line as the cursor.
-        # v4.1.28 HARD TRUNCATE: TUI body is rendered into
-        # rows 1..TUI_BODY_LINES (default 15). The bottom
-        # region (rows 16+) is reserved for the SEPARATE
-        # command-output terminal. If we emit more than 15
-        # lines, they overflow into the bottom region and
-        # corrupt the terminal. So we hard-truncate to 15.
-        out = out[:15]
+        # v4.1.29: NO truncate, full TUI body.
         sys.stdout.write("\r\n".join(out))
         sys.stdout.flush()
 
@@ -7990,20 +7963,29 @@ class MemoryExplorerAI:
                 # of "KETO0422XXXXX"), the helper crashed
                 # before prctl ran and the scanner can
                 # never find KETO0422 in task_struct.
+                # v4.1.29: print directly, wait so user can read
                 try:
                     out = self.cmd_vcomm()
-                    self._cmd_output(out)
+                    sys.stdout.write(C.CLR)
+                    sys.stdout.write(out + "\n")
+                    sys.stdout.flush()
+                    time.sleep(0.5)
                 except Exception as _e:
-                    self._cmd_output(f" vcomm error: {_e}")
+                    sys.stdout.write(f" vcomm error: {_e}\n")
+                    sys.stdout.flush()
                 continue
             elif cmd in ("kb", "kbase", "kernel_base", "kernelbases"):
                 # v4.1.19: print common QCOM kernel bases
                 # when kptr_restrict=2 hides the real one.
                 try:
                     out = self.cmd_kb_known_ranges()
-                    self._cmd_output(out)
+                    sys.stdout.write(C.CLR)
+                    sys.stdout.write(out + "\n")
+                    sys.stdout.flush()
+                    time.sleep(0.5)
                 except Exception as _e:
-                    self._cmd_output(f" kb error: {_e}")
+                    sys.stdout.write(f" kb error: {_e}\n")
+                    sys.stdout.flush()
                 continue
             elif cmd in ("tstack", "taskstack", "task_stack"):
                 # v4.1.15: read /proc/PID/stack for each live
@@ -8016,28 +7998,32 @@ class MemoryExplorerAI:
                 # owns the process.
                 try:
                     out = self.cmd_tstack()
-                    self._cmd_output(out)
+                    sys.stdout.write(C.CLR)
+                    sys.stdout.write(out + "\n")
+                    sys.stdout.flush()
+                    time.sleep(0.5)
                 except Exception as _e:
-                    self._cmd_output(f" tstack error: {_e}")
+                    sys.stdout.write(f" tstack error: {_e}\n")
+                    sys.stdout.flush()
                 continue
             elif cmd in ("englog", "elog", "engine_log"):
-                # v4.1.13: dump captured engine stderr. The
-                # engine emits [UAF], [SCAN], IOCTL_xxx messages
-                # on stderr which tell us WHY things are or
-                # aren't working. This command prints the last
-                # 40 lines so the user can see engine activity.
+                # v4.1.13: dump captured engine stderr.
                 try:
                     out = self.cmd_englog(40)
+                    sys.stdout.write(C.CLR)
                     out_text = (
                         f"{C.BOLD}{C.CYN}=== ENGINE STDERR "
                         f"(last 40 lines) ==={C.RST}\n"
                         f"{C.GRY}{'-'*65}{C.RST}\n"
                         f"{out}\n"
                         f"{C.GRY}{'-'*65}{C.RST}\n"
-                        f" Also written to: /sdcard/kgsl_eng.log")
-                    self._cmd_output(out_text)
+                        f" Also written to: /sdcard/kgsl_eng.log\n")
+                    sys.stdout.write(out_text)
+                    sys.stdout.flush()
+                    time.sleep(0.5)
                 except Exception as _e:
-                    self._cmd_output(f" englog error: {_e}")
+                    sys.stdout.write(f" englog error: {_e}\n")
+                    sys.stdout.flush()
                 continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
