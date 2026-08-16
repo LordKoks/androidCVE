@@ -15,29 +15,26 @@ import select
 import termios
 import tty
 
-# v4.1.27-bottom-panel: visible build tag. The
-# "-bottom-panel" suffix marks the NEW TUI layout
-# with a separate bottom panel for command output.
-# Layout:
-#   - Top region (rows 1..tty_h-10): TUI body
-#     (status, perf, etc.) — gets redrawn every
-#     0.3s.
-#   - Bottom region (rows tty_h-9..tty_h): command
-#     output panel. NEVER cleared by TUI redraws.
-#     When the user types a command (e.g. vcomm,
-#     kb, list, dev, englog), the output is
-#     appended to self._cmd_out_buf (deque,
-#     maxlen=200) and the bottom panel is
-#     re-rendered in place. The user can scroll
-#     through recent command output without it
-#     being wiped by TUI updates.
-#   - Prompt at row tty_h (very last line).
-# The user said: "удали этот терминал и создай
-# новый отдельно, что бы он не обновлялся".
-# This is exactly that: a separate bottom
-# terminal for command output, stable, not
-# affected by TUI redraws.
-_BUILD_TAG = "v4.1.27-bottom-panel"
+# v4.1.28-zone-fix: visible build tag. The "-zone-fix"
+# suffix marks the FINAL 2-zone TUI layout:
+#   - TOP ZONE (rows 1-15): TUI body (status, perf,
+#     workers, spray, scan, AI). Hard-truncated to
+#     15 lines. TUI redraws only touch rows 1-15.
+#   - BOTTOM ZONE (rows 16-26): SEPARATE command
+#     terminal. Static separator at row 16, command
+#     output panel rows 17-24, separator row 25,
+#     prompt at row 26. NEVER touched by TUI
+#     redraws. When the user types a command (e.g.
+#     vcomm, kb, list, dev), the output is appended
+#     to self._cmd_out_buf and re-rendered ONLY in
+#     rows 17-24. The user sees the live status on
+#     top, command output on the bottom, and types
+#     at the prompt on the very last line.
+# The user said: "вынеси терминал в другую зону
+# так что бы он не обновлялся онлайн". This is
+# exactly that: the terminal is in a SEPARATE
+# zone that does NOT update with the live TUI.
+_BUILD_TAG = "v4.1.28-zone-fix"
 import datetime
 import fcntl
 import ctypes
@@ -1159,9 +1156,22 @@ class MemoryExplorerAI:
     def input_cmd(self):
         self.is_reading_input = True
         try:
+            # v4.1.28: print the static bottom command
+            # terminal ONCE on startup. The TUI body
+            # (rows 1..15) is redrawn every 0.3s but the
+            # bottom terminal (rows 16..26) is NEVER
+            # touched by TUI redraws. The user types
+            # commands at the prompt (row 26) and the
+            # output appears in the bottom panel.
+            if not getattr(self, "_static_bottom_printed", False):
+                sys.stdout.write(C.CLR)
+                try:
+                    self._render_static_bottom()
+                except Exception:
+                    pass
+                self._static_bottom_printed = True
             # Initial TUI render so the user sees the dashboard on
-            # the very first input prompt. Without this they'd only
-            # see "explorer >" with a blank screen above.
+            # the very first input prompt.
             try:
                 self._tui_full_redraw_with_input("")
             except Exception:
@@ -1341,49 +1351,62 @@ class MemoryExplorerAI:
         # Render the bottom panel in place (don't clear top)
         self._render_cmd_output_panel()
 
-    def _render_cmd_output_panel(self):
-        """v4.1.27: print the last N command output lines
-        at the bottom of the terminal. This is a SEPARATE
-        panel that the TUI redraws never touch.
+    def _render_static_bottom(self):
+        """v4.1.28: print the bottom command-output terminal
+        ONCE on startup. This is a SEPARATE zone that the
+        TUI redraws NEVER touch. The user types commands at
+        the bottom and the output appears here.
 
-        The TUI redraw only touches rows 1..N, where N is
-        (terminal_height - 10). The bottom 10 lines are
-        reserved for the command output panel + prompt.
+        Layout (fixed):
+          - Rows 1..15:    TUI body (status, perf, etc.) -
+                           gets redrawn every 0.3s
+          - Row 16:        separator
+          - Rows 17..24:   command output (8 lines, last 8
+                           cmd outputs from _cmd_out_buf)
+          - Row 25:        separator
+          - Row 26:        prompt `explorer > `
 
-        Layout:
-          - Rows 1..N:  TUI body (status, perf, etc.)
-          - Separator
-          - Rows N+1..N+9: command output (last 8 lines)
-          - Row N+10: prompt `explorer > `
+        The TUI redraw only touches rows 1..15. Rows 16+
+        are NEVER touched by TUI redraws.
         """
         if not hasattr(self, "_cmd_out_buf"):
             self._cmd_out_buf = collections.deque(maxlen=200)
-        try:
-            tty_h = self._term_height
-        except AttributeError:
-            tty_h = 32
-        # Reserve 10 lines at the bottom: 1 separator + 8
-        # output lines + 1 prompt line.
-        body_lines = tty_h - 10
-        if body_lines < 5:
-            body_lines = 5
-        # Position cursor at the start of the bottom panel
-        out_start_row = body_lines + 1
-        sys.stdout.write(f"\033[{out_start_row};1H\033[J")
+        TUI_LINES = 15
+        # Position cursor at row 16 (right after TUI body)
+        sys.stdout.write(f"\033[{TUI_LINES+1};1H\033[J")
+        # Print separator
         sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-        # Print last 8 output lines
+        # Print 8 command output lines (initially blank)
+        for _ in range(8):
+            sys.stdout.write("\033[2K\n")
+        # Print separator
+        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+        sys.stdout.flush()
+
+    def _render_cmd_output_panel(self):
+        """v4.1.28: print the last 8 command output lines
+        in the bottom panel (rows 17..24). This re-render
+        only touches rows 16-25, never the TUI body
+        (rows 1-15).
+        """
+        if not hasattr(self, "_cmd_out_buf"):
+            self._cmd_out_buf = collections.deque(maxlen=200)
+        TUI_LINES = 15
+        out_start_row = TUI_LINES + 2  # row 17
+        # Save cursor, position to start, clear, write, restore
+        sys.stdout.write(f"\033[{out_start_row};1H\033[J")
         out_lines = list(self._cmd_out_buf)[-8:]
         for line in out_lines:
-            # Strip ANSI for length check, but keep ANSI in output
             stripped = self._strip_ansi(line)
             if len(stripped) > 90:
-                line = line[:200] + C.RST
+                # Truncate
+                line = line[:150] + C.RST
             sys.stdout.write(f" {line}\n")
-        # Pad to 8 lines if fewer (to keep prompt position stable)
+        # Pad to 8 lines
         for _ in range(8 - len(out_lines)):
             sys.stdout.write("\033[2K\n")
-        # Prompt at last row
-        sys.stdout.write(f"\033[{tty_h};1H\033[2K")
+        # Re-emit prompt at row 26
+        sys.stdout.write("\033[26;1H\033[2K")
         self._print_prompt(getattr(self, "_input_buf", ""))
         sys.stdout.flush()
 
@@ -1393,36 +1416,27 @@ class MemoryExplorerAI:
 
     def _tui_full_redraw_with_input(self, input_buf):
         """Atomically redraw the TUI body without touching
-        the bottom command-output panel. Called from
-        input_cmd() every 0.3s of no-keypress.
+        the bottom command-output panel.
 
-        v4.1.27 BOTTOM-PANEL: the TUI redraws only touch
-        rows 1..N, where N = terminal_height - 10. The
-        bottom 10 lines are reserved for the command
-        output panel + prompt, and are NEVER cleared by
-        TUI redraws. When a command is typed (e.g.
-        `vcomm`, `kb`, `list`), its output is appended
-        to self._cmd_out_buf and the bottom panel is
-        re-rendered in place. The user sees the live
-        status on top and command output on the bottom.
+        v4.1.28 FINAL LAYOUT: TUI body is HARD-FIXED at
+        15 lines (rows 1..15). The bottom region (rows
+        16+) is the SEPARATE command-output terminal +
+        prompt. TUI redraws only clear/write rows 1..15.
+        The bottom region is NEVER touched by TUI
+        redraws. The user can type commands into the
+        prompt at the bottom, and the output appears in
+        the bottom panel.
         """
         if not self.render_lock.acquire(blocking=False):
             return
         try:
-            # Get terminal height
-            try:
-                tty_h = self._term_height
-            except AttributeError:
-                tty_h = 32
-            body_lines = tty_h - 10
-            if body_lines < 5:
-                body_lines = 5
+            TUI_LINES = 15  # MUST match _render_tui_body truncate
             # Hide cursor during redraw
             sys.stdout.write("\033[?25l")
             # Cursor to top-left
             sys.stdout.write("\033[H")
-            # Clear only the body region (rows 1..body_lines)
-            sys.stdout.write(f"\033[1;{body_lines}H\033[J")
+            # Clear only the body region (rows 1..15)
+            sys.stdout.write(f"\033[1;{TUI_LINES}H\033[J")
             try:
                 self._render_tui_body()
             except Exception:
@@ -2040,6 +2054,13 @@ class MemoryExplorerAI:
         # Write with EXPLICIT \r\n between lines (Termux-safe,
         # works whether OPOST is on or off). NO trailing \r\n —
         # the prompt is on the same line as the cursor.
+        # v4.1.28 HARD TRUNCATE: TUI body is rendered into
+        # rows 1..TUI_BODY_LINES (default 15). The bottom
+        # region (rows 16+) is reserved for the SEPARATE
+        # command-output terminal. If we emit more than 15
+        # lines, they overflow into the bottom region and
+        # corrupt the terminal. So we hard-truncate to 15.
+        out = out[:15]
         sys.stdout.write("\r\n".join(out))
         sys.stdout.flush()
 
