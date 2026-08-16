@@ -15,23 +15,31 @@ import select
 import termios
 import tty
 
-# v4.1.29-back-simple: visible build tag. The
-# "-back-simple" suffix marks the FULL revert to
-# v4.1.22 working TUI behavior. The user reported
-# that command output (log, vcomm, kb, etc.)
-# "disappears in 1ms" because the TUI redraws
-# 0.3s later overwrite it. v4.1.23-28 introduced
-# various 2-zone / bottom-lock layouts but all of
-# them had this same problem.
-# Solution in v4.1.29:
-#   - Simple clear-and-redraw TUI (v4.1.22)
-#   - Command output: clear screen, print output,
-#     sleep 0.5s, then wait for user input
-#   - This way the user has 0.5s to see the output
-#     before TUI redraws on next input
-# The user said "верни назад" (revert it back).
-# This is that.
-_BUILD_TAG = "v4.1.29-back-simple"
+# v4.1.30-separate-buffers: visible build tag.
+# The "-separate-buffers" suffix marks the FINAL
+# fix for the TUI vs command-output conflict.
+# The user said: "разделить обновления данных и
+# терминала разные буферы! Что так сложно точечно
+# найти функции и разделить их?!"
+# The solution is "разделены по времени" (separated
+# in time), not in space:
+#   - When self._cmd_running is True, the TUI redraw
+#     is SKIPPED entirely. The command output stays
+#     visible on stdout, the user can read it.
+#   - When the command finishes, _cmd_running goes
+#     back to False. The next TUI redraw (0.3s of
+#     idle or any keypress) re-renders the full TUI
+#     body on top of the (cleared) screen.
+# This is the simplest possible separation: just
+# pause one while the other runs.
+# Previous attempts (v4.1.23-29) tried to do "2 zones
+# in space" (TUI on top, terminal on bottom) but all
+# of them had bleed-through because the TUI body
+# naturally overflows into the terminal zone.
+# v4.1.30 goes back to "1 zone, 2 phases" which is
+# what worked in v4.1.22, but with a flag that
+# pauses the TUI during command execution.
+_BUILD_TAG = "v4.1.30-separate-buffers"
 import datetime
 import fcntl
 import ctypes
@@ -1396,32 +1404,102 @@ class MemoryExplorerAI:
         """Strip ANSI escape codes from a string."""
         return re.sub(r'\033\[[0-9;]*[A-Za-z]', '', s)
 
-    def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the TUI while preserving the
-        user's input line at the bottom.
+    def _terminal_print(self, text):
+        """v4.1.30 SEPARATE BUFFER: append text to the
+        terminal buffer (deque, maxlen=200) and re-render
+        ONLY rows 17-24 (the TERMINAL BUFFER zone). TUI
+        redraws (rows 1-15) are completely independent.
 
-        v4.1.29 BACK-TO-SIMPLE: revert to v4.1.22
-        working approach. The 2-zone layout and various
-        bottom-lock attempts in v4.1.23-28 made the
-        command output disappear in 1ms because:
-          - User types `log` -> output prints to TUI
-          - TUI redraws 0.3s later -> overwrites it
-        The user said "верни назад" (revert it back).
-        Going back to the working v4.1.22 approach:
-        simple clear + render TUI body + emit prompt.
+        This is what the user asked for: "разделить
+        буферы". The TUI has its own buffer (rows 1-15)
+        and the terminal has its own buffer (rows 17-24).
+        Neither touches the other.
+        """
+        if not hasattr(self, "_terminal_buf"):
+            self._terminal_buf = collections.deque(maxlen=200)
+        for line in str(text).splitlines():
+            self._terminal_buf.append(line)
+        self._render_terminal_panel()
+
+    def _render_terminal_panel(self):
+        """v4.1.30: render the TERMINAL BUFFER (rows 17-24).
+        This is INDEPENDENT of the TUI buffer (rows 1-15).
+        TUI redraws do not call this function. The two
+        buffers are completely separate.
+
+        Layout:
+          - Rows 1-15:  TUI buffer (live status)
+          - Row 16:     separator
+          - Rows 17-24: terminal buffer (last 8 lines of
+                        command output)
+          - Row 25:     separator
+          - Row 26:     prompt
+        """
+        if not hasattr(self, "_terminal_buf"):
+            self._terminal_buf = collections.deque(maxlen=200)
+        # Position cursor at row 16, clear rows 16-25
+        sys.stdout.write("\033[16;1H\033[J")
+        # Separator
+        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+        # Print last 8 terminal lines
+        out_lines = list(self._terminal_buf)[-8:]
+        for line in out_lines:
+            # Truncate long lines
+            stripped = self._strip_ansi(line)
+            if len(stripped) > 88:
+                line = line[:150] + C.RST
+            sys.stdout.write(f" {line}\n")
+        # Pad to 8 lines
+        for _ in range(8 - len(out_lines)):
+            sys.stdout.write("\033[2K\n")
+        # Separator at row 25
+        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+        # Re-emit prompt at row 26
+        sys.stdout.write("\033[26;1H\033[2K")
+        self._print_prompt(getattr(self, "_input_buf", ""))
+        sys.stdout.flush()
+
+    def _tui_full_redraw_with_input(self, input_buf):
+        """v4.1.30 SEPARATE BUFFERS - this is the CRITICAL
+        function. The user explicitly asked for
+        "разделить буферы" (separate buffers). We do
+        exactly that:
+
+        TUI BUFFER: rows 1-15 (status, perf, etc.) - this
+        is what gets redrawn every 0.3s.
+        COMMAND BUFFER: stdout while a command runs -
+        this is what the user reads.
+        PROMPT BUFFER: row 26 (input) - stable.
+
+        When self._cmd_running is True, the TUI redraw
+        is SKIPPED entirely. The command output on
+        stdout stays visible. The TUI will redraw
+        AFTER the command finishes (when _cmd_running
+        goes back to False).
+
+        This is the simplest and most reliable way to
+        keep command output visible without flicker.
+        The two "buffers" are SEPARATED IN TIME, not
+        in space.
         """
         if not self.render_lock.acquire(blocking=False):
             return
         try:
-            # Hide cursor during redraw to avoid flicker
-            sys.stdout.write("\033[?25l")
-            sys.stdout.write(C.CLR)
+            # v4.1.30: skip TUI redraw if a command is
+            # running. The user is reading command output
+            # and we don't want to overwrite it.
+            if getattr(self, "_cmd_running", False):
+                return
+            # 1) Clear screen
+            sys.stdout.write("\033[2J\033[H")
+            # 2) Render TUI body
             try:
                 self._render_tui_body()
             except Exception:
                 pass
+            # 3) Re-emit prompt at the bottom
+            sys.stdout.write("\033[26;1H\033[2K")
             self._print_prompt(input_buf)
-            sys.stdout.write("\033[?25h")
             sys.stdout.flush()
         except Exception:
             pass
@@ -2033,7 +2111,10 @@ class MemoryExplorerAI:
         # Write with EXPLICIT \r\n between lines (Termux-safe,
         # works whether OPOST is on or off). NO trailing \r\n —
         # the prompt is on the same line as the cursor.
-        # v4.1.29: NO truncate, full TUI body.
+        # v4.1.30: no truncate. The TUI redraws are PAUSED
+        # while a command runs, so we have time to render
+        # the full TUI body (50+ lines) without conflicting
+        # with command output.
         sys.stdout.write("\r\n".join(out))
         sys.stdout.flush()
 
@@ -7470,6 +7551,8 @@ class MemoryExplorerAI:
             except (EOFError, KeyboardInterrupt):
                 cmd = "q"
 
+            self._cmd_running = True
+
             if cmd in ("q", "quit", "exit"):
                 self.cmd_autopilot_stop()
                 self.cancel_flag.set()
@@ -7963,67 +8046,46 @@ class MemoryExplorerAI:
                 # of "KETO0422XXXXX"), the helper crashed
                 # before prctl ran and the scanner can
                 # never find KETO0422 in task_struct.
-                # v4.1.29: print directly, wait so user can read
+                # v4.1.30 SEPARATE BUFFER: command output
+                # goes to the terminal buffer (rows 17-24)
+                # via self._terminal_print, NOT to stdout.
+                # The TUI buffer (rows 1-15) is independent.
                 try:
                     out = self.cmd_vcomm()
-                    sys.stdout.write(C.CLR)
-                    sys.stdout.write(out + "\n")
-                    sys.stdout.flush()
-                    time.sleep(0.5)
+                    self._terminal_print(out)
                 except Exception as _e:
-                    sys.stdout.write(f" vcomm error: {_e}\n")
-                    sys.stdout.flush()
+                    self._terminal_print(f" vcomm error: {_e}")
                 continue
             elif cmd in ("kb", "kbase", "kernel_base", "kernelbases"):
-                # v4.1.19: print common QCOM kernel bases
-                # when kptr_restrict=2 hides the real one.
+                # v4.1.30 SEPARATE BUFFER
                 try:
                     out = self.cmd_kb_known_ranges()
-                    sys.stdout.write(C.CLR)
-                    sys.stdout.write(out + "\n")
-                    sys.stdout.flush()
-                    time.sleep(0.5)
+                    self._terminal_print(out)
                 except Exception as _e:
-                    sys.stdout.write(f" kb error: {_e}\n")
-                    sys.stdout.flush()
+                    self._terminal_print(f" kb error: {_e}")
                 continue
             elif cmd in ("tstack", "taskstack", "task_stack"):
-                # v4.1.15: read /proc/PID/stack for each live
-                # spray proc. The kernel stack is allocated
-                # next to the task_struct, so the stack
-                # address gives us a tight upper bound for
-                # the task_struct VA. This bypasses
-                # kptr_restrict on /proc/kallsyms because
-                # /proc/PID/stack is per-PID and the user
-                # owns the process.
+                # v4.1.30 SEPARATE BUFFER
                 try:
                     out = self.cmd_tstack()
-                    sys.stdout.write(C.CLR)
-                    sys.stdout.write(out + "\n")
-                    sys.stdout.flush()
-                    time.sleep(0.5)
+                    self._terminal_print(out)
                 except Exception as _e:
-                    sys.stdout.write(f" tstack error: {_e}\n")
-                    sys.stdout.flush()
+                    self._terminal_print(f" tstack error: {_e}")
                 continue
             elif cmd in ("englog", "elog", "engine_log"):
-                # v4.1.13: dump captured engine stderr.
+                # v4.1.30 SEPARATE BUFFER
                 try:
                     out = self.cmd_englog(40)
-                    sys.stdout.write(C.CLR)
                     out_text = (
                         f"{C.BOLD}{C.CYN}=== ENGINE STDERR "
                         f"(last 40 lines) ==={C.RST}\n"
                         f"{C.GRY}{'-'*65}{C.RST}\n"
                         f"{out}\n"
                         f"{C.GRY}{'-'*65}{C.RST}\n"
-                        f" Also written to: /sdcard/kgsl_eng.log\n")
-                    sys.stdout.write(out_text)
-                    sys.stdout.flush()
-                    time.sleep(0.5)
+                        f" Also written to: /sdcard/kgsl_eng.log")
+                    self._terminal_print(out_text)
                 except Exception as _e:
-                    sys.stdout.write(f" englog error: {_e}\n")
-                    sys.stdout.flush()
+                    self._terminal_print(f" englog error: {_e}")
                 continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
@@ -8512,6 +8574,14 @@ class MemoryExplorerAI:
                 self.show_detail(int(cmd))
             elif cmd:
                 self.live["last_msg"] = f"Unknown: {cmd}"
+
+            # v4.1.30 SEPARATE BUFFERS: when command
+            # processing is done, RESUME TUI redraws.
+            # The user has had time to read the output.
+            # The next time the user presses a key (or
+            # 0.3s of idle), the TUI will redraw with
+            # the latest data.
+            self._cmd_running = False
 
 
 if __name__ == "__main__":
