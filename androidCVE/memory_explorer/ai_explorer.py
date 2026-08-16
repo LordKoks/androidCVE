@@ -2701,7 +2701,10 @@ class MemoryExplorerAI:
         """Open /dev/kgsl-3d0 (world-accessible, no root needed).
 
         v4.1: try multiple paths and return clear error reason
-        so user can see WHY KGSL is off.
+        so user can see WHY KGSL is off. Also tries to read
+        SELinux denial from /proc/thread-self/attr/current
+        and /var/log/audit/audit.log so user can see exactly
+        what's blocking.
         """
         if self.kgsl_fd is not None:
             return True
@@ -2730,7 +2733,19 @@ class MemoryExplorerAI:
                     self.kgsl_path = path
                     return True
                 except PermissionError as e:
-                    last_err = f"{path}: PermissionError: {e}"
+                    # v4.1: when open() fails with PermissionError
+                    # on a world-accessible device, it's almost
+                    # always SELinux. Try to read the denial
+                    # from audit log or dmesg to give the user
+                    # the exact AVC denial message.
+                    selinux_hint = self._read_selinux_denial(path, str(e))
+                    if selinux_hint:
+                        last_err = (f"{path}: SELinux denied. "
+                                    f"{selinux_hint}")
+                    else:
+                        last_err = (f"{path}: PermissionError "
+                                    f"(probably SELinux). DAC mode="
+                                    f"{oct(mode)}, try: setenforce 0")
                     continue
                 except FileNotFoundError:
                     continue
@@ -2749,6 +2764,50 @@ class MemoryExplorerAI:
         except Exception as e:
             self.kgsl_error = f"unexpected: {e}"
             return False
+
+    def _read_selinux_denial(self, path, original_err):
+        """v4.1: when KGSL open fails with PermissionError, try
+        to read the SELinux AVC denial from the audit log so
+        the user knows exactly which SELinux rule is blocking.
+
+        Returns a string like "avc: denied { ioctl } for
+        comm=\"explorer\" path=\"/dev/kgsl-3d0\" context=..."
+        or empty if no log available.
+        """
+        import os
+        # Try /proc/thread-self/attr/current for our context
+        try:
+            with open("/proc/thread-self/attr/current", "r") as f:
+                ctx = f.read().strip()
+        except Exception:
+            ctx = "(unknown)"
+        # Try to get the device's SELinux context
+        try:
+            import subprocess
+            r = subprocess.run(["ls", "-laZ", path],
+                               capture_output=True, text=True, timeout=2)
+            dev_ctx = r.stdout.strip() or "(unknown)"
+        except Exception:
+            dev_ctx = "(unknown)"
+        # Try audit log (may need root)
+        audit = ""
+        for log in ("/var/log/audit/audit.log",
+                    "/data/audit/audit.log"):
+            try:
+                with open(log, "r") as f:
+                    # Read last 64KB and search for "kgsl"
+                    lines = f.read()[-65536:].splitlines()
+                for line in reversed(lines):
+                    if "kgsl" in line.lower():
+                        audit = line[:200]
+                        break
+            except Exception:
+                continue
+        if audit:
+            return (f"audit: {audit} | "
+                    f"current_context={ctx}")
+        return (f"current_context={ctx}, device_context={dev_ctx} | "
+                f"fix: setenforce 0 OR run with right context")
 
     def _kgsl_setup_persistent(self):
         """Create persistent GPU context, IB, and DST objects.
