@@ -2757,85 +2757,99 @@ class MemoryExplorerAI:
     def _kgsl_open(self):
         """Open /dev/kgsl-3d0 (world-accessible, no root needed).
 
-        v4.1: try multiple paths and return clear error reason
-        so user can see WHY KGSL is off. Also tries to read
-        SELinux denial from /proc/thread-self/attr/current
-        and /var/log/audit/audit.log so user can see exactly
-        what's blocking.
+        v4.1.7-debug-log: massive diagnostic logging. Every
+        step writes to:
+        1. stderr (visible in the terminal in real time)
+        2. /sdcard/kgsl_debug.log (world-readable, always
+           writable, even for untrusted_app_27 on stock
+           Android 11+)
+        3. ~/kgsl_debug.log (Termux home, may fail if SELinux
+           blocks untrusted_app_27 writing there)
 
-        v4.1: ALWAYS logs to /sdcard/kgsl_debug.log what was
-        tried and what failed, so user can see even if last_msg
-        is overwritten by the render loop.
+        So even if 2 of 3 paths fail, at least one will work
+        and we'll see exactly what's happening with KGSL open.
         """
         import os as _os
-        # v4.1: log every attempt to a file the user can read
-        # from any terminal
-        _debug_log = None
-        try:
-            _debug_log = open("/data/data/com.termux/files/home/"
-                              "kgsl_debug.log", "a")
-        except Exception:
+        import sys as _sys
+        # v4.1.7: open ALL log paths up front and use any
+        # that succeed. This way we get diagnostic output
+        # even if some paths are blocked.
+        _log_handles = []
+        for _log_path in (
+            "/sdcard/kgsl_debug.log",
+            "/data/local/tmp/kgsl_debug.log",
+            "/data/data/com.termux/files/home/kgsl_debug.log",
+            "/tmp/kgsl_debug.log",
+        ):
             try:
-                _debug_log = open("/tmp/kgsl_debug.log", "a")
+                h = open(_log_path, "a")
+                _log_handles.append((_log_path, h))
             except Exception:
-                _debug_log = None
+                continue
         def _log(msg):
-            if _debug_log is None:
-                return
+            line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+            # Print to stderr so it shows in terminal in real time
             try:
-                import time as _t
-                _debug_log.write(f"{_t.time():.2f} {msg}\n")
-                _debug_log.flush()
+                _sys.stderr.write(line)
+                _sys.stderr.flush()
             except Exception:
                 pass
+            # Write to all log files
+            for _p, h in _log_handles:
+                try:
+                    h.write(line)
+                    h.flush()
+                except Exception:
+                    pass
         if self.kgsl_fd is not None:
+            _log("kgsl_fd already set, skipping")
             return True
         try:
-            # Try all known KGSL device paths
             paths = (
                 "/dev/kgsl-3d0",
-                "/dev/kgsl-3d0_pixelfl",  # some Adreno variants
+                "/dev/kgsl-3d0_pixelfl",
                 "/dev/kgsl",
             )
+            _log(f"_kgsl_open START; pid={_os.getpid()}")
+            _log(f"selinux ctx: {getattr(self, '_selinux_ctx', '?')}")
+            _log(f"kptr_restricted: {getattr(self, '_kptr_restricted', '?')}")
             last_err = ""
             for path in paths:
-                _log(f"trying path={path}")
+                _log(f"--- try path: {path} ---")
                 try:
-                    # Test if file exists first
                     exists = _os.path.exists(path)
-                    _log(f"  exists={exists}")
+                    _log(f"  exists: {exists}")
                     if not exists:
                         continue
-                    # Check permissions
                     st = _os.stat(path)
                     mode = st.st_mode & 0o777
                     is_chr = ((st.st_mode & 0o170000) == 0o20000)
-                    _log(f"  mode={oct(mode)} is_chr={is_chr}")
+                    _log(f"  mode: {oct(mode)} is_chr: {is_chr}")
                     if mode == 0:
-                        last_err = f"{path}: no permissions (mode=0)"
-                        _log(f"  -> {last_err}")
+                        last_err = f"{path}: mode=0 (no perm)"
+                        _log(f"  {last_err}")
                         continue
-                    # Try to open with O_RDWR (needed for ioctl)
+                    # Try O_RDWR first (needed for ioctl)
                     try:
                         self.kgsl_fd = _os.open(path, _os.O_RDWR)
-                        _log(f"  open O_RDWR OK fd={self.kgsl_fd}")
+                        _log(f"  O_RDWR OK fd={self.kgsl_fd}")
                         self.kgsl_path = path
                         return True
                     except PermissionError as e:
-                        _log(f"  open O_RDWR PermissionError: {e}")
-                        # Try O_RDONLY — the C exploit uses this as
-                        # fallback for reading KGSL. Won't work for
-                        # ioctl, but at least the user can SEE the
-                        # device is there.
+                        _log(f"  O_RDWR PermissionError errno={e.errno}: {e}")
+                        # Try O_RDONLY — v6.c uses RDONLY for
+                        # the read side of the UAF reclaim.
+                        # If this works, we can at least
+                        # detect the device, even if ioctl
+                        # later fails.
                         try:
                             self.kgsl_fd = _os.open(path, _os.O_RDONLY)
                             self.kgsl_path = path + " (RO)"
-                            last_err = (f"{path}: O_RDWR denied "
-                                        f"({e}), using O_RDONLY")
-                            _log(f"  open O_RDONLY OK fd={self.kgsl_fd}")
+                            last_err = (f"{path}: RDWR denied, RDONLY ok")
+                            _log(f"  O_RDONLY OK fd={self.kgsl_fd}")
                             return True
                         except Exception as e2:
-                            _log(f"  open O_RDONLY also failed: {e2}")
+                            _log(f"  O_RDONLY also failed: {e2}")
                             selinux_hint = self._read_selinux_denial(
                                 path, str(e))
                             if selinux_hint:
@@ -2845,8 +2859,9 @@ class MemoryExplorerAI:
                             else:
                                 last_err = (
                                     f"{path}: PermissionError "
-                                    f"(probably SELinux). DAC mode="
+                                    f"errno={e.errno}, DAC mode="
                                     f"{oct(mode)}, try: setenforce 0")
+                            _log(f"  {last_err}")
                         continue
                 except FileNotFoundError:
                     _log(f"  FileNotFoundError")
@@ -2855,12 +2870,10 @@ class MemoryExplorerAI:
                     last_err = f"{path}: {type(e).__name__}: {e}"
                     _log(f"  {last_err}")
                     continue
-            # If we get here, no device opened
             if not last_err:
                 last_err = (
                     "/dev/kgsl-3d0 not found. Device is Qualcomm-only; "
-                    "works on Snapdragon phones (most Androids). "
-                    "On MediaTek/Exynos this exploit cannot run.")
+                    "works on Snapdragon phones (most Androids).")
             self.kgsl_error = last_err
             _log(f"GIVE UP: {last_err}")
             return False
@@ -2869,9 +2882,9 @@ class MemoryExplorerAI:
             _log(f"UNEXPECTED: {e}")
             return False
         finally:
-            if _debug_log is not None:
+            for _p, h in _log_handles:
                 try:
-                    _debug_log.close()
+                    h.close()
                 except Exception:
                     pass
 
