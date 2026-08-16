@@ -15,12 +15,14 @@ import select
 import termios
 import tty
 
-# v4.1.7-debug-log: visible build tag shown in TUI so the
+# v4.1.8-tui-trace: visible build tag shown in TUI so the
 # user can verify they have the latest code. The suffix
-# "-debug-log" indicates the new _kgsl_open with full
-# /data/data/.../kgsl_debug.log tracing and CTX/kptr
-# diagnostic line in the TUI header.
-_BUILD_TAG = "v4.1.7-debug-log"
+# "-tui-trace" indicates the new _kgsl_open with in-memory
+# trace buffer (self._kgsl_trace) displayed directly in
+# the TUI KGSL status line. This replaces file-based
+# logging because Android scoped storage often blocks
+# Termux from writing to /sdcard.
+_BUILD_TAG = "v4.1.8-tui-trace"
 import datetime
 import fcntl
 import ctypes
@@ -1294,18 +1296,28 @@ class MemoryExplorerAI:
 
         out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
 
-        # v4.1: SELinux + KGSL diagnostic line. Shows the
-        # current context and KGSL device visibility. This
-        # makes it obvious if KGSL is blocked by SELinux or
-        # by device file permissions. v6.c has the same
-        # gating — the C exploit must run in init/hal_graphics
-        # context to actually open KGSL for ioctl (vs read).
+        # v4.1.7: SELinux + KGSL diagnostic line. Shows the
+        # current context and KGSL device visibility. The
+        # last entry of self._kgsl_trace is the most
+        # recent action taken, so the user can see exactly
+        # what step the KGSL open is at (or where it
+        # failed). v6.c has the same gating — the C
+        # exploit must run in init/hal_graphics context
+        # to actually open KGSL for ioctl (vs read).
         try:
             ctx_short = (self._selinux_ctx or "?")[-50:]
             kp = self._kptr_restricted
-            kgsl_d = (C.GRN + self.kgsl_path
-                      if self.kgsl_fd is not None
-                      else C.RED + "OFF")
+            if self.kgsl_fd is not None:
+                kgsl_d = C.GRN + self.kgsl_path
+            else:
+                # Show the last 3 trace entries so the
+                # user can see EXACTLY what step failed.
+                trace = getattr(self, "_kgsl_trace", [])
+                if trace:
+                    last = " | ".join(trace[-3:])
+                    kgsl_d = C.RED + last[:100]
+                else:
+                    kgsl_d = C.RED + "OFF (no trace)"
             out.append(f" {C.BOLD}CTX{C.RST}: {C.CYN}{ctx_short}{C.RST}"
                        f" {C.GRY}│{C.RST} kptr={C.YEL}{kp}{C.RST}"
                        f" {C.GRY}│{C.RST} KGSL: {kgsl_d}{C.RST}")
@@ -2758,49 +2770,49 @@ class MemoryExplorerAI:
         """Open /dev/kgsl-3d0 (world-accessible, no root needed).
 
         v4.1.7-debug-log: massive diagnostic logging. Every
-        step writes to:
-        1. stderr (visible in the terminal in real time)
-        2. /sdcard/kgsl_debug.log (world-readable, always
-           writable, even for untrusted_app_27 on stock
-           Android 11+)
-        3. ~/kgsl_debug.log (Termux home, may fail if SELinux
-           blocks untrusted_app_27 writing there)
-
-        So even if 2 of 3 paths fail, at least one will work
-        and we'll see exactly what's happening with KGSL open.
+        step writes to self._kgsl_trace[] which the TUI
+        displays directly in the header (replaces the
+        'KGSL: OFF' line with a step-by-step trace). Also
+        writes to /sdcard/kgsl_debug.log and stderr as
+        best-effort. We no longer rely on log files alone
+        because some Android devices (especially under
+        scoped storage in Android 11+) block Termux from
+        writing to /sdcard. The TUI trace is always
+        available since it lives in process memory.
         """
         import os as _os
         import sys as _sys
-        # v4.1.7: open ALL log paths up front and use any
-        # that succeed. This way we get diagnostic output
-        # even if some paths are blocked.
-        _log_handles = []
-        for _log_path in (
-            "/sdcard/kgsl_debug.log",
-            "/data/local/tmp/kgsl_debug.log",
-            "/data/data/com.termux/files/home/kgsl_debug.log",
-            "/tmp/kgsl_debug.log",
-        ):
-            try:
-                h = open(_log_path, "a")
-                _log_handles.append((_log_path, h))
-            except Exception:
-                continue
+        # v4.1.7: in-memory trace buffer (always works, no
+        # filesystem dependency). The TUI shows the last 8
+        # entries in the KGSL status area.
+        self._kgsl_trace = []
         def _log(msg):
-            line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
-            # Print to stderr so it shows in terminal in real time
+            # Always push to in-memory trace (replaces last
+            # entry if buffer is full, so the user always
+            # sees the LATEST activity)
+            if len(self._kgsl_trace) >= 16:
+                self._kgsl_trace.pop(0)
+            self._kgsl_trace.append(msg)
+            # Best-effort: stderr (visible if user runs
+            # 'python3 ai_explorer.py 2>log' but the trace
+            # is also in TUI always)
             try:
-                _sys.stderr.write(line)
+                _sys.stderr.write(f"[kgsl] {msg}\n")
                 _sys.stderr.flush()
             except Exception:
                 pass
-            # Write to all log files
-            for _p, h in _log_handles:
+            # Best-effort: log file (may fail on scoped
+            # storage, that's OK — TUI trace is primary)
+            for _log_path in (
+                "/sdcard/kgsl_debug.log",
+                "/data/local/tmp/kgsl_debug.log",
+            ):
                 try:
-                    h.write(line)
-                    h.flush()
+                    with open(_log_path, "a") as _lf:
+                        _lf.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                    break  # one is enough
                 except Exception:
-                    pass
+                    continue
         if self.kgsl_fd is not None:
             _log("kgsl_fd already set, skipping")
             return True
@@ -2810,70 +2822,54 @@ class MemoryExplorerAI:
                 "/dev/kgsl-3d0_pixelfl",
                 "/dev/kgsl",
             )
-            _log(f"_kgsl_open START; pid={_os.getpid()}")
-            _log(f"selinux ctx: {getattr(self, '_selinux_ctx', '?')}")
-            _log(f"kptr_restricted: {getattr(self, '_kptr_restricted', '?')}")
+            _log(f"START pid={_os.getpid()} ctx={getattr(self, '_selinux_ctx', '?')[:40]}")
             last_err = ""
             for path in paths:
-                _log(f"--- try path: {path} ---")
+                _log(f"path: {path}")
                 try:
                     exists = _os.path.exists(path)
-                    _log(f"  exists: {exists}")
+                    _log(f"  exists={exists}")
                     if not exists:
                         continue
                     st = _os.stat(path)
                     mode = st.st_mode & 0o777
                     is_chr = ((st.st_mode & 0o170000) == 0o20000)
-                    _log(f"  mode: {oct(mode)} is_chr: {is_chr}")
+                    _log(f"  mode={oct(mode)} chr={is_chr}")
                     if mode == 0:
-                        last_err = f"{path}: mode=0 (no perm)"
+                        last_err = f"{path}: mode=0"
                         _log(f"  {last_err}")
                         continue
-                    # Try O_RDWR first (needed for ioctl)
+                    # Try O_RDWR (needed for ioctl)
                     try:
                         self.kgsl_fd = _os.open(path, _os.O_RDWR)
-                        _log(f"  O_RDWR OK fd={self.kgsl_fd}")
+                        _log(f"  RDWR OK fd={self.kgsl_fd}")
                         self.kgsl_path = path
                         return True
                     except PermissionError as e:
-                        _log(f"  O_RDWR PermissionError errno={e.errno}: {e}")
-                        # Try O_RDONLY — v6.c uses RDONLY for
-                        # the read side of the UAF reclaim.
-                        # If this works, we can at least
-                        # detect the device, even if ioctl
-                        # later fails.
+                        _log(f"  RDWR DENIED errno={e.errno}: {e}")
+                        # Fallback to O_RDONLY — at least
+                        # we can SEE the device, even if
+                        # ioctl() later fails.
                         try:
                             self.kgsl_fd = _os.open(path, _os.O_RDONLY)
                             self.kgsl_path = path + " (RO)"
-                            last_err = (f"{path}: RDWR denied, RDONLY ok")
-                            _log(f"  O_RDONLY OK fd={self.kgsl_fd}")
+                            last_err = "RDWR denied, RDONLY ok"
+                            _log(f"  RDONLY OK fd={self.kgsl_fd}")
                             return True
                         except Exception as e2:
-                            _log(f"  O_RDONLY also failed: {e2}")
-                            selinux_hint = self._read_selinux_denial(
-                                path, str(e))
-                            if selinux_hint:
-                                last_err = (
-                                    f"{path}: SELinux denied. "
-                                    f"{selinux_hint}")
-                            else:
-                                last_err = (
-                                    f"{path}: PermissionError "
-                                    f"errno={e.errno}, DAC mode="
-                                    f"{oct(mode)}, try: setenforce 0")
-                            _log(f"  {last_err}")
+                            _log(f"  RDONLY also fail: {e2}")
+                            last_err = (f"PermissionError errno={e.errno}, "
+                                        f"RDONLY also fail: {e2}")
                         continue
                 except FileNotFoundError:
                     _log(f"  FileNotFoundError")
                     continue
                 except Exception as e:
-                    last_err = f"{path}: {type(e).__name__}: {e}"
+                    last_err = f"{type(e).__name__}: {e}"
                     _log(f"  {last_err}")
                     continue
             if not last_err:
-                last_err = (
-                    "/dev/kgsl-3d0 not found. Device is Qualcomm-only; "
-                    "works on Snapdragon phones (most Androids).")
+                last_err = "/dev/kgsl-3d0 not found"
             self.kgsl_error = last_err
             _log(f"GIVE UP: {last_err}")
             return False
@@ -2881,12 +2877,6 @@ class MemoryExplorerAI:
             self.kgsl_error = f"unexpected: {e}"
             _log(f"UNEXPECTED: {e}")
             return False
-        finally:
-            for _p, h in _log_handles:
-                try:
-                    h.close()
-                except Exception:
-                    pass
 
     def _read_selinux_denial(self, path, original_err):
         """v4.1: when KGSL open fails with PermissionError, try
