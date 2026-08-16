@@ -15,21 +15,17 @@ import select
 import termios
 import tty
 
-# v4.1.16-helper-safe: visible build tag. The "-helper-safe"
-# suffix marks the CRITICAL FIX for the 95% kill rate
-# observed on the user's ROG 5S. The spray helper
-# (`python3 -c "import ctypes; libc=ctypes.CDLL(None); ..."`)
-# was crashing on Termux because CDLL(None) sometimes
-# fails with "library None not found" on bionic libc.
-# This caused the helper to exit immediately, before
-# the prctl(PR_SET_NAME) call, so the kernel task_struct
-# comm was never set. Now we try libc.so → libc.so.6 →
-# CDLL(None) in order. We also ignore SIGCHLD/SIGTERM/
-# SIGHUP so the helper can't be killed by parent signals.
-# Expected result: alivePk should rise significantly
-# (from 5% to 60%+), matches should appear once the
-# scanner can find task_structs with KETO0422 comm.
-_BUILD_TAG = "v4.1.16-helper-safe"
+# v4.1.17-vcomm: visible build tag. The "-vcomm" suffix
+# marks the new cmd_vcomm() method that reads /proc/PID/comm
+# for every live spray proc. This is THE critical debug
+# command for the "matches=0" mystery: if the comm is
+# wrong (e.g. "python3" instead of "KETO0422XXXXX"), the
+# spray helper crashed before prctl(PR_SET_NAME) ran and
+# the scanner can never find KETO0422 in task_struct.
+# It also reads /proc/PID/stack to see if kptr_restrict=2
+# is blocking stack dumps. Use [vcomm] to verify the
+# spray is actually working before tuning the scan range.
+_BUILD_TAG = "v4.1.17-vcomm"
 import datetime
 import fcntl
 import ctypes
@@ -1817,7 +1813,8 @@ class MemoryExplorerAI:
             f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
             f" {C.BLU}[health]{C.RST} Health   "
             f" {C.BLU}[englog]{C.RST} Engine Stderr   "
-            f" {C.BLU}[tstack]{C.RST} Task Stacks"
+            f" {C.BLU}[tstack]{C.RST} Task Stacks   "
+            f" {C.BLU}[vcomm]{C.RST} Verify Comm"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -2049,6 +2046,80 @@ class MemoryExplorerAI:
             except (PermissionError, FileNotFoundError, OSError):
                 continue
         return syms
+
+    def cmd_vcomm(self):
+        """v4.1.17: verify /proc/PID/comm for every live spray
+        proc. The helper runs `prctl(PR_SET_NAME, name)` which
+        sets task_struct->comm = name. Reading /proc/PID/comm
+        shows what's actually in task_struct. If comm shows
+        "python3" or empty, the helper crashed before prctl
+        ran (e.g. CDLL(None) failed on Termux). If comm shows
+        KETO0422XXXXX, the marker IS in task_struct and the
+        scanner should be able to find it (else the scan
+        range is wrong).
+        """
+        self.live["last_command"] = "vcomm"
+        my_pids = set()
+        for s in self.spray_procs_by_worker.values():
+            my_pids.update(s)
+        if not my_pids:
+            return "No live spray procs"
+        out = []
+        out.append(f"{C.BOLD}{C.CYN}=== SPRAY COMM VERIFICATION ==={C.RST}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        keto_ok = 0
+        keto_wrong = 0
+        stack_ok = 0
+        sample = []
+        for pid in list(my_pids)[:20]:
+            try:
+                with open(f"/proc/{pid}/comm", "r") as f:
+                    comm = f.read().strip()
+            except Exception:
+                comm = "?"
+            stack = self.read_proc_stack(pid)
+            if stack is not None:
+                stack_ok += 1
+            if "KETO" in comm or "KETW" in comm:
+                keto_ok += 1
+            else:
+                keto_wrong += 1
+            if len(sample) < 5:
+                sample.append((pid, comm, hex(stack) if stack else "denied"))
+        out.append(f" {C.BOLD}Total{C.RST}: {len(my_pids)} live, "
+                   f"sampled {min(20, len(my_pids))}")
+        out.append(f" {C.GRN}KETO comm{C.RST}: {keto_ok}")
+        out.append(f" {C.RED}wrong comm{C.RST}: {keto_wrong}")
+        out.append(f" {C.CYN}stack read{C.RST}: {stack_ok}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        for pid, comm, stack in sample:
+            color = C.GRN if ("KETO" in comm or "KETW" in comm) else C.RED
+            out.append(
+                f" pid={C.WHT}{pid:<6}{C.RST} "
+                f"comm={color}{comm:<16}{C.RST} "
+                f"stack={C.GRY}{stack}{C.RST}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        if keto_wrong > keto_ok:
+            out.append(
+                f" {C.RED}FAIL{C.RST}: spray helper is not setting "
+                f"comm. Most procs have wrong comm. Check helper "
+                f"string and CDLL call in _popen_spray.")
+        elif keto_ok > 0 and stack_ok == 0:
+            out.append(
+                f" {C.YEL}NOTE{C.RST}: comm is set but "
+                f"/proc/PID/stack is denied. kptr_restrict=2 blocks "
+                f"the per-PID stack dump. Need root or another "
+                f"kernel leak to bypass.")
+        elif keto_ok > 0 and stack_ok > 0:
+            out.append(
+                f" {C.GRN}OK{C.RST}: comm AND stack readable. "
+                f"Use [tstack] for stack addresses, then targeted "
+                f"scan should find task_structs.")
+        else:
+            out.append(
+                f" {C.RED}EMPTY{C.RST}: no live spray procs with "
+                f"valid comm. Spray loop is broken.")
+        return "\n".join(out)
 
     def cmd_tstack(self):
         """v4.1.15: read /proc/PID/stack for every live spray
@@ -7406,6 +7477,21 @@ class MemoryExplorerAI:
                 }
                 self.save_kb()
                 self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("vcomm", "verifycomm", "verify_comm"):
+                # v4.1.17: verify /proc/PID/comm for live
+                # spray procs. The single most useful debug
+                # command for the "matches=0" mystery: if
+                # the comm is wrong (e.g. "python3" instead
+                # of "KETO0422XXXXX"), the helper crashed
+                # before prctl ran and the scanner can
+                # never find KETO0422 in task_struct.
+                try:
+                    out = self.cmd_vcomm()
+                    print(C.CLR, end="", flush=True)
+                    print(out, flush=True)
+                except Exception as _e:
+                    print(f" vcomm error: {_e}", flush=True)
+                continue
             elif cmd in ("tstack", "taskstack", "task_stack"):
                 # v4.1.15: read /proc/PID/stack for each live
                 # spray proc. The kernel stack is allocated
