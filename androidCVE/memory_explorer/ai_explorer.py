@@ -15,18 +15,29 @@ import select
 import termios
 import tty
 
-# v4.1.26-clean-revert: visible build tag. The
-# "-clean-revert" suffix marks the FULL revert to
-# v4.1.22 working state. v4.1.23-25 introduced
-# bottom-lock / split-layout / truncation changes
-# that broke the TUI multiple times. The user
-# reported "сломал ты плохо" and "сломал всё".
-# TUI is back to simple clear-and-redraw (which
-# was working in v4.1.22). The user accepted
-# prompt flicker before. The C helper logging and
-# cycle=0 fix from v4.1.23+ are kept (they were
-# the only useful changes).
-_BUILD_TAG = "v4.1.26-clean-revert"
+# v4.1.27-bottom-panel: visible build tag. The
+# "-bottom-panel" suffix marks the NEW TUI layout
+# with a separate bottom panel for command output.
+# Layout:
+#   - Top region (rows 1..tty_h-10): TUI body
+#     (status, perf, etc.) — gets redrawn every
+#     0.3s.
+#   - Bottom region (rows tty_h-9..tty_h): command
+#     output panel. NEVER cleared by TUI redraws.
+#     When the user types a command (e.g. vcomm,
+#     kb, list, dev, englog), the output is
+#     appended to self._cmd_out_buf (deque,
+#     maxlen=200) and the bottom panel is
+#     re-rendered in place. The user can scroll
+#     through recent command output without it
+#     being wiped by TUI updates.
+#   - Prompt at row tty_h (very last line).
+# The user said: "удали этот терминал и создай
+# новый отдельно, что бы он не обновлялся".
+# This is exactly that: a separate bottom
+# terminal for command output, stable, not
+# affected by TUI redraws.
+_BUILD_TAG = "v4.1.27-bottom-panel"
 import datetime
 import fcntl
 import ctypes
@@ -481,6 +492,28 @@ class MemoryExplorerAI:
         # (buttons) only ONCE on startup. Subsequent TUI
         # redraws never touch the bottom region.
         self._static_bottom_printed = False
+        # v4.1.27: detect terminal height. The bottom 10
+        # rows are reserved for the command output
+        # panel + prompt. The TUI body occupies
+        # rows 1..(tty_h-10).
+        try:
+            import fcntl, termios, struct
+            tty_h, tty_w = struct.unpack(
+                "hh", fcntl.ioctl(
+                    sys.stdout.fileno(), termios.TIOCGWINSZ,
+                    b"\x00"*4))
+            if tty_h < 10:
+                tty_h = 32
+        except Exception:
+            tty_h = 32
+        self._term_height = tty_h
+        # v4.1.27: command output buffer (deque). When
+        # the user types `vcomm`, `kb`, `list`, etc., the
+        # output is appended here and the bottom panel
+        # is re-rendered.
+        import collections
+        self._cmd_out_buf = collections.deque(maxlen=200)
+        self._input_buf = ""
         # v4.1.20: hard cap on live spray procs per worker to
         # prevent OOM/cgroup kills. On Termux the app
         # memory cgroup has a strict limit (typically 512MB
@@ -1293,34 +1326,107 @@ class MemoryExplorerAI:
             f"{C.GRY}{'─'*92}{C.RST}\n")
         sys.stdout.flush()
 
-    def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the whole TUI while preserving the
-        user's input line at the bottom. Called from input_cmd()
-        every 0.3s of no-keypress so the user sees live updates
-        without pressing anything.
+    def _cmd_output(self, text):
+        """v4.1.27: append command output to a separate
+        output buffer and re-render the bottom panel. The
+        bottom panel is a SEPARATE area that does NOT get
+        cleared by TUI redraws. The user sees the live
+        status on top, and command output (like vcomm,
+        kb, list, dev) on the bottom.
+        """
+        if not hasattr(self, "_cmd_out_buf"):
+            self._cmd_out_buf = collections.deque(maxlen=200)
+        for line in str(text).splitlines():
+            self._cmd_out_buf.append(line)
+        # Render the bottom panel in place (don't clear top)
+        self._render_cmd_output_panel()
 
-        v4.1.26: REVERTED TO WORKING v4.1.22 APPROACH.
-        v4.1.23-25 broke the TUI with various bottom-lock
-        attempts. The user reported "сломал всё" multiple
-        times. Going back to simple clear-and-redraw
-        (which was working fine in v4.1.22). The user
-        complained about prompt flicker but accepted it
-        before. The TUI layout was clean and stable.
-        Only the C helper logging and cycle=0 fix
-        remain from v4.1.23+.
+    def _render_cmd_output_panel(self):
+        """v4.1.27: print the last N command output lines
+        at the bottom of the terminal. This is a SEPARATE
+        panel that the TUI redraws never touch.
+
+        The TUI redraw only touches rows 1..N, where N is
+        (terminal_height - 10). The bottom 10 lines are
+        reserved for the command output panel + prompt.
+
+        Layout:
+          - Rows 1..N:  TUI body (status, perf, etc.)
+          - Separator
+          - Rows N+1..N+9: command output (last 8 lines)
+          - Row N+10: prompt `explorer > `
+        """
+        if not hasattr(self, "_cmd_out_buf"):
+            self._cmd_out_buf = collections.deque(maxlen=200)
+        try:
+            tty_h = self._term_height
+        except AttributeError:
+            tty_h = 32
+        # Reserve 10 lines at the bottom: 1 separator + 8
+        # output lines + 1 prompt line.
+        body_lines = tty_h - 10
+        if body_lines < 5:
+            body_lines = 5
+        # Position cursor at the start of the bottom panel
+        out_start_row = body_lines + 1
+        sys.stdout.write(f"\033[{out_start_row};1H\033[J")
+        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
+        # Print last 8 output lines
+        out_lines = list(self._cmd_out_buf)[-8:]
+        for line in out_lines:
+            # Strip ANSI for length check, but keep ANSI in output
+            stripped = self._strip_ansi(line)
+            if len(stripped) > 90:
+                line = line[:200] + C.RST
+            sys.stdout.write(f" {line}\n")
+        # Pad to 8 lines if fewer (to keep prompt position stable)
+        for _ in range(8 - len(out_lines)):
+            sys.stdout.write("\033[2K\n")
+        # Prompt at last row
+        sys.stdout.write(f"\033[{tty_h};1H\033[2K")
+        self._print_prompt(getattr(self, "_input_buf", ""))
+        sys.stdout.flush()
+
+    def _strip_ansi(self, s):
+        """Strip ANSI escape codes from a string."""
+        return re.sub(r'\033\[[0-9;]*[A-Za-z]', '', s)
+
+    def _tui_full_redraw_with_input(self, input_buf):
+        """Atomically redraw the TUI body without touching
+        the bottom command-output panel. Called from
+        input_cmd() every 0.3s of no-keypress.
+
+        v4.1.27 BOTTOM-PANEL: the TUI redraws only touch
+        rows 1..N, where N = terminal_height - 10. The
+        bottom 10 lines are reserved for the command
+        output panel + prompt, and are NEVER cleared by
+        TUI redraws. When a command is typed (e.g.
+        `vcomm`, `kb`, `list`), its output is appended
+        to self._cmd_out_buf and the bottom panel is
+        re-rendered in place. The user sees the live
+        status on top and command output on the bottom.
         """
         if not self.render_lock.acquire(blocking=False):
-            return  # another render in progress; skip this frame
+            return
         try:
-            # Hide cursor during redraw to avoid flicker
-            sys.stdout.write("\033[?25l")
-            sys.stdout.write(C.CLR)         # clear screen + home
+            # Get terminal height
             try:
-                self._render_tui_body()    # build & write body lines
+                tty_h = self._term_height
+            except AttributeError:
+                tty_h = 32
+            body_lines = tty_h - 10
+            if body_lines < 5:
+                body_lines = 5
+            # Hide cursor during redraw
+            sys.stdout.write("\033[?25l")
+            # Cursor to top-left
+            sys.stdout.write("\033[H")
+            # Clear only the body region (rows 1..body_lines)
+            sys.stdout.write(f"\033[1;{body_lines}H\033[J")
+            try:
+                self._render_tui_body()
             except Exception:
                 pass
-            # Re-emit the prompt + buffer at the bottom (same line)
-            self._print_prompt(input_buf)
             # Re-show cursor
             sys.stdout.write("\033[?25h")
             sys.stdout.flush()
@@ -7865,20 +7971,18 @@ class MemoryExplorerAI:
                 # never find KETO0422 in task_struct.
                 try:
                     out = self.cmd_vcomm()
-                    print(C.CLR, end="", flush=True)
-                    print(out, flush=True)
+                    self._cmd_output(out)
                 except Exception as _e:
-                    print(f" vcomm error: {_e}", flush=True)
+                    self._cmd_output(f" vcomm error: {_e}")
                 continue
             elif cmd in ("kb", "kbase", "kernel_base", "kernelbases"):
                 # v4.1.19: print common QCOM kernel bases
                 # when kptr_restrict=2 hides the real one.
                 try:
                     out = self.cmd_kb_known_ranges()
-                    print(C.CLR, end="", flush=True)
-                    print(out, flush=True)
+                    self._cmd_output(out)
                 except Exception as _e:
-                    print(f" kb error: {_e}", flush=True)
+                    self._cmd_output(f" kb error: {_e}")
                 continue
             elif cmd in ("tstack", "taskstack", "task_stack"):
                 # v4.1.15: read /proc/PID/stack for each live
@@ -7891,10 +7995,9 @@ class MemoryExplorerAI:
                 # owns the process.
                 try:
                     out = self.cmd_tstack()
-                    print(C.CLR, end="", flush=True)
-                    print(out, flush=True)
+                    self._cmd_output(out)
                 except Exception as _e:
-                    print(f" tstack error: {_e}", flush=True)
+                    self._cmd_output(f" tstack error: {_e}")
                 continue
             elif cmd in ("englog", "elog", "engine_log"):
                 # v4.1.13: dump captured engine stderr. The
@@ -7904,16 +8007,16 @@ class MemoryExplorerAI:
                 # 40 lines so the user can see engine activity.
                 try:
                     out = self.cmd_englog(40)
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== ENGINE STDERR "
-                          f"(last 40 lines) ==={C.RST}", flush=True)
-                    print(f"{C.GRY}{'-'*65}{C.RST}", flush=True)
-                    print(out, flush=True)
-                    print(f"{C.GRY}{'-'*65}{C.RST}", flush=True)
-                    print(f" Also written to: /sdcard/kgsl_eng.log",
-                          flush=True)
+                    out_text = (
+                        f"{C.BOLD}{C.CYN}=== ENGINE STDERR "
+                        f"(last 40 lines) ==={C.RST}\n"
+                        f"{C.GRY}{'-'*65}{C.RST}\n"
+                        f"{out}\n"
+                        f"{C.GRY}{'-'*65}{C.RST}\n"
+                        f" Also written to: /sdcard/kgsl_eng.log")
+                    self._cmd_output(out_text)
                 except Exception as _e:
-                    print(f" englog error: {_e}", flush=True)
+                    self._cmd_output(f" englog error: {_e}")
                 continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
