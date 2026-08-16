@@ -15,22 +15,17 @@ import select
 import termios
 import tty
 
-# v4.1.23-split-tui: visible build tag. The "-split-tui"
-# suffix marks the 2-region TUI layout. The TOP region
-# (rows 1-22) is the live status panel (KGSL, AI,
-# spray, workers, kernel) and gets redrawn every 0.3s.
-# The BOTTOM region (rows 23-24) is the prompt
-# (`explorer > `) and the user can type commands there
-# without it being overwritten. We also:
-#   - Restored `cycle = 0` in _autopilot_worker (was
-#     lost in an earlier edit, causing
-#     UnboundLocalError crash).
-#   - Added /sdcard/kgsl_spray.log logging in
-#     spray_helper.c so we can see if prctl(PR_SET_NAME)
-#     actually sets comm or if it's being denied.
-# Expected: stable input prompt, no crashes, and we
-# can see in the log if prctl works.
-_BUILD_TAG = "v4.1.23-split-tui"
+# v4.1.24-revert-tui: visible build tag. The "-revert-tui"
+# suffix marks the revert of the v4.1.23 split-layout
+# change. The split layout (ANSI cursor positioning to
+# keep the prompt separate from the TUI body) was
+# breaking the TUI because the TUI body often exceeded
+# 22 lines, causing the prompt to overlap with TUI
+# text. Reverted to the working whole-screen clear +
+# body + prompt approach from v4.1.22. The C helper
+# logging (/sdcard/kgsl_spray.log) and the cycle=0
+# fix are kept.
+_BUILD_TAG = "v4.1.24-revert-tui"
 import datetime
 import fcntl
 import ctypes
@@ -1237,38 +1232,33 @@ class MemoryExplorerAI:
         sys.stdout.flush()
 
     def _tui_full_redraw_with_input(self, input_buf):
-        """Atomically redraw the TUI while preserving the user's
-        input line at the bottom.
+        """Atomically redraw the whole TUI while preserving the
+        user's input line at the bottom. Called from input_cmd()
+        every 0.3s of no-keypress so the user sees live updates
+        without pressing anything.
 
-        v4.1.23 SPLIT-LAYOUT: instead of clear-the-whole-screen
-        and re-print everything (which causes the prompt to
-        flicker and sometimes get overwritten), we now use
-        a 2-region split layout:
-          - TOP region (fixed N lines): TUI status, perf, etc.
-          - BOTTOM region (3 lines): prompt + last 3 log lines
-
-        We redraw only the TOP region with a single ANSI clear
-        sequence. The BOTTOM region (prompt) stays put and is
-        only re-emitted when the user types something.
+        v4.1.24: reverted from split-layout (which was
+        breaking the TUI). The split layout tried to use
+        ANSI cursor positioning to keep the prompt
+        separate from the TUI body, but the TUI body is
+        variable height and often exceeded 22 lines, so
+        the prompt ended up overlapping with TUI text.
+        The user reported "сломал ты плохо" (you broke
+        it badly). Going back to the working whole-screen
+        clear + body + prompt approach. The C helper
+        logging and the cycle=0 fix are kept.
         """
         if not self.render_lock.acquire(blocking=False):
             return  # another render in progress; skip this frame
         try:
             # Hide cursor during redraw to avoid flicker
             sys.stdout.write("\033[?25l")
-            # Cursor to top-left
-            sys.stdout.write("\033[H")
-            # Clear from cursor down to row 22 (we reserve 22..24
-            # for the prompt). This leaves the prompt lines
-            # untouched.
-            sys.stdout.write("\033[1;22H\033[J")
+            sys.stdout.write(C.CLR)         # clear screen + home
             try:
                 self._render_tui_body()    # build & write body lines
             except Exception:
                 pass
-            # Force-cursor to row 23 (just above prompt)
-            sys.stdout.write("\033[23;1H")
-            # Re-emit the prompt + buffer at row 24
+            # Re-emit the prompt + buffer at the bottom (same line)
             self._print_prompt(input_buf)
             # Re-show cursor
             sys.stdout.write("\033[?25h")
