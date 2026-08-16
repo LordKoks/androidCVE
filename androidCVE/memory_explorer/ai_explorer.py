@@ -15,15 +15,18 @@ import select
 import termios
 import tty
 
-# v4.1.12-uaf-scan: visible build tag. The "-uaf-scan"
-# suffix marks the AUTOPILOT fix where after UAF+mmap_spray
-# we now do (a) targeted UAF scan (256MB at UAF_START, not
-# 1GB WIDE) and (b) explicit cmd_spray(batch=20) right after
-# mmap_spray to ensure KETO0422 task_structs land on the
-# just-freed page frames. Previously the scanner was running
-# WIDE 1GB and missing the actual UAF region where the
-# dangling mapping lives. This is the v6.c flow replicated.
-_BUILD_TAG = "v4.1.12-uaf-scan"
+# v4.1.13-englog: visible build tag. The "-englog" suffix
+# marks the engine stderr drain thread that continuously
+# reads the kgsl_engine subprocess stderr (in a background
+# thread) and stores the last 200 lines in self._engine_stderr.
+# Until now, engine stderr went into a PIPE buffer and was
+# only read on engine exit — usually too late. The new
+# [englog] command prints the captured stderr so the user
+# can see WHY UAF failed or scan found 0 matches. Critical
+# for debugging the "matches=0" mystery on the user's
+# device. Also writes each line to /sdcard/kgsl_eng.log
+# for offline review.
+_BUILD_TAG = "v4.1.13-englog"
 import datetime
 import fcntl
 import ctypes
@@ -1809,7 +1812,8 @@ class MemoryExplorerAI:
             f" {C.BLU}[w3]{C.RST} Deep-scan   "
             f" {C.BLU}[rva]{C.RST} Read VA  "
             f" {C.BLU}[N/{C.RST}{C.BLU}N]{C.RST} Open   "
-            f" {C.BLU}[health]{C.RST} Health"
+            f" {C.BLU}[health]{C.RST} Health   "
+            f" {C.BLU}[englog]{C.RST} Engine Stderr"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -1883,6 +1887,50 @@ class MemoryExplorerAI:
                     self.live["engine_pid"] = self.exploit_proc.pid
                 self.live["last_msg"] = f"Engine started (pid={self.exploit_proc.pid})"
                 self.log_event("engine_start", {"pid": self.exploit_proc.pid})
+                # v4.1.13: start a daemon thread that continuously
+                # reads engine stderr. The engine emits critical
+                # diagnostic messages on stderr (e.g. "[UAF] failed:
+                # Operation not permitted", "[SCAN] total=... pages,
+                # empty=N, nonzero=M, hits=K"). Without this thread
+                # the messages just sit in the PIPE buffer (4KB-64KB
+                # depending on libc) and are lost. Now we capture
+                # them in self._engine_stderr (deque, max 200 lines)
+                # and they're visible via [englog] command and the
+                # TUI status line.
+                import threading as _thr
+                import collections as _col
+                if not hasattr(self, "_engine_stderr") or \
+                        self._engine_stderr is None:
+                    self._engine_stderr = _col.deque(maxlen=200)
+                def _drain_engine_stderr():
+                    while True:
+                        try:
+                            if not self.exploit_proc:
+                                return
+                            if self.exploit_proc.stderr is None:
+                                return
+                            line = self.exploit_proc.stderr.readline()
+                            if not line:
+                                # Engine closed stderr (likely exited)
+                                return
+                            try:
+                                l = line.decode("utf-8", errors="replace").rstrip()
+                            except Exception:
+                                l = str(line)
+                            if l:
+                                self._engine_stderr.append(l)
+                                # Also write to a debug log so we
+                                # can review after the session.
+                                try:
+                                    with open("/sdcard/kgsl_eng.log", "a") as _f:
+                                        _f.write(l + "\n")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            return
+                _t = _thr.Thread(target=_drain_engine_stderr,
+                                 daemon=True, name="eng-stderr")
+                _t.start()
                 return True
             except Exception as e:
                 self.live["last_msg"] = f"Engine start failed: {e}"
@@ -4679,29 +4727,50 @@ class MemoryExplorerAI:
                 os.close(self.kgsl_fd)
             except Exception:
                 pass
-            self.kgsl_fd = None
-        # If we have an unprivileged SELinux context, try to
-        # switch to hal_graphics_default which has IOCTL perms
-        # on /dev/kgsl-3d0.
-        tried_runcon = False
-        if self.kgsl_fd is None and self._kgsl_retries <= 3:
+        self.kgsl_fd = None
+        # Try fresh open
+        ok = self._kgsl_open()
+        # Also restart engine
+        if self.exploit_proc:
             try:
-                # Try runcon to hal_graphics_default context
-                r = subprocess.run(
-                    ["runcon", "u:r:hal_graphics_default:s0",
-                     "ls", "-la", "/dev/kgsl-3d0"],
-                    capture_output=True, text=True, timeout=2)
-                tried_runcon = (r.returncode == 0)
+                self.exploit_proc.terminate()
             except Exception:
-                tried_runcon = False
-        # Re-attempt open
-        if self._kgsl_open():
-            self.live["last_msg"] = (
-                f"KGSL Retry #{self._kgsl_retries} OK: {self.kgsl_path}")
-            return "KGSL OPEN"
+                pass
+            self.exploit_proc = None
+        self.ensure_engine()
         self.live["last_msg"] = (
-            f"KGSL Retry #{self._kgsl_retries} fail: {self.kgsl_error[:60]}")
-        return "KGSL still off"
+            f"KGSL retry #{self._kgsl_retries}: "
+            f"{'OK' if ok else 'FAIL'} "
+            f"fd={self.kgsl_fd}")
+        return "OK" if ok else "FAIL"
+
+    def cmd_englog(self, n=40):
+        """v4.1.13: dump engine stderr buffer. The engine
+        writes critical diagnostic info on stderr like
+        '[UAF] failed: ...', '[SCAN] total=...',
+        'IOCTL_KGSL_DRAWCTXT_CREATE failed: ...'. These
+        messages tell us WHY scan finds no matches or
+        UAF fails. We capture them in a deque via a
+        background thread; this command prints the
+        last N lines (default 40) so the user can see
+        what the engine has been doing.
+        """
+        self.live["last_command"] = "englog"
+        if not hasattr(self, "_engine_stderr") or \
+                self._engine_stderr is None:
+            return "No engine stderr captured"
+        buf = list(self._engine_stderr)[-int(n):]
+        if not buf:
+            return "Engine stderr buffer empty"
+        out = "\n".join(buf)
+        # Also write to /sdcard for offline review
+        try:
+            with open("/sdcard/kgsl_eng.log", "a") as f:
+                f.write("\n--- englog dump ---\n")
+                f.write(out + "\n")
+        except Exception:
+            pass
+        return out
 
     def cmd_verify_root(self):
         self.live["last_command"] = "R (Verify Root)"
@@ -7230,6 +7299,25 @@ class MemoryExplorerAI:
                 }
                 self.save_kb()
                 self.live["last_msg"] = "Knowledge base reset."
+            elif cmd in ("englog", "elog", "engine_log"):
+                # v4.1.13: dump captured engine stderr. The
+                # engine emits [UAF], [SCAN], IOCTL_xxx messages
+                # on stderr which tell us WHY things are or
+                # aren't working. This command prints the last
+                # 40 lines so the user can see engine activity.
+                try:
+                    out = self.cmd_englog(40)
+                    print(C.CLR, end="", flush=True)
+                    print(f"{C.BOLD}{C.CYN}=== ENGINE STDERR "
+                          f"(last 40 lines) ==={C.RST}", flush=True)
+                    print(f"{C.GRY}{'-'*65}{C.RST}", flush=True)
+                    print(out, flush=True)
+                    print(f"{C.GRY}{'-'*65}{C.RST}", flush=True)
+                    print(f" Also written to: /sdcard/kgsl_eng.log",
+                          flush=True)
+                except Exception as _e:
+                    print(f" englog error: {_e}", flush=True)
+                continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
                 # exactly what's working and what's broken so they
