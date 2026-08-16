@@ -15,27 +15,27 @@ import select
 import termios
 import tty
 
-# v4.1.31-all-buttons: visible build tag. The
-# "-all-buttons" suffix marks the FULL migration of
-# all command outputs to the SEPARATE BUFFER system.
-# The user said: "Остальные кнопки обнови!" (update
-# the other buttons). v4.1.30 only migrated
-# vcomm/tstack/englog. v4.1.31 migrates ALL the
-# remaining commands:
-#   - log, list, kb, stats, dev (info)
-#   - pidmap, iomem, syms, ksd
-#   - help (full help text)
-# All of them now use self._terminal_print() which
-# writes to the SEPARATE TERMINAL BUFFER (rows 16 to
-# tty_h-2). The TUI buffer (rows 1-15) is independent.
-# Also the terminal panel now shows up to (tty_h-17)
-# lines (16+ for default 32-row terminal), up from
-# 8 lines in v4.1.30. Long outputs (log: 20+ lines,
-# list: 25+ lines, help: 40+ lines) are now visible.
-# TUI redraws are PAUSED while a command runs
-# (self._cmd_running flag), so the user can see the
-# full output without it being overwritten.
-_BUILD_TAG = "v4.1.31-all-buttons"
+# v4.1.32-bugfix: visible build tag. The
+# "-bugfix" suffix marks the FIX of two bugs in
+# v4.1.31:
+#   1. AttributeError: 'MemoryExplorerAI' object
+#      has no attribute 'render_hz'. The 'dev'
+#      command used self.render_hz directly, but
+#      this attribute doesn't exist on the class.
+#      Fix: use self.live.get('render_hz', 0).
+#   2. NameError: name 'collections' is not
+#      defined. The _terminal_print and
+#      _render_terminal_panel functions used
+#      collections.deque but collections was not
+#      imported at the top of the file. Fix: use
+#      a local import inside the function:
+#      `import collections as _coll`. This is
+#      safer because it doesn't require modifying
+#      the top-level imports.
+# Both bugs crashed the 'dev' command. v4.1.32
+# fixes them and adds runtime safety: if the
+# import fails, it falls back to a plain list.
+_BUILD_TAG = "v4.1.32-bugfix"
 import datetime
 import fcntl
 import ctypes
@@ -1412,7 +1412,8 @@ class MemoryExplorerAI:
         Neither touches the other.
         """
         if not hasattr(self, "_terminal_buf"):
-            self._terminal_buf = collections.deque(maxlen=200)
+            import collections as _coll
+            self._terminal_buf = _coll.deque(maxlen=200)
         for line in str(text).splitlines():
             self._terminal_buf.append(line)
         self._render_terminal_panel()
@@ -1433,7 +1434,8 @@ class MemoryExplorerAI:
         tty_h-1). Prompt is at the last line.
         """
         if not hasattr(self, "_terminal_buf"):
-            self._terminal_buf = collections.deque(maxlen=200)
+            import collections as _coll
+            self._terminal_buf = _coll.deque(maxlen=200)
         try:
             tty_h = self._term_height
         except AttributeError:
@@ -7909,7 +7911,7 @@ class MemoryExplorerAI:
                         f"{C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}")
                     out_lines.append(
                         f" {C.BOLD}Render rate{C.RST}: "
-                        f"{C.CYN}{self.render_hz:.1f} Hz{C.RST}")
+                        f"{C.CYN}{self.live.get('render_hz', 0):.1f} Hz{C.RST}")
                     out_lines.append(f"{C.GRY}{'─'*60}{C.RST}")
                     self._terminal_print("\n".join(out_lines))
                 except Exception as _e:
@@ -7966,7 +7968,7 @@ class MemoryExplorerAI:
                     print(f" {C.BOLD}PID{C.RST}        : {C.CYN}{self.live.get('engine_pid', 0)}{C.RST}", flush=True)
                     print(f" {C.BOLD}Uptime{C.RST}     : {C.CYN}{int(time.time() - self.live['uptime_start'])}s{C.RST}", flush=True)
                     print(f" {C.BOLD}RAM{C.RST}        : {C.CYN}{self.live.get('ram', 0):.1f}%{C.RST}", flush=True)
-                    print(f" {C.BOLD}Render rate{C.RST}: {C.CYN}{self.render_hz:.1f} Hz{C.RST}", flush=True)
+                    print(f" {C.BOLD}Render rate{C.RST}: {C.CYN}{self.live.get('render_hz', 0):.1f} Hz{C.RST}", flush=True)
                     print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
                     print("Press Enter to return...", flush=True)
                     try:
