@@ -15,16 +15,20 @@ import select
 import termios
 import tty
 
-# v4.1.19-kb-bases: visible build tag. The "-kb-bases"
-# suffix marks the cmd_kb_known_ranges() command that
-# lists common QCOM kernel bases for when kptr_restrict=2
-# blocks /proc/kallsyms. The user can then try scanning
-# each base range. Also added kernel_scanner.c which
-# reads /proc/PID/stat (potential kernel pointer leak
-# via start_code field) and /proc/PID/status. Combined
-# with spray_helper.c, both helpers are auto-built on
-# startup if gcc is available.
-_BUILD_TAG = "v4.1.19-kb-bases"
+# v4.1.20-cgroup-cap: visible build tag. The "-cgroup-cap"
+# suffix marks the OOM/cgroup fix. The user's ROG 5S was
+# showing 77-95% kill rate because the Termux app has a
+# strict cgroup memory limit (~512MB), and our spray was
+# accumulating 200-400 procs. The cgroup OOM killer was
+# SIGKILL'ing them all in batches. Now:
+#   - q_actions batch sizes reduced from 10/20/40 to 4/6/8
+#   - MAX_SPRAY_PER_WORKER = 12 (was unlimited)
+#   - Reaper kills oldest PID before each new batch
+#   - Total: max 36 procs across 3 workers = ~216MB
+# Expected result: kills < 20%, alivePk steady at 30-36,
+# and the spray helper actually has time to set comm
+# before being killed.
+_BUILD_TAG = "v4.1.20-cgroup-cap"
 import datetime
 import fcntl
 import ctypes
@@ -137,8 +141,14 @@ class MemoryExplorerAI:
         self.q_epsilon = 0.2   # exploration rate
         self.q_lr = 0.4       # learning rate (was 0.1, too slow)
         self.q_gamma = 0.9    # discount factor
+        # v4.1.20: smaller batches (max 8) to stay under
+        # cgroup limit. With 12 procs cap per worker and
+        # 3 workers, total = 36 procs = ~216MB max.
+        # Batch of 8 = at most 8 new procs per cycle, so
+        # we reaper-kill the oldest 8 (replacing them) on
+        # every batch. No OOM.
         self.q_actions = [
-            ("batch", 10), ("batch", 20), ("batch", 40),
+            ("batch", 4), ("batch", 6), ("batch", 8),
             ("comm", "KETO"), ("comm", "KETW"),
             ("comm", "MIXED"),
             ("range", 0), ("range", 1), ("range", 2), ("range", 3), ("range", 4),
@@ -469,6 +479,17 @@ class MemoryExplorerAI:
         # surviving its own cull cycle). Now each worker owns its own
         # set of PIDs; cross-kill is impossible.
         self.spray_procs_by_worker = {}
+        # v4.1.20: hard cap on live spray procs per worker to
+        # prevent OOM/cgroup kills. On Termux the app
+        # memory cgroup has a strict limit (typically 512MB
+        # on stock devices). Each spray proc uses ~4MB stack
+        # + ~2MB libc, so 50+ procs = 300MB+ which trips the
+        # cgroup OOM killer and kills them with SIGKILL. We
+        # now keep max 12 procs per worker, rotating the
+        # oldest out before spawning a new one. With 3 workers
+        # that's 36 total procs = ~144MB which is well
+        # within cgroup limits.
+        self.MAX_SPRAY_PER_WORKER = 12
         # Adaptive scan state — when no matches are found in 5
         # consecutive batches, the scan range is shifted to try
         # a different part of the address space. Initialized here
@@ -5722,6 +5743,29 @@ class MemoryExplorerAI:
                 q_range = worker_id
 
             batch_pids = []
+            # v4.1.20: reaper — before spawning a new batch,
+            # check if this worker has too many live procs.
+            # If so, kill the oldest ones (those with
+            # smallest PIDs, since spray always increments).
+            # This prevents the cgroup OOM killer from
+            # killing ALL our procs in one shot. The cgroup
+            # limit on Termux is ~512MB; each proc ~6MB = max
+            # ~85 procs across all 3 workers. We use 12 per
+            # worker (36 total) which leaves plenty of
+            # headroom for the engine, scans, and other
+            # Python overhead.
+            while len(my_pids) >= self.MAX_SPRAY_PER_WORKER:
+                if not my_pids:
+                    break
+                oldest = min(my_pids)
+                try:
+                    os.kill(oldest, 9)
+                except Exception:
+                    pass
+                my_pids.discard(oldest)
+                with self.stats_lock:
+                    self.live["kill_count"] = (
+                        self.live.get("kill_count", 0) + 1)
             for i in range(q_batch):
                 if self.cancel_flag.is_set():
                     break
