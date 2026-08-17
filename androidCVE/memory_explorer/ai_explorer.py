@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.40-all-kills-tracked"
+_BUILD_TAG = "v4.1.41-cgroup-cmd"
 import datetime
 import fcntl
 import ctypes
@@ -6079,6 +6079,220 @@ class MemoryExplorerAI:
         lines.append("=" * 60)
         return "\n".join(lines)
 
+    def cmd_cgroup(self):
+        """v4.1.40: dump cgroup limits.
+
+        The user is seeing kills at 43.7% RAM with
+        10s age — too consistent to be memory
+        pressure. Likely it's a cgroup pids.max
+        or memory.max limit. This command reads
+        /proc/self/cgroup and the relevant
+        cgroup files to show what limits apply.
+
+        On Android (cgroup v1 + v2 hybrid):
+          - v1: /sys/fs/cgroup/<ctrl>/<path>/<file>
+          - v2: /sys/fs/cgroup/<path>/<file>
+        """
+        self.live["last_command"] = "cgroup"
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  CGROUP LIMITS")
+        lines.append("=" * 60)
+
+        # 1) Read /proc/self/cgroup
+        cgroup_info = []
+        try:
+            with open("/proc/self/cgroup", "r") as f:
+                cgroup_info = [
+                    l.strip().split(":", 2)
+                    for l in f if l.strip()]
+        except Exception as e:
+            lines.append(f"  Failed to read /proc/self/cgroup: {e}")
+            return "\n".join(lines)
+
+        # 2) For each cgroup entry, get the path
+        # and the v2 unified path
+        v2_path = None
+        for entry in cgroup_info:
+            hier_id, ctrls, path = (
+                entry[0] if len(entry) > 0 else "",
+                entry[1] if len(entry) > 1 else "",
+                entry[2] if len(entry) > 2 else "")
+            lines.append(f"  [{hier_id}] ctrls={ctrls!r:<20s} path={path}")
+            # 0::/path/... is cgroup v2
+            if hier_id == "0" and ctrls == "":
+                v2_path = path
+
+        # 3) Try cgroup v2 first (unified)
+        lines.append("")
+        lines.append("  --- cgroup v2 (unified) ---")
+        if v2_path:
+            v2_full = f"/sys/fs/cgroup{v2_path}"
+            for fname, label in (
+                ("pids.max", "PIDS LIMIT"),
+                ("pids.current", "PIDS NOW"),
+                ("memory.max", "MEMORY LIMIT"),
+                ("memory.current", "MEMORY NOW"),
+                ("memory.high", "MEMORY HIGH"),
+                ("memory.swap.max", "SWAP LIMIT"),
+                ("cpu.max", "CPU QUOTA"),
+            ):
+                fpath = f"{v2_full}/{fname}"
+                try:
+                    with open(fpath, "r") as f:
+                        val = f.read().strip()
+                    if val and val != "max":
+                        # Format nicely
+                        try:
+                            num = int(val)
+                            if num > 1024 * 1024:
+                                val = f"{num/(1024*1024):.0f}MB ({num})"
+                            elif num > 1024:
+                                val = f"{num/1024:.0f}KB ({num})"
+                        except Exception:
+                            pass
+                    lines.append(f"    {label:<14s}: {val}")
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    lines.append(f"    {label:<14s}: <permission denied>")
+                except Exception as e:
+                    lines.append(f"    {label:<14s}: <{e}>")
+        else:
+            lines.append("    (no cgroup v2 path found)")
+
+        # 4) Also try cgroup v1 paths (Android)
+        lines.append("")
+        lines.append("  --- cgroup v1 (legacy) ---")
+        # memory v1
+        for fname, label in (
+            ("memory.limit_in_bytes", "MEMORY LIMIT"),
+            ("memory.usage_in_bytes", "MEMORY NOW"),
+            ("memory.kmem.limit_in_bytes", "KMEM LIMIT"),
+        ):
+            for v1_root in (
+                "/sys/fs/cgroup/memory",
+                "/sys/fs/cgroup/memory/uid_10237",
+            ):
+                fpath = f"{v1_root}/{fname}"
+                try:
+                    with open(fpath, "r") as f:
+                        val = f.read().strip()
+                    if val and val != "max":
+                        try:
+                            num = int(val)
+                            if num > 1024 * 1024:
+                                val = f"{num/(1024*1024):.0f}MB"
+                            elif num > 1024:
+                                val = f"{num/1024:.0f}KB"
+                        except Exception:
+                            pass
+                    lines.append(f"    {label:<14s}: {val} ({v1_root})")
+                    break
+                except Exception:
+                    continue
+
+        # pids v1
+        for fname, label in (
+            ("pids.max", "PIDS LIMIT"),
+            ("pids.current", "PIDS NOW"),
+        ):
+            for v1_root in (
+                "/sys/fs/cgroup/pids",
+                "/sys/fs/cgroup/pids/uid_10237",
+            ):
+                fpath = f"{v1_root}/{fname}"
+                try:
+                    with open(fpath, "r") as f:
+                        val = f.read().strip()
+                    if val and val != "max":
+                        try:
+                            num = int(val)
+                            val = f"{num} procs"
+                        except Exception:
+                            pass
+                    lines.append(f"    {label:<14s}: {val} ({v1_root})")
+                    break
+                except Exception:
+                    continue
+
+        # 5) Verdict
+        lines.append("")
+        lines.append("  --- VERDICT ---")
+        # Check if we found a PIDS LIMIT
+        pids_limit_found = False
+        pids_limit_val = None
+        pids_now_val = None
+        mem_limit_found = False
+        mem_limit_val = None
+        if v2_path:
+            v2_full = f"/sys/fs/cgroup{v2_path}"
+            try:
+                with open(f"{v2_full}/pids.max", "r") as f:
+                    pids_limit_val = f.read().strip()
+                    if pids_limit_val and pids_limit_val != "max":
+                        pids_limit_found = True
+                        pids_limit_val = int(pids_limit_val)
+            except Exception:
+                pass
+            try:
+                with open(f"{v2_full}/pids.current", "r") as f:
+                    pids_now_val = f.read().strip()
+            except Exception:
+                pass
+            try:
+                with open(f"{v2_full}/memory.max", "r") as f:
+                    mem_limit_val = f.read().strip()
+            except Exception:
+                pass
+
+        if pids_limit_found and pids_limit_val and pids_limit_val < 100:
+            lines.append(
+                f"  >> PIDS LIMIT IS LOW: {pids_limit_val}")
+            lines.append(
+                f"     (current: {pids_now_val})")
+            lines.append(
+                f"     This explains the 10s kills!")
+            lines.append(
+                f"     The kernel SIGKILLs procs that")
+            lines.append(
+                f"     exceed pids.max.")
+            lines.append(
+                f"     FIX: lower MAX_SPRAY_PER_WORKER")
+            lines.append(
+                f"     below {pids_limit_val} total.")
+        elif mem_limit_val and mem_limit_val != "max":
+            try:
+                ml = int(mem_limit_val)
+                lines.append(
+                    f"  >> MEMORY LIMIT: {ml/(1024*1024):.0f}MB")
+                lines.append(
+                    f"     (cgroup v2 memory.max)")
+                lines.append(
+                    f"     FIX: be more aggressive about")
+                lines.append(
+                    f"     culling before hitting this limit.")
+            except Exception:
+                pass
+        else:
+            lines.append(
+                "  >> No clear cgroup limit found")
+            lines.append(
+                "     (memory.max=max and pids.max=max)")
+            lines.append(
+                "     → NOT cgroup memory or pids limit")
+            lines.append(
+                "     → Likely: Termux anti-spawn defense")
+            lines.append(
+                "       or kernel task watchdog")
+            lines.append(
+                "     → FIX: add PR_SET_PDEATHSIG")
+            lines.append(
+                "       and shorter sleep between sprays")
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
     def cmd_verify_root(self):
         self.live["last_command"] = "R (Verify Root)"
         try:
@@ -8846,6 +9060,15 @@ class MemoryExplorerAI:
                 except Exception as _e:
                     self._terminal_print(
                         f" killreasons error: {_e}")
+                continue
+            elif cmd in ("cgroup", "cglim", "cgroups"):
+                # v4.1.40 SEPARATE BUFFER
+                try:
+                    out = self.cmd_cgroup()
+                    self._terminal_print(out)
+                except Exception as _e:
+                    self._terminal_print(
+                        f" cgroup error: {_e}")
                 continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
