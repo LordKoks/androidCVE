@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.34-more-patterns"
+_BUILD_TAG = "v4.1.35-no-empty-no-dup"
 import datetime
 import fcntl
 import ctypes
@@ -1482,19 +1482,37 @@ class MemoryExplorerAI:
         return re.sub(r'\033\[[0-9;]*[A-Za-z]', '', s)
 
     def _terminal_print(self, text):
-        """v4.1.30 SEPARATE BUFFER: append text to the
-        terminal buffer (deque, maxlen=200) and re-render
-        ONLY rows 17-24 (the TERMINAL BUFFER zone). TUI
-        redraws (rows 1-15) are completely independent.
+        """v4.1.35: REPLACE terminal buffer with the
+        new command's output (don't append). This is
+        the fix for the "list shown 3 times" bug.
 
-        This is what the user asked for: "разделить
-        буферы". The TUI has its own buffer (rows 1-15)
-        and the terminal has its own buffer (rows 17-24).
-        Neither touches the other.
+        The user said: "И тут найденные смещения.
+        Пусты там 0000000" — and the buffer showed
+        the same list 3 times because each `list`
+        command APPENDED the new output to the
+        existing buffer (deque, maxlen=500). After
+        3 calls, the buffer had 3 copies.
+
+        v4.1.35: on each `_terminal_print` call,
+        CLEAR the buffer first and add only the new
+        text. This way the user always sees the
+        LAST command's output, not a history of
+        duplicates.
+
+        If the user wants history, they can scroll
+        back via the spray_log / found_items
+        commands instead of relying on the terminal
+        buffer.
         """
         if not hasattr(self, "_terminal_buf"):
             import collections as _coll
-            self._terminal_buf = _coll.deque(maxlen=200)
+            self._terminal_buf = _coll.deque(maxlen=500)
+        # v4.1.35: CLEAR the buffer before adding
+        # the new command's output. This is the
+        # simplest way to ensure the user sees
+        # only the LAST command's output, not a
+        # history of duplicates.
+        self._terminal_buf.clear()
         for line in str(text).splitlines():
             self._terminal_buf.append(line)
         self._render_terminal_panel()
@@ -5716,8 +5734,18 @@ class MemoryExplorerAI:
                     va = int(va_hex, 16)
                     data = self.read_page(va)
                     if data and not any(int(it['va'], 16) == va for it in self.found_items):
-                        with self.bg_lock:
-                            self.found_items.append(self.classify_page(data, va))
+                        classified = self.classify_page(data, va)
+                        # v4.1.35: skip Empty Page — they
+                        # are all-zero unallocated memory
+                        # and add no value to the list.
+                        # Without this filter, the user
+                        # saw "Empty Page" entries that
+                        # were all zeros (0x00000000...).
+                        if (classified
+                                and classified.get("type")
+                                != "Empty Page"):
+                            with self.bg_lock:
+                                self.found_items.append(classified)
 
                 if not self._engine_write(
                     # v4.1: SMART scan range. If kernel_base was
@@ -5791,12 +5819,17 @@ class MemoryExplorerAI:
                                 if triple and len(triple) == 12288:
                                     cross = triple
                             if sig in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17) or self._is_real_task_struct(cross):
-                                with self.bg_lock:
-                                    self.found_items.append(
-                                        self.classify_page(cross, va, sig, off_in_page))
-                                self.log_event("scan_match", {"va": va,
-                                                               "type": self.found_items[-1]['type'],
-                                                               "sig": sig})
+                                classified = self.classify_page(
+                                    cross, va, sig, off_in_page)
+                                # v4.1.35: skip Empty Page
+                                if (classified
+                                        and classified.get("type")
+                                        != "Empty Page"):
+                                    with self.bg_lock:
+                                        self.found_items.append(classified)
+                                    self.log_event("scan_match", {"va": va,
+                                                                   "type": classified['type'],
+                                                                   "sig": sig})
                             else:
                                 # Keep weaker matches as "Unknown Object"
                                 interesting, reason, conf = self._is_page_interesting(data)
@@ -5850,7 +5883,12 @@ class MemoryExplorerAI:
         # was seeing 3 "Empty Page" entries that were discovered
         # 5 minutes ago and never went away — confusing because
         # they look like current results.
-        self.found_items = []
+        # v4.1.35: also drop any "Empty Page" entries — they
+        # are all-zero unallocated memory and add no value.
+        self.found_items = [
+            it for it in self.found_items
+            if it.get("type") != "Empty Page"
+        ]
         self.memory_map = []
         # Reset adaptive scan state
         self._adaptive_scan = {
