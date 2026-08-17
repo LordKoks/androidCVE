@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.35-no-empty-no-dup"
+_BUILD_TAG = "v4.1.36-no-kgsl-spam"
 import datetime
 import fcntl
 import ctypes
@@ -3527,14 +3527,18 @@ class MemoryExplorerAI:
             if len(self._kgsl_trace) >= 16:
                 self._kgsl_trace.pop(0)
             self._kgsl_trace.append(msg)
-            # Best-effort: stderr (visible if user runs
-            # 'python3 ai_explorer.py 2>log' but the trace
-            # is also in TUI always)
-            try:
-                _sys.stderr.write(f"[kgsl] {msg}\n")
-                _sys.stderr.flush()
-            except Exception:
-                pass
+            # v4.1.36: REMOVED stderr write. It was
+            # causing the terminal area to flood with
+            # `[kgsl] kgsl_fd already set, skipping`
+            # messages every time the UAF trigger ran.
+            # The user said the terminal was "full of
+            # these messages and they couldn't see real
+            # output". Now we keep ONLY the in-memory
+            # trace (visible in TUI) and the file log
+            # (for after-session review). The user can
+            # see Python-side log via the TUI status,
+            # and engine stderr via the [englog] command
+            # which reads from self._engine_stderr.
             # Best-effort: log file (may fail on scoped
             # storage, that's OK — TUI trace is primary)
             for _log_path in (
@@ -3547,6 +3551,17 @@ class MemoryExplorerAI:
                     break  # one is enough
                 except Exception:
                     continue
+            # v4.1.36: also push to a separate deque
+            # visible via [englog] (was engine-only,
+            # now includes Python-side _log too)
+            if not hasattr(self, "_engine_stderr") or \
+                    self._engine_stderr is None:
+                import collections as _col2
+                self._engine_stderr = _col2.deque(maxlen=200)
+            try:
+                self._engine_stderr.append(f"[kgsl] {msg}")
+            except Exception:
+                pass
         if self.kgsl_fd is not None:
             _log("kgsl_fd already set, skipping")
             return True
