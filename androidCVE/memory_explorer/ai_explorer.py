@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.39-kill-tracker"
+_BUILD_TAG = "v4.1.40-all-kills-tracked"
 import datetime
 import fcntl
 import ctypes
@@ -3567,11 +3567,16 @@ class MemoryExplorerAI:
                     for pid in list(pids):
                         all_pids.append((wid, pid))
                 for wid, pid in all_pids:
-                    if pid not in self._proc_start_time:
-                        # Not tracked (e.g. just spawned, or
-                        # legacy from before v4.1.39). Skip
-                        # without recording.
-                        continue
+                    # v4.1.40: REMOVED strict check
+                    # "if pid not in self._proc_start_time:
+                    #  continue". That was causing us to
+                    # miss kills for PIDs spawned by
+                    # workers that didn't call _track_proc.
+                    # Now we record ANY dead PID we find.
+                    # If it's not in our tracking dict
+                    # (e.g. legacy from a prior build), we
+                    # still get its wait status and
+                    # categorize the kill.
                     # Check if proc is alive
                     try:
                         # kill(pid, 0) returns 0 if alive, ESRCH
@@ -3699,6 +3704,11 @@ class MemoryExplorerAI:
                 ["python3", "-c", helper],
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
             )
+            # v4.1.40: track for kill reason
+            try:
+                self._track_proc(p.pid, marker[:15])
+            except Exception:
+                pass
             return p.pid
         except Exception:
             return None
@@ -3736,6 +3746,11 @@ class MemoryExplorerAI:
                 ["python3", "-c", helper],
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
             )
+            # v4.1.40: track for kill reason
+            try:
+                self._track_proc(p.pid, marker[:15])
+            except Exception:
+                pass
             return p.pid
         except Exception:
             return None
@@ -4676,6 +4691,11 @@ class MemoryExplorerAI:
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                 start_new_session=True,
             )
+            # v4.1.40: track for kill reason
+            try:
+                self._track_proc(p.pid, marker[:15])
+            except Exception:
+                pass
             return p
         except Exception:
             return None
@@ -4717,6 +4737,11 @@ class MemoryExplorerAI:
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                 start_new_session=True,
             )
+            # v4.1.40: track for kill reason
+            try:
+                self._track_proc(p.pid, marker[:15])
+            except Exception:
+                pass
             return p
         except Exception:
             return None
@@ -4752,6 +4777,11 @@ class MemoryExplorerAI:
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                 start_new_session=True,
             )
+            # v4.1.40: track for kill reason
+            try:
+                self._track_proc(p.pid, marker[:15])
+            except Exception:
+                pass
             return p
         except Exception:
             return None
@@ -5859,6 +5889,14 @@ class MemoryExplorerAI:
                     os.kill(pid, 9)
                     os.waitpid(pid, 0)
                     killed += 1
+                    # v4.1.40: record WHY it died
+                    self._record_kill(
+                        pid=pid,
+                        reason="clear(all)",
+                        status=0,
+                        ram=self.get_ram_usage(),
+                        ts=time.time(),
+                    )
                 except Exception:
                     pass
             pids.clear()
@@ -6786,6 +6824,22 @@ class MemoryExplorerAI:
                 with self.stats_lock:
                     self.live["kill_count"] = (
                         self.live.get("kill_count", 0) + 1)
+                # v4.1.40: record the rotation kill
+                # (we kill oldest to make room for new)
+                try:
+                    _w_pid, _w_status = os.waitpid(
+                        oldest, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    _w_status = 0
+                except Exception:
+                    _w_status = 0
+                self._record_kill(
+                    pid=oldest,
+                    reason="rotate(max)",
+                    status=_w_status,
+                    ram=self.get_ram_usage(),
+                    ts=time.time(),
+                )
             # v4.1.38: SPRAY_PER_LOOP. The user wants
             # faster spray cadence. Now we do q_batch
             # iterations, but with self.SPRAY_PER_LOOP
@@ -7411,6 +7465,14 @@ class MemoryExplorerAI:
                 my_pids.discard(pid)
                 if died:
                     killed_this_batch += 1
+                    # v4.1.40: record WHY it died
+                    self._record_kill(
+                        pid=pid,
+                        reason="batch_death",
+                        status=0,
+                        ram=self.get_ram_usage(),
+                        ts=time.time(),
+                    )
                 else:
                     survived_this_batch += 1
                 with self.stats_lock:
