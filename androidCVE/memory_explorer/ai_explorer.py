@@ -15,27 +15,50 @@ import select
 import termios
 import tty
 
-# v4.1.32-bugfix: visible build tag. The
-# "-bugfix" suffix marks the FIX of two bugs in
-# v4.1.31:
-#   1. AttributeError: 'MemoryExplorerAI' object
-#      has no attribute 'render_hz'. The 'dev'
-#      command used self.render_hz directly, but
-#      this attribute doesn't exist on the class.
-#      Fix: use self.live.get('render_hz', 0).
-#   2. NameError: name 'collections' is not
-#      defined. The _terminal_print and
-#      _render_terminal_panel functions used
-#      collections.deque but collections was not
-#      imported at the top of the file. Fix: use
-#      a local import inside the function:
-#      `import collections as _coll`. This is
-#      safer because it doesn't require modifying
-#      the top-level imports.
-# Both bugs crashed the 'dev' command. v4.1.32
-# fixes them and adds runtime safety: if the
-# import fails, it falls back to a plain list.
-_BUILD_TAG = "v4.1.32-bugfix"
+# v4.1.33-stable-terminal: visible build tag.
+# The "-stable-terminal" suffix marks the FINAL
+# 2-zone layout the user asked for.
+# The user said: "Сюда выведи терминал и сделай
+# так что бы он не обновлялся онлайн как
+# обновляется всё выше!" (Output the terminal
+# HERE and make it so it does not update live
+# like everything above updates).
+# LAYOUT (strict, all enforced by code):
+#   Rows 1..15 :  TUI body (status, perf, etc.)
+#                 Updates every 0.3s via
+#                 _tui_full_redraw_with_input.
+#                 Uses \033[2K to clear each line
+#                 before writing — does NOT touch
+#                 rows 16+.
+#   Row 16    :  Separator (printed on each TUI
+#                 redraw).
+#   Row 17    :  Prompt "explorer > " + input
+#                 buffer. Stable.
+#   Rows 18+  :  Terminal output (commands print
+#                 here). STABLE — TUI redraws do
+#                 NOT touch this area. _terminal_print
+#                 re-renders rows 18..tty_h-1 when
+#                 a command finishes, showing the
+#                 last N lines of output.
+# Key changes in v4.1.33:
+#   1. TUI body is hard-capped to 15 lines via
+#      _build_tui_lines()[:15].
+#   2. Each TUI line is written to a specific row
+#      with \033[2K (clear line) before, so the
+#      lines never bleed into the terminal area.
+#   3. Separator at row 16 is printed on every
+#      TUI redraw.
+#   4. Prompt at row 17 is re-emitted on every
+#      TUI redraw, so the user always sees it
+#      even after the TUI body updates.
+#   5. The 3 remaining commands that used
+#      print(C.CLR) (which clears the whole
+#      screen) now use "\033[18;1H\033[J" which
+#      clears only the terminal area (rows 18+).
+#   6. _terminal_print renders the terminal
+#      area in rows 18..tty_h-1 with the last
+#      (tty_h - 18) lines of the buffer.
+_BUILD_TAG = "v4.1.33-stable-terminal"
 import datetime
 import fcntl
 import ctypes
@@ -1419,94 +1442,132 @@ class MemoryExplorerAI:
         self._render_terminal_panel()
 
     def _render_terminal_panel(self):
-        """v4.1.30: render the TERMINAL BUFFER (rows 16+
-        up to tty_h-2). This is INDEPENDENT of the TUI
-        buffer (rows 1-15). TUI redraws do not call this
-        function. The two buffers are completely separate.
+        """v4.1.33 STABLE TERMINAL — render command
+        output to rows 18..tty_h-1. This is BELOW
+        the prompt (row 17) and is INDEPENDENT of
+        the TUI body (rows 1-15).
 
-        v4.1.31: show MORE lines (16 instead of 8) and
-        use a dynamic line count based on terminal
-        height. The user can see the full output of
-        commands like 'log' (20+ lines), 'list' (25+
-        lines), 'dev' (15+ lines), 'help' (40+ lines).
-        The TUI body is fixed at 15 lines (rows 1-15).
-        The terminal gets everything else (rows 16 to
-        tty_h-1). Prompt is at the last line.
+        The user said: "Сюда выведи терминал и
+        сделай так что бы он не обновлялся онлайн".
+        The terminal is HERE (below prompt) and is
+        STABLE (TUI redraws do not touch rows 18+).
+
+        Layout (strict):
+          Rows 1-15:  TUI body
+          Row 16:     Separator
+          Row 17:     Prompt
+          Rows 18..tty_h-1: Terminal output (stable)
+
+        When a command runs, output is appended to
+        self._terminal_buf (deque, maxlen=500) and
+        this function re-renders rows 18..tty_h-1
+        to show the last N lines. The TUI redraws
+        do NOT call this function. The terminal is
+        completely independent.
         """
         if not hasattr(self, "_terminal_buf"):
             import collections as _coll
-            self._terminal_buf = _coll.deque(maxlen=200)
+            self._terminal_buf = _coll.deque(maxlen=500)
         try:
             tty_h = self._term_height
         except AttributeError:
             tty_h = 32
-        TUI_LINES = 15
-        prompt_row = tty_h  # last row
-        sep_row = tty_h - 1  # separator just above prompt
-        # Terminal gets rows 16 .. sep_row-1
-        term_rows = sep_row - (TUI_LINES + 1)  # rows 16..sep_row-1
-        if term_rows < 4:
-            term_rows = 4
-        # Position cursor at start of terminal area (row 16)
-        sys.stdout.write(f"\033[{TUI_LINES+1};1H\033[J")
+        TERM_START = 18
+        PROMPT_ROW = 17
+        # Terminal area: rows 18..tty_h-1
+        term_rows = tty_h - TERM_START
+        if term_rows < 2:
+            term_rows = 2
+        # Position cursor at row 18, clear rows 18..tty_h
+        sys.stdout.write(f"\033[{TERM_START};1H\033[J")
+        # Print last term_rows terminal lines
         out_lines = list(self._terminal_buf)[-term_rows:]
         for line in out_lines:
-            # Truncate long lines
             stripped = self._strip_ansi(line)
             if len(stripped) > 88:
                 line = line[:150] + C.RST
             sys.stdout.write(f" {line}\033[K\n")
-        # Pad to term_rows lines
+        # Pad to term_rows
         for _ in range(term_rows - len(out_lines)):
             sys.stdout.write("\033[2K\n")
-        # Separator at sep_row
-        sys.stdout.write(f"\033[{sep_row};1H\033[2K")
-        sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\n")
-        # Re-emit prompt at last row
-        sys.stdout.write(f"\033[{prompt_row};1H\033[2K")
+        # Re-emit prompt at row 17
+        sys.stdout.write(f"\033[{PROMPT_ROW};1H\033[2K")
         self._print_prompt(getattr(self, "_input_buf", ""))
         sys.stdout.flush()
 
     def _tui_full_redraw_with_input(self, input_buf):
-        """v4.1.30 SEPARATE BUFFERS - this is the CRITICAL
-        function. The user explicitly asked for
-        "разделить буферы" (separate buffers). We do
-        exactly that:
+        """v4.1.33 STABLE TERMINAL — FINAL LAYOUT.
 
-        TUI BUFFER: rows 1-15 (status, perf, etc.) - this
-        is what gets redrawn every 0.3s.
-        COMMAND BUFFER: stdout while a command runs -
-        this is what the user reads.
-        PROMPT BUFFER: row 26 (input) - stable.
+        The user said: "Сюда выведи терминал и сделай
+        так что бы он не обновлялся онлайн как
+        обновляется всё выше!" (Output the terminal
+        HERE and make it so it does not update live
+        like everything above updates).
 
-        When self._cmd_running is True, the TUI redraw
-        is SKIPPED entirely. The command output on
-        stdout stays visible. The TUI will redraw
-        AFTER the command finishes (when _cmd_running
-        goes back to False).
+        The user is pointing to the BOTTOM of the
+        screen, below the prompt. They want the
+        command output to be there, and NOT be
+        cleared by the live TUI redraws above.
 
-        This is the simplest and most reliable way to
-        keep command output visible without flicker.
-        The two "buffers" are SEPARATED IN TIME, not
-        in space.
+        LAYOUT (strict):
+          Rows 1..15 :  TUI body (status, perf, etc.)
+                        Updates every 0.3s.
+          Row 16    :  Separator
+          Row 17    :  Prompt "explorer > " (input)
+                        Stable.
+          Rows 18..tty_h-1: Terminal output (commands
+                            print here). STABLE.
+                            Last (tty_h - 18) lines
+                            are visible.
+          Row tty_h :  Empty buffer (spare).
+
+        TUI redraws ONLY touch rows 1..15. They
+        re-emit the prompt at row 17 but do NOT
+        touch rows 18+. So terminal output stays
+        visible.
+
+        Command output goes to rows 18+. After a
+        command finishes, the terminal panel is
+        re-rendered to rows 18..tty_h-1 (showing
+        the last N lines).
         """
         if not self.render_lock.acquire(blocking=False):
             return
         try:
-            # v4.1.30: skip TUI redraw if a command is
-            # running. The user is reading command output
-            # and we don't want to overwrite it.
+            # v4.1.33: skip TUI redraw if a command is
+            # actively running. The user is reading
+            # command output and we don't want to
+            # overwrite it.
             if getattr(self, "_cmd_running", False):
                 return
-            # 1) Clear screen
-            sys.stdout.write("\033[2J\033[H")
-            # 2) Render TUI body
             try:
-                self._render_tui_body()
+                tty_h = self._term_height
+            except AttributeError:
+                tty_h = 32
+            TUI_LINES = 15
+            PROMPT_ROW = 17
+            # Move cursor to top-left
+            sys.stdout.write("\033[H")
+            # Write each TUI line in rows 1..15 with
+            # \033[2K (clear line) before writing. This
+            # does NOT touch rows 16+ (the terminal area
+            # below the prompt). The terminal stays put.
+            try:
+                tui_lines = self._build_tui_lines()
             except Exception:
-                pass
-            # 3) Re-emit prompt at the bottom
-            sys.stdout.write("\033[26;1H\033[2K")
+                tui_lines = []
+            tui_lines = tui_lines[:TUI_LINES]
+            for i, line in enumerate(tui_lines):
+                # Move to row i+1, clear line, write
+                sys.stdout.write(f"\033[{i+1};1H\033[2K{line}\r\n")
+            # Pad remaining rows with cleared lines
+            for i in range(len(tui_lines), TUI_LINES):
+                sys.stdout.write(f"\033[{i+1};1H\033[2K\r\n")
+            # Separator at row 16
+            sys.stdout.write(f"\033[16;1H\033[2K")
+            sys.stdout.write(f"{C.GRY}{'─'*92}{C.RST}\r\n")
+            # Re-emit prompt at row 17
+            sys.stdout.write(f"\033[{PROMPT_ROW};1H\033[2K")
             self._print_prompt(input_buf)
             sys.stdout.flush()
         except Exception:
@@ -1519,11 +1580,14 @@ class MemoryExplorerAI:
                 pass
             self.render_lock.release()
 
-    def _render_tui_body(self, hint=""):
-        """Build the TUI lines (everything EXCEPT the prompt at the
-        bottom) and write them to stdout with explicit \\r\\n
-        endings. NO trailing \\r\\n — the caller adds the prompt
-        on the same line as the cursor.
+    def _build_tui_lines(self, hint=""):
+        """v4.1.33: build the TUI lines as a LIST of
+        strings (no printing). The caller writes each
+        line to a specific row with \033[2K (clear
+        line) before, so the lines never bleed into
+        the terminal area below the prompt.
+
+        Returns a list of strings, one per TUI line.
         """
         out = []
         L = self.live
@@ -2116,15 +2180,14 @@ class MemoryExplorerAI:
         out.append(f" {C.GRY}LAST CMD{C.RST}: {C.CYN}{L['last_command']}{C.RST}    "
                    f"{C.GRY}(↑/↓ history, Ctrl+E rewind, Ctrl+P stop 'L', 'log' to dump){C.RST}")
 
-        # Write with EXPLICIT \r\n between lines (Termux-safe,
-        # works whether OPOST is on or off). NO trailing \r\n —
-        # the prompt is on the same line as the cursor.
-        # v4.1.30: no truncate. The TUI redraws are PAUSED
-        # while a command runs, so we have time to render
-        # the full TUI body (50+ lines) without conflicting
-        # with command output.
-        sys.stdout.write("\r\n".join(out))
-        sys.stdout.flush()
+        # v4.1.33: hard cap to 15 lines and RETURN
+        # the list (no printing). The caller writes
+        # each line to a specific row with \033[2K
+        # (clear line) before, so the lines never
+        # bleed into the terminal area below the
+        # prompt (row 17+).
+        out = out[:15]
+        return out
 
     # ============== ENGINE MANAGEMENT ==============
     def ensure_engine(self):
@@ -7939,7 +8002,12 @@ class MemoryExplorerAI:
                 # Show device / runtime info
                 try:
                     self._render_paused_set_noop()  # no-op in single-thread
-                    print(C.CLR, end="", flush=True)
+                    # v4.1.33: position cursor at row 18
+                    # (start of terminal area) and clear from
+                    # there. Do NOT clear the whole screen —
+                    # the TUI body in rows 1-15 stays visible.
+                    sys.stdout.write(f"\033[18;1H\033[J")
+                    sys.stdout.flush()
                     print(f"{C.BOLD}{C.CYN}=== DEVICE / RUNTIME INFO ==={C.RST}", flush=True)
                     print(f"{C.GRY}{'─'*60}{C.RST}", flush=True)
                     # Try getprop
@@ -8141,7 +8209,10 @@ class MemoryExplorerAI:
                 # self-test, counts alive procs, checks kallsyms
                 # freshness, verifies KGSL, etc.
                 try:
-                    print(C.CLR, end="", flush=True)
+                    # v4.1.33: don't clear whole screen,
+                    # only clear terminal area (rows 18+).
+                    sys.stdout.write(f"\033[18;1H\033[J")
+                    sys.stdout.flush()
                     print(f"{C.BOLD}{C.CYN}=== HEALTH CHECK ==={C.RST}",
                           flush=True)
                     print(f"{C.GRY}{'─'*65}{C.RST}", flush=True)
@@ -8418,7 +8489,9 @@ class MemoryExplorerAI:
                         f"have KETO comm ({rate:.0f}%)")
                     # Print sample details
                     try:
-                        print(C.CLR, end="", flush=True)
+                        # v4.1.33: only clear terminal area
+                        sys.stdout.write(f"\033[18;1H\033[J")
+                        sys.stdout.flush()
                         print(f"{C.BOLD}=== SPRAY COMM VERIFY ==={C.RST}", flush=True)
                         for pid, comm, ok in r["sample"]:
                             tag = f"{C.GRN}OK{C.RST}" if ok else f"{C.RED}WRONG{C.RST}"
