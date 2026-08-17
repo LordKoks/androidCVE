@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.38-bigger-spray"
+_BUILD_TAG = "v4.1.39-kill-tracker"
 import datetime
 import fcntl
 import ctypes
@@ -94,6 +94,31 @@ class MemoryExplorerAI:
         self.found_items = []
         self.spray_procs = []
         self.spray_log = []  # detailed log of every spray
+        # v4.1.39: KILL REASON TRACKER. The user
+        # asked: "А как проверить почему вообще
+        # умерают они? Можно отдельный лог вывести
+        # на один запуск" (How can I check why
+        # they're dying? Can you output a separate
+        # log for one run?)
+        # We track EVERY kill with:
+        #   - PID
+        #   - comm (process name like KETO0422...)
+        #   - reason: OOM, SIGSEGV, SIGABRT, SIGKILL,
+        #            SIGTERM(our), EXIT(N), ALIVE
+        #   - timestamp
+        #   - ram_at_kill (RAM % when killed)
+        #   - age_ms (how long the proc lived)
+        # Then [killreasons] shows the breakdown:
+        #   OOM      : 245 (66%)
+        #   SIGKILL  : 89  (24%)  ← cgroup or kernel
+        #   SIGSEGV  : 12  (3%)
+        #   ...
+        # And last 20 kills as a list.
+        self.kill_log = []            # last 20 kills
+        self.kill_reasons = {}        # reason → count
+        self.kill_total = 0
+        self._proc_start_time = {}    # pid → start_ts
+        self._proc_comm = {}          # pid → comm
         self.exploit_proc = None
         self.kb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base.json")
         self.log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "explorer_log.jsonl")
@@ -745,6 +770,16 @@ class MemoryExplorerAI:
         self.cancel_flag = threading.Event()
         self.bg_thread = None
         self.bg_lock = threading.Lock()
+
+        # v4.1.39: start the periodic kill watcher
+        # daemon thread. It watches all spray procs
+        # and records WHY they die (OOM/CGROUP,
+        # SIGKILL, SIGSEGV, etc.) so the user can
+        # see the breakdown via [killreasons].
+        try:
+            self.start_kill_watcher()
+        except Exception:
+            pass
 
         # Heuristics — device-agnostic: covers Android, AOSP, Google, Samsung,
         # Huawei, Sony, Xiaomi, OnePlus, Asus and other common packages.
@@ -3408,6 +3443,187 @@ class MemoryExplorerAI:
         except Exception:
             return 0.0
 
+    def _record_kill(self, pid, reason, status=0, ram=0.0, ts=0.0):
+        """v4.1.39: Record WHY a spray proc died.
+
+        The user wants to know if kills are from:
+          - Our own RAM-cull (SIGTERM from us)
+          - Kernel OOM-killer (SIGKILL from kernel)
+          - cgroup kill (SIGKILL when over memory.max)
+          - SIGSEGV (memory corruption)
+          - SIGABRT (assertion fail)
+          - Normal exit (exit code)
+
+        status is the raw os.waitpid status. Format:
+          - if WIFEXITED(status): low byte = exit code
+          - if WIFSIGNALED(status): high byte = signal + 0x80
+        On Linux, os.WTERMSIG(status) gives the signal,
+        os.WEXITSTATUS(status) gives the exit code.
+        """
+        import time as _t
+        try:
+            # Decode the status into reason + signal/code
+            if status and (status & 0xFF) == 0:
+                # Killed by signal: high byte holds it
+                sig = (status >> 8) & 0xFF
+                if sig == 9:
+                    actual = "SIGKILL(kernel/cgroup)"
+                elif sig == 15:
+                    actual = "SIGTERM(our)"
+                elif sig == 11:
+                    actual = "SIGSEGV(crash)"
+                elif sig == 6:
+                    actual = "SIGABRT(assert)"
+                elif sig == 13:
+                    actual = "SIGPIPE"
+                elif sig == 8:
+                    actual = "SIGFPE"
+                else:
+                    actual = f"sig{sig}"
+            elif status and (status & 0x7F) == 0:
+                # Exited normally
+                code = (status >> 8) & 0xFF
+                actual = f"exit({code})"
+            else:
+                # No status (already gone) — likely OOM
+                # because kernel SIGKILLs OOM targets
+                actual = "OOM/CGROUP"
+
+            # Use the more accurate reason
+            final_reason = actual if actual != "sig0" else reason
+
+            # Get comm (process name) and age
+            comm = self._proc_comm.get(pid, "?")
+            start_ts = self._proc_start_time.get(pid, ts)
+            age_ms = int((ts - start_ts) * 1000) if ts > start_ts else 0
+
+            entry = {
+                "pid": pid,
+                "comm": comm,
+                "reason": final_reason,
+                "ram": round(ram, 1),
+                "age_ms": age_ms,
+                "ts": _t.strftime("%H:%M:%S", _t.localtime(ts)),
+            }
+
+            # Update counters
+            self.kill_reasons[final_reason] = (
+                self.kill_reasons.get(final_reason, 0) + 1)
+            self.kill_total += 1
+
+            # Update last-20 list (FIFO)
+            self.kill_log.append(entry)
+            if len(self.kill_log) > 20:
+                self.kill_log.pop(0)
+
+            # Cleanup
+            self._proc_comm.pop(pid, None)
+            self._proc_start_time.pop(pid, None)
+        except Exception as e:
+            # Don't let tracking fail the actual kill
+            pass
+
+    def _track_proc(self, pid, comm):
+        """v4.1.39: remember when a proc was spawned
+        and its comm, so we can compute age on kill."""
+        try:
+            import time as _t
+            self._proc_start_time[pid] = _t.time()
+            self._proc_comm[pid] = comm
+        except Exception:
+            pass
+
+    def _untrack_proc(self, pid):
+        """v4.1.39: forget about a proc (e.g. when
+        it exits cleanly)."""
+        self._proc_comm.pop(pid, None)
+        self._proc_start_time.pop(pid, None)
+
+    def _periodic_kill_check(self):
+        """v4.1.39: background thread that watches
+        ALL spray procs and detects kills done by
+        the KERNEL (not by us). This catches:
+          - OOM-killer SIGKILL
+          - cgroup memory.max enforcement SIGKILL
+          - SIGSEGV from corrupted state
+          - Normal exit (so we don't leak PIDs)
+
+        Runs every 1s in a daemon thread. When it
+        finds a dead proc, it records the reason.
+        """
+        import time as _t
+        # Local refs to avoid races
+        while True:
+            try:
+                _t.sleep(1.0)
+                if self.cancel_flag.is_set():
+                    return
+                _now = _t.time()
+                _ram = self.get_ram_usage()
+                # Snapshot current PIDs
+                all_pids = []
+                for wid, pids in list(
+                        self.spray_procs_by_worker.items()):
+                    for pid in list(pids):
+                        all_pids.append((wid, pid))
+                for wid, pid in all_pids:
+                    if pid not in self._proc_start_time:
+                        # Not tracked (e.g. just spawned, or
+                        # legacy from before v4.1.39). Skip
+                        # without recording.
+                        continue
+                    # Check if proc is alive
+                    try:
+                        # kill(pid, 0) returns 0 if alive, ESRCH
+                        # if dead. Doesn't actually send a signal.
+                        os.kill(pid, 0)
+                        # Still alive — nothing to record
+                        continue
+                    except ProcessLookupError:
+                        # Dead. Use waitpid with WNOHANG to
+                        # get the status.
+                        try:
+                            _w_pid, _w_status = os.waitpid(
+                                pid, os.WNOHANG)
+                        except ChildProcessError:
+                            _w_status = 0
+                        except Exception:
+                            _w_status = 0
+                        # Record it
+                        self._record_kill(
+                            pid=pid,
+                            reason="kernel",
+                            status=_w_status,
+                            ram=_ram,
+                            ts=_now,
+                        )
+                        # Remove from worker's set
+                        try:
+                            self.spray_procs_by_worker[wid].discard(pid)
+                        except Exception:
+                            pass
+                    except PermissionError:
+                        # Proc alive but we can't signal
+                        continue
+                    except Exception:
+                        continue
+            except Exception:
+                # Don't let this thread die
+                _t.sleep(1.0)
+                continue
+
+    def start_kill_watcher(self):
+        """v4.1.39: spawn the periodic kill checker
+        daemon thread. Called once at startup."""
+        try:
+            _t = _thr.Thread(
+                target=self._periodic_kill_check,
+                daemon=True,
+                name="kill-watcher")
+            _t.start()
+        except Exception:
+            pass
+
     def _q_choose_action(self, worker_id, state):
         """Epsilon-greedy action selection for the spray parameters.
 
@@ -4364,6 +4580,10 @@ class MemoryExplorerAI:
         libc names to survive Termux's bionic.
 
         Returns Popen object or None.
+
+        v4.1.39: also tracks PID in self._proc_start_time
+        and self._proc_comm so _periodic_kill_check can
+        record the kill reason when this proc dies.
         """
         import subprocess as _sp
         # v4.1.18: prefer C binary
@@ -4378,6 +4598,12 @@ class MemoryExplorerAI:
                     stderr=_sp.DEVNULL,
                     start_new_session=True,
                 )
+                # v4.1.39: track for kill reason logging
+                try:
+                    if p.pid:
+                        self._track_proc(p.pid, name)
+                except Exception:
+                    pass
                 return p
             except Exception:
                 pass
@@ -4401,6 +4627,12 @@ class MemoryExplorerAI:
                 stderr=_sp.DEVNULL,
                 start_new_session=True,
             )
+            # v4.1.39: track for kill reason logging
+            try:
+                if p.pid:
+                    self._track_proc(p.pid, name)
+            except Exception:
+                pass
             return p
         except Exception as e:
             self.live["last_msg"] = f"Spray failed: {e}"
@@ -5707,6 +5939,108 @@ class MemoryExplorerAI:
             pass
         return out
 
+    def cmd_killreasons(self, n=20):
+        """v4.1.39: dump WHY spray procs died.
+
+        The user asked: "А как проверить почему вообще
+        умерают они? Можно отдельный лог вывести на
+        один запуск" (How can I check why they're
+        dying? Can you output a separate log for one
+        run?)
+
+        This command shows:
+          1) A breakdown by reason (sorted by count)
+          2) The last 20 kills as a table
+        """
+        self.live["last_command"] = "killreasons"
+
+        # Part 1: breakdown
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  KILL REASONS BREAKDOWN")
+        lines.append("=" * 60)
+        if not self.kill_reasons:
+            lines.append("  No kills recorded yet")
+        else:
+            total = sum(self.kill_reasons.values())
+            lines.append(f"  Total kills: {total}")
+            lines.append("")
+            # Sort by count desc
+            for reason, count in sorted(
+                    self.kill_reasons.items(),
+                    key=lambda x: -x[1]):
+                pct = (100.0 * count / total) if total else 0
+                bar = "#" * int(pct / 2)
+                lines.append(
+                    f"  {reason:24s} {count:5d}  "
+                    f"({pct:4.1f}%)  {bar}")
+            lines.append("")
+            # Verdict
+            oom = self.kill_reasons.get("OOM/CGROUP", 0)
+            ksig = self.kill_reasons.get(
+                "SIGKILL(kernel/cgroup)", 0)
+            segv = self.kill_reasons.get("SIGSEGV(crash)", 0)
+            our = self.kill_reasons.get("SIGTERM(our)", 0)
+            if oom + ksig > total * 0.5:
+                lines.append(
+                    "  >> VERDICT: >50% killed by KERNEL")
+                lines.append(
+                    "     (OOM-killer or cgroup enforcement)")
+                lines.append(
+                    "     This is the kernel defense you")
+                lines.append(
+                    "     suspected. Solutions:")
+                lines.append(
+                    "     - Lower SPRAY_PER_LOOP or batch")
+                lines.append(
+                    "     - Lower MAX_SPRAY_PER_WORKER")
+                lines.append(
+                    "     - Increase RAM cull threshold")
+            elif segv > total * 0.3:
+                lines.append(
+                    "  >> VERDICT: >30% SIGSEGV (crash)")
+                lines.append(
+                    "     Procs crashing from memory")
+                lines.append(
+                    "     corruption. Spray pattern may be")
+                lines.append(
+                    "     bad. Try different comm or method.")
+            elif our > total * 0.5:
+                lines.append(
+                    "  >> VERDICT: >50% killed by US")
+                lines.append(
+                    "     (our RAM cull is working normally)")
+            else:
+                lines.append(
+                    "  >> VERDICT: mixed causes, no clear")
+                lines.append(
+                    "     pattern. Keep watching.")
+
+        # Part 2: last 20 kills
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("  LAST KILLS (most recent first)")
+        lines.append("=" * 60)
+        if not self.kill_log:
+            lines.append("  No kills logged yet")
+        else:
+            lines.append(
+                f"  {'TIME':<6s} {'PID':<7s} {'COMM':<14s} "
+                f"{'REASON':<24s} {'AGE':<8s} {'RAM':<5s}")
+            lines.append(
+                "  " + "-" * 70)
+            for entry in reversed(self.kill_log[-int(n):]):
+                lines.append(
+                    f"  {entry['ts']:<6s} "
+                    f"{entry['pid']:<7d} "
+                    f"{entry['comm'][:13]:<14s} "
+                    f"{entry['reason'][:23]:<24s} "
+                    f"{entry['age_ms']:<8d} "
+                    f"{entry['ram']:<5.1f}")
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
     def cmd_verify_root(self):
         self.live["last_command"] = "R (Verify Root)"
         try:
@@ -6317,6 +6651,8 @@ class MemoryExplorerAI:
                 with self.stats_lock:
                     self.live["last_msg"] = (
                         f"W{worker_id}: RAM>55%, killing {len(my_pids)} sprays\u2026")
+                _now = time.time()
+                _ram = self.get_ram_usage()
                 for pid in list(my_pids):
                     try:
                         # v4.1: try TERM first (graceful), then KILL.
@@ -6327,9 +6663,35 @@ class MemoryExplorerAI:
                         except Exception:
                             pass
                         try:
-                            os.waitpid(pid, 0)
+                            # v4.1.39: pass WNOHANG so we don't block
+                            # if the child is taking long to die. We
+                            # get back the (pid, status) tuple where
+                            # status encodes the SIGNAL that killed it
+                            # (if any) or the EXIT CODE.
+                            _w_pid, _w_status = os.waitpid(
+                                pid, os.WNOHANG)
+                            if _w_pid == 0:
+                                # Still running, give it 0.5s then KILL
+                                time.sleep(0.1)
+                                try:
+                                    os.kill(pid, 9)  # SIGKILL
+                                except Exception:
+                                    pass
+                                try:
+                                    _w_pid, _w_status = os.waitpid(
+                                        pid, os.WNOHANG)
+                                except ChildProcessError:
+                                    _w_status = 0
                             with self.stats_lock:
                                 self.live["kill_count"] += 1
+                            # v4.1.39: record WHY it died
+                            self._record_kill(
+                                pid=pid,
+                                reason="SIGTERM(our)",
+                                status=_w_status,
+                                ram=_ram,
+                                ts=_now,
+                            )
                         except ChildProcessError:
                             # Already gone (e.g. OOM-killed it). Count
                             # it as a kill so the user sees the real
@@ -6338,6 +6700,18 @@ class MemoryExplorerAI:
                                 self.live["kill_count"] += 1
                                 self.live["oom_kills"] = (
                                     self.live.get("oom_kills", 0) + 1)
+                            # v4.1.39: OOM-killed (or unknown kill).
+                            # The kernel sends SIGKILL when OOM-killer
+                            # fires, so ESRCH after our SIGTERM means
+                            # the kernel already killed it. The most
+                            # likely reason is OOM or cgroup.
+                            self._record_kill(
+                                pid=pid,
+                                reason="OOM/CGROUP",
+                                status=0,
+                                ram=_ram,
+                                ts=_now,
+                            )
                         except Exception:
                             # ESRCH = no such process. Don't double count.
                             pass
@@ -8398,6 +8772,18 @@ class MemoryExplorerAI:
                     self._terminal_print(out_text)
                 except Exception as _e:
                     self._terminal_print(f" englog error: {_e}")
+                continue
+            elif cmd in ("killreasons", "kstats", "killa"):
+                # v4.1.39 SEPARATE BUFFER
+                try:
+                    out = self.cmd_killreasons(20)
+                    out_text = (
+                        f"{C.BOLD}{C.CYN}"
+                        f"{out}{C.RST}")
+                    self._terminal_print(out_text)
+                except Exception as _e:
+                    self._terminal_print(
+                        f" killreasons error: {_e}")
                 continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
