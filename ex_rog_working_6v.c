@@ -1757,6 +1757,28 @@ shell:
     setenv("TERM", "xterm", 1);
     setenv("HOME", "/data/local/tmp", 1);
 
+    // CRITICAL: Termux-compiled binaries require libtermux-exec-ld-preload.so
+    // Without LD_PRELOAD, any binary we exec will fail with "library not found"
+    if (access("/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so", R_OK) == 0) {
+        setenv("LD_PRELOAD", "/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so", 1);
+        fprintf(stderr, "[CHILD %d] Set LD_PRELOAD for Termux compat\n", getpid());
+    } else if (access("/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so", F_OK) == 0) {
+        // exists but not readable - try anyway
+        setenv("LD_PRELOAD", "/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so", 1);
+    }
+    // Also try system paths as fallback
+    char *ld_paths[] = {
+        "/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so",
+        "/system/lib64/libtermux-exec-ld-preload.so",
+        NULL
+    };
+    for (int i = 0; ld_paths[i]; i++) {
+        if (access(ld_paths[i], R_OK) == 0) {
+            setenv("LD_PRELOAD", ld_paths[i], 1);
+            break;
+        }
+    }
+
     // Try to disable SELinux BEFORE exec (so the new shell inherits permissive context)
     if (getuid() == 0) {
         // We are root, try to disable SELinux
@@ -1774,18 +1796,28 @@ shell:
         if (tty_fd > 2) close(tty_fd);
     }
 
-    // Try a few shell paths in order
+    // Try multiple shell paths in order of preference
+    // For Termux, use the bundled shell (which has LD_PRELOAD compatibility)
+    // For system, use /system/bin/sh
     char *sh_paths[] = {
-        "/system/bin/sh",
+        "/data/data/com.termux/files/usr/bin/sh",  // Termux bash/sh
+        "/data/data/com.termux/files/usr/bin/bash",
+        "/system/bin/sh",                          // Android sh
         "/vendor/bin/sh",
-        "/data/adb/modules/..." // placeholder
+        "/system/bin/toybox",
+        NULL
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; sh_paths[i]; i++) {
         if (access(sh_paths[i], X_OK) == 0) {
+            fprintf(stderr, "[CHILD %d] Trying shell: %s\n", getpid(), sh_paths[i]);
+            fflush(stderr);
             execl(sh_paths[i], "sh", NULL);
+            // If execl returns, it failed - try next
         }
     }
     // Last resort
+    fprintf(stderr, "[CHILD %d] All shells failed, trying system call\n", getpid());
+    fflush(stderr);
     execl("/system/bin/sh", "sh", NULL);
     exit(0);
 }
